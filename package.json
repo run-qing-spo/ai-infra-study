@@ -1,13 +1,14 @@
 {
-  "name": "ai-infra-study",
+  "name": "ai-infer-io-opt",
   "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "dev": "vuepress dev docs",
-    "build": "vuepress build docs",
-    "deploy": "vuepress build docs && gh-pages -d docs/.vuepress/dist"
+    "dev": "vitepress dev docs",
+    "build": "vitepress build docs",
+    "deploy": "vitepress build docs && gh-pages -d docs/.vitepress/dist"
   },
   "devDependencies": {
-    "vuepress": "^1.9.10",
+    "vitepress": "^1.0.0",
     "gh-pages": "^6.3.0"
   }
 }
