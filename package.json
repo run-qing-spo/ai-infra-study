@@ -1,0 +1,13 @@
+{
+  "name": "ai-infra-study",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vuepress dev docs",
+    "build": "vuepress build docs",
+    "deploy": "vuepress build docs && gh-pages -d docs/.vuepress/dist"
+  },
+  "devDependencies": {
+    "vuepress": "^1.9.10",
+    "gh-pages": "^6.3.0"
+  }
+}
