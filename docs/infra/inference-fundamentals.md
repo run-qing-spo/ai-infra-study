@@ -44,7 +44,7 @@ Part 1: 为什么推理框架需要调用这些接口（推理原理） · Part 
 
 **为什么框架调用 flash_attn_func()**
 
-标准 Attention 需要先算出完整的 seq×seq 得分矩阵，存入 HBM（Prefill 时 4096×4096×2B = 32 MB/head，64 head = 2 GB），再从 HBM 读回来做 softmax。Flash Attention 将 Q/K/V 分块加载到 SM 的 SRAM（~200 KB），在 SRAM 内完成 softmax+matmul，避免中间矩阵写回 HBM。HBM 访问量从 O(N²) 降到 O(N)。
+标准 Attention 需要先算出完整的 seq×seq 得分矩阵，存入 HBM（Prefill 时 4096×4096×2B = 32 MB/head，64 head = 2 GB），再从 HBM 读回来做 softmax。Flash Attention 将 Q/K/V 分块加载到 SM 的 SRAM（A100 ~164 KB，H100 ~228 KB），在 SRAM 内完成 softmax+matmul，避免中间矩阵写回 HBM。HBM 额外内存占用从 O(N²) 降到 O(N)（不再存储完整注意力矩阵）；HBM 访问量从 O(Nd + N²) 降到 O(N²d²/M)，其中 M 为 SRAM 大小——对 N 仍是二次，但常数因子大幅缩小。
 
 ### 1.3 KV Cache：为什么要缓存 K 和 V
 
