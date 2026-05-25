@@ -44,7 +44,7 @@ Part 1: 为什么推理框架需要调用这些接口（推理原理） · Part 
 
 **为什么框架调用 flash_attn_func()**
 
-标准 Attention 需要先算出完整的 seq×seq 得分矩阵，存入 HBM（Prefill 时 4096×4096×2B = 32 MB/head，64 head = 2 GB），再从 HBM 读回来做 softmax。Flash Attention 将 Q/K/V 分块加载到 SM 的 SRAM（A100 ~164 KB，H100 ~228 KB），在 SRAM 内完成 softmax+matmul，避免中间矩阵写回 HBM。HBM 额外内存占用从 O(N²) 降到 O(N)（不再存储完整注意力矩阵）；HBM 访问量从 O(Nd + N²) 降到 O(N²d²/M)，其中 M 为 SRAM 大小——对 N 仍是二次，但常数因子大幅缩小。
+标准 Attention 需要先算出完整的 seq×seq 得分矩阵，存入 HBM（Prefill 时 32768×32768×2B = 2 GB/head，64 head = 128 GB），再从 HBM 读回来做 softmax。Flash Attention 将 Q/K/V 分块加载到 SM 的 SRAM（A100 ~164 KB，H100 ~228 KB），在 SRAM 内完成 softmax+matmul，避免中间矩阵写回 HBM。HBM 额外内存占用从 O(N²) 降到 O(N)（不再存储完整注意力矩阵）；HBM 访问量从 O(Nd + N²) 降到 O(N²d²/M)，其中 M 为 SRAM 大小——对 N 仍是二次，但常数因子大幅缩小。
 
 ### 1.3 KV Cache：为什么要缓存 K 和 V
 
@@ -60,7 +60,7 @@ Part 1: 为什么推理框架需要调用这些接口（推理原理） · Part 
 | | · 新的 K,V 追加到 cache 末尾 |
 | | · 新的 Q（只有 1 个 token）与整个 cache 的 K 做 attention |
 | | · 计算量从 O(N²) 降到 O(N)（每步只处理 1 个 query vs N 个 key） |
-| **代价** | KV Cache 占大量 HBM。Llama-3 70B GQA(8 heads)、4096 seq: ~10 GB/请求。这就是为什么内存管理（PagedAttention、CXL 扩展）如此重要。 |
+| **代价** | KV Cache 占大量 HBM。Llama-3 70B GQA(8 heads)、32768 seq: ~10 GB/请求。这就是为什么内存管理（PagedAttention、CXL 扩展）如此重要。 |
 
 ::: info 这解释了为什么 Prefill 和 Decode 性质不同
 Prefill 处理 N 个 token：Q 是 [N, d] 矩阵 × K^T 是 [d, N] 矩阵 → 矩阵-矩阵乘（GEMM）→ 计算密集。
@@ -72,11 +72,11 @@ Decode 处理 1 个 token：Q 是 [1, d] 向量 × K^T 是 [d, N] 矩阵 → 矩
 
 | | |
 |---|---|
-| **MHA 的问题** | 标准 MHA（Multi-Head Attention）：64 个 Q head 对应 64 个 K head 和 64 个 V head。KV Cache = 2 × 80 layers × 64 heads × 128 dim × seq × 2B。4096 seq 时 = 80 GB。一个请求就占满一张 A100。 |
+| **MHA 的问题** | 标准 MHA（Multi-Head Attention）：64 个 Q head 对应 64 个 K head 和 64 个 V head。KV Cache = 2 × 80 layers × 64 heads × 128 dim × seq × 2B。32768 seq 时 = 80 GB。一个请求就占满一张 A100。 |
 | **解决方案：共享 KV Head** | 实验发现，多个 Q head 可以共享同一组 K,V（因为不同 head 学到的 K,V 有很大冗余）。 |
 | | · GQA（Grouped）：每 8 个 Q head 共享 1 组 K,V → KV head 从 64 降到 8 → KV Cache 缩小 8x |
 | | · MQA（Multi-Query）：所有 Q head 共享 1 组 K,V → KV head 只有 1 → KV Cache 缩小 64x |
-| | Llama-3 70B 使用 GQA(8)，所以 KV Cache = ~10 GB/请求而非 80 GB。 |
+| | Llama-3 70B 使用 GQA(8)，32768 seq 时 KV Cache = ~10 GB/请求而非 80 GB。 |
 | **IO 意义** | Decode 每步读取的 KV 字节数直接按 head 数成比例下降 → TBT 改善。这是模型架构层面的 IO 优化——你无法改变它，但必须理解它来计算 IO 量。 |
 
 ### 1.5 FFN（前馈网络）：Attention 之后为什么还需要 FFN
@@ -124,9 +124,9 @@ IO 视角：LM Head 权重 = hidden_dim × vocab_size × dtype = 8192 × 128K ×
 
 | | |
 |---|---|
-| **问题** | 推理服务同时处理多个请求。每个请求的 KV Cache 占 ~2.5 GB/卡（TP=4, GQA）。A100 扣除权重后只剩 ~40 GB → 最多 ~16 个请求同时在 GPU 上。 |
+| **问题** | 推理服务同时处理多个请求。每个请求的 KV Cache 占 ~2.5 GB/卡（TP=4, GQA, 32768 seq）。A100 扣除权重后只剩 ~40 GB → 最多 ~16 个请求同时在 GPU 上。 |
 | | 而且不同请求的输入长度不同、生成步数不同、到达时间不同。怎么管理？ |
-| **PagedAttention 解决内存碎片** | 传统方式：为每个请求预分配 max_seq_len 的连续内存。请求只用了 100 token，却占 4096 token 的空间 → 浪费 97%。 |
+| **PagedAttention 解决内存碎片** | 传统方式：为每个请求预分配 max_seq_len 的连续内存。请求只用了 100 token，却占 32768 token 的空间 → 浪费 ~99.7%。 |
 | | PagedAttention：像操作系统管理虚拟内存一样，将 KV Cache 分成固定大小的块（如 16 token/块），按需分配。请求用多少分配多少，结束后回收。浪费率从 60–80% 降到 <4%。 |
 | **Scheduler 解决并发调度** | 每轮迭代前，Scheduler 决定： |
 | | · 新请求能否加入（KV 块够不够？） → `BlockManager.can_allocate()` |
@@ -140,7 +140,7 @@ IO 视角：LM Head 权重 = hidden_dim × vocab_size × dtype = 8192 × 128K ×
 |---|---|
 | **Continuous Batching** | 传统 static batching：等一个 batch 的所有请求都生成完，再处理下一个 batch。短请求等长请求 → GPU 空转。 |
 | | Continuous Batching：某个请求完成后立即移出，空出的槽位立即填入新请求。GPU 永远在工作。 |
-| **Chunked Prefill** | 一个 4096 token 的 Prefill 可能需要 ~800 ms。在这期间，decode 请求无法执行（GPU 被独占），TBT 飙升。 |
+| **Chunked Prefill** | 一个 32768 token 的 Prefill 可能需要数秒。在这期间，decode 请求无法执行（GPU 被独占），TBT 飙升。 |
 | | Chunked Prefill：将长 prefill 切成小块（如 512 token），每块与 decode token 混合在同一 batch 中执行。Prefill 慢一点，但 decode 请求的 TBT 不会被饿死。 |
 | **为什么这与 IO 相关** | 调度策略决定了每轮 GPU 上同时有多少请求 → 决定了 KV Cache 总占用 → 决定了是否触发 swap IO → 决定了 Throughput 天花板。 |
 
