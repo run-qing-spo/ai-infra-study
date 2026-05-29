@@ -30,6 +30,10 @@ features:
 - [推理基础：原理与硬件](/infra/inference-fundamentals) — Part 1 Transformer 推理原理 · Part 2 硬件组件内部结构
 - [推理 IO 优化：完整技术全景](/infra/inference-io-tech-complete) — 芯片内到跨数据中心的 IO 技术栈
 
+### AI 存储
+
+- [项目总览](/projects/overview) — KV Cache 分层卸载 + 异步 Checkpoint，两个动手项目的路线图与进度追踪
+
 ### AI
 
 （待补充）
