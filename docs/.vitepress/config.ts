@@ -19,6 +19,10 @@ export default defineConfig({
               text: '推理基础：原理与硬件',
               link: '/infra/inference-fundamentals',
             },
+            {
+              text: '推理 IO 优化：技术全景',
+              link: '/infra/inference-io-tech-complete',
+            },
           ],
         },
       ],

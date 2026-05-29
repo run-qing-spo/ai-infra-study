@@ -9,6 +9,9 @@ hero:
       text: 推理基础：原理与硬件
       link: /infra/inference-fundamentals
     - theme: alt
+      text: 推理 IO 优化：技术全景
+      link: /infra/inference-io-tech-complete
+    - theme: alt
       text: GitHub
       link: https://github.com/run-qing-spo/ai-infra-study
 features:
@@ -25,6 +28,7 @@ features:
 ### 基础设施
 
 - [推理基础：原理与硬件](/infra/inference-fundamentals) — Part 1 Transformer 推理原理 · Part 2 硬件组件内部结构
+- [推理 IO 优化：完整技术全景](/infra/inference-io-tech-complete) — 芯片内到跨数据中心的 IO 技术栈
 
 ### AI
 
