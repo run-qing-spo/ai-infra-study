@@ -44,6 +44,8 @@ description: KV Cache 分层卸载 + 异步 Checkpoint 两个系统项目的设�
 
 **设计动机**：现有 offload（LMCache / vLLM）淘汰多用朴素 LRU，无视 KV 的两个结构——attention 偏置（sink + 近期 token 更重要）与多轮前缀复用。本项目把存储引擎的分层 / compaction 思想迁移到 KV 卸载。
 
+**实现**：底层微基准（Stage 0A）用 **C++** 直打 syscall（`O_DIRECT` 对齐、page cache 行为）；trace 分析与三级模拟器用 **Python**（trace-driven simulation 的标准形态）；真机集成走 vLLM / LMCache 的 Python 接口。
+
 ### 研究问题
 
 - **RQ1（刻画）**：真实 trace 里 KV 块复用距离 / 前缀命中分布如何？LRU 为何次优？ → Fig 1
@@ -93,9 +95,15 @@ description: KV Cache 分层卸载 + 异步 Checkpoint 两个系统项目的设�
 
 ## 3. 项目二（写 / 训练侧）：崩溃一致的异步 Checkpoint
 
+### 定位
+
+**工程 / 系统件*：设计决策 + 正确性保证 + 量化收益**：① `torch.save` 没有的崩溃安全（原子发布，写一半挂掉不留坏文件）；② 量化的 serialization↔IO overlap 与 fsync 成本；③ 对 durability 语义的深度掌握（`fsync` ≠ 落盘、一致性 vs 持久性、原子 `rename`）。
+
 **一句话**：实现一个大模型 checkpoint 写引擎，覆盖分片、异步落盘、崩溃一致性，对标业界方案（PyTorch DCP / ByteCheckpoint）的核心问题。**几乎不需要 GPU**（纯 IO + 序列化）。
 
 **动机**：项目一偏读 / 缓存，碰不到写路径与持久化语义；而 fsync / 崩溃一致性 / checkpoint 是训练侧存储的核心问题。两个项目一拼，正好覆盖读 + 写、服务 + 训练、缓存 + durability 的全貌。
+
+**实现**：写引擎核心用 **C++**（`pwrite` / `fsync` / 原子 `rename` / 真线程分片 / CRC32C），让"序列化与磁盘 IO 真并行重叠"的故事不受 Python GIL 限制；仅用一层薄 Python 与 `torch.save` 对比。
 
 ### 里程碑
 
@@ -103,12 +111,15 @@ description: KV Cache 分层卸载 + 异步 Checkpoint 两个系统项目的设�
 - **C2**：持久化正确性——临时文件 + `fsync` + 原子 `rename`，注入崩溃（写一半 kill）验证可恢复；对比有无 fsync 的差异
 - **C3**：分片 + 异步——多线程分片写 + 异步落盘，让"序列化 CPU 工作"与"磁盘 IO"重叠；对比 `torch.save` 耗时
 - **C4**：完整性——每分片 checksum，损坏检测与跳过
-- **C5（可选 stretch）**：写到对象存储（MinIO/S3），轻触分布式存储
+- ~~C5 对象存储~~ —— 移出范围（分布式存储留作背景阅读 §4）
 
 ### 验收标准
 
-- 能用实测数据回答："fsync 之后一定落盘了吗？怎么保证 checkpoint 崩溃可恢复？"
-- 相比 `torch.save` 给出量化的写入提速 / overlap 收益
+- **功能件**：`ckpt save / load` 真能序列化 / mmap 加载张量；崩溃安全；CRC 校验。
+- **崩溃可恢复（拆两半，避免把一致性与持久性混为一谈）**：
+  - 一致性（原子发布 / `rename`）——进程崩溃注入可测，产出"崩溃点 → 结果"表。
+  - 持久性（`fsync` 真落盘）——需断电模型（`dm-log-writes` / 关写缓存的诚实盘），本机实测时标注硬件局限。
+- **量化优势**：相比 `torch.save` 的写入提速 / overlap（笔记本实测），且具备 `torch.save` 没有的崩溃安全。
 
 ---
 
@@ -148,19 +159,30 @@ description: KV Cache 分层卸载 + 异步 Checkpoint 两个系统项目的设�
 
 | 阶段 | 环境 | 说明 |
 |---|---|---|
-| IO 栈 / checkpoint / 模拟器 | 本地机器：好的 NVMe(2TB) + 64–128GB 内存 | 纯 CPU·DRAM·SSD，无需 GPU |
+| IO 栈 / checkpoint / 模拟器 | **本地机器即可**（纯 CPU·DRAM·SSD，无需 GPU） | 见下方「本地配置」 |
 | 真实 KV / 模型加载 / GDS | 云端**单卡**（如 4090 24G 或 A100 40/80G） | 跑通 vLLM offloading、真机校准 |
 | 偶尔多卡 | 按需 spot | 偶发验证 |
 
+**本地配置**（用以完成 Stage 0A、项目二 C1–C4、trace 模拟器）：
+
+| 组件 | 规格 |
+|---|---|
+| CPU | i7，16 核 |
+| 内存 | 16GB |
+| 磁盘 | 256GB SSD（PCIe 3.0 TLC） |
+| GPU | 不需要 |
+
+> **实际约束**：① 磁盘要留余量——Mooncake trace 和 fio 测试文件别占满盘；② 大模型 checkpoint 分片实验用小 tensor 即可，不必存完整 7B 权重；③ 模拟器是纯内存回放，16GB 跑主流 trace 子集没问题；④ IO 微基准测的是相对延迟（buffered vs O_DIRECT vs mmap），绝对数值偏慢但不影响结论。
+>
 > RDMA / 多机网络与 CXL 没有对应硬件时，用 loopback + 注入延迟、远端 NUMA node + 注入延迟来模拟。大部分工作（trace 刻画、模拟器、checkpoint）在本地纯 CPU 环境即可完成，GPU 只在真机校准阶段短时租用。
 
 ---
 
 ## 6. 路线图（阶段）
 
-- **热身**：项目一 Stage 0A（IO 栈）+ 项目二 C1–C3（checkpoint 核心）——先建立存储基本功，跑出第一个能展示的项目
-- **项目一主力**：项目一 Stage 1–5（trace → 模拟器 → 真机 → 量化 → 敏感性）
-- **进阶（可选）**：项目二 C4–C5（完整性 / 对象存储）、DataLoader 小文件加载 demo、GDS 真机路径
+- **存储基础部分**：项目一 Stage 0A（IO 栈）+ 项目二 C1–C3（checkpoint 核心）
+- **项目**：项目一 Stage 1–5（trace → 模拟器 → 真机 → 量化 → 敏感性）
+- **进阶（可选）**：项目二 C4（完整性）、DataLoader 小文件加载 demo、GDS 真机路径
 - **持续打磨**：每个里程碑在项目 `REPORT.md` 留带数字的图表
 
 ---
