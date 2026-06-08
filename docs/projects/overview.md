@@ -1,6 +1,5 @@
 ---
-title: AI 存储 · KV Cache 基础项目总览
-description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
+AI 存储 · KV Cache 基础项目总览
 ---
 
 # AI 存储 · KV Cache 基础项目总览
@@ -57,7 +56,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：C++ 实现 `get(key)` / `put(key, value)` 接口，16 线程并发测试通过，`-fsanitize=thread` 0 race。
 
-**我会重点练**：
+**重点**：
 - `std::mutex` + `std::list` + `std::unordered_map` 组合
 - 锁竞争分析（为什么 `get` 不能用 `shared_mutex` 简单优化）
 - TSan 使用
@@ -70,7 +69,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：ring buffer + atomic 索引，性能数据对比 `std::queue + mutex`（吞吐 + p99 延迟）。
 
-**我会重点练**：
+**重点**：
 - `std::atomic` + memory order
 - cache line 对齐（`alignas(64)`）避免 false sharing
 - 为什么单线程下 mutex 几乎无开销，跨核才显优势
@@ -85,7 +84,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：基于 `liburing` 封装 io_uring，SSD 读/写接口，吞吐 + p99 延迟数据表。
 
-**我会重点练**：
+**重点**：
 - `liburing` API（提交队列 / 完成队列）
 - 零拷贝 I/O
 - 为什么异步 I/O 在高并发场景优于传统 `read()/write()`
@@ -98,7 +97,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：DRAM + SSD，支持 LRU/LFU 淘汰策略，真实 trace 回放验证。
 
-**我会重点练**：
+**重点**：
 - 冷热分层（什么时候从 DRAM 淘汰到 SSD）
 - 预取策略（什么时候提前把 SSD 的数据拉回 DRAM）
 - trace-driven 验证方法
@@ -113,7 +112,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：HBM + DRAM + SSD，租用 GPU 几小时验证完整路径。
 
-**我会重点练**：
+**重点**：
 - pinned memory（为什么需要，如何分配）
 - `cudaMemcpyAsync` + CUDA stream
 - GPU ↔ CPU ↔ SSD 的数据流
@@ -128,7 +127,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：跨层级传输的异步流水线，隐藏延迟，性能对比图。
 
-**我会重点练**：
+**重点**：
 - CUDA stream 的 pipeline parallelism
 - 如何让计算与传输重叠
 - FlexKV 本地 TransferEngine 的核心思想
@@ -143,7 +142,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：支持 prefix 复用的 RadixTree，对齐 FlexKV 的索引结构。
 
-**我会重点练**：
+**重点**：
 - RadixTree 数据结构（如何支持高效的 prefix 命中）
 - 并发安全的读路径（读路径无锁，写路径加锁）
 - 为什么 RadixTree 比 hashmap 更适合 KV Cache 的 prefix 复用
@@ -156,7 +155,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：用 loopback + 延迟注入模拟 RDMA，4 层完整路径，延迟瀑布图。
 
-**我会重点练**：
+**重点**：
 - RPC 抽象（如何封装跨节点调用）
 - 延迟建模（如何用本地注入模拟网络延迟）
 - 4 层协同（HBM/DRAM/SSD/Remote 之间的调度）
@@ -171,7 +170,7 @@ description: 我为 FlexKV/Mooncake 打基础的 10 个渐进式 C++ 项目
 
 **交付**：4 层 + RadixTree + 异步传输，对标 FlexKV 本地路径，完整性能报告。
 
-**我会重点练**：
+**重点**：
 - 系统整合（如何把前面的模块拼起来）
 - 性能调优（瓶颈定位与优化）
 - 与 FlexKV 的设计差异分析
