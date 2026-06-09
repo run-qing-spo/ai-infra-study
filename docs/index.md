@@ -29,6 +29,7 @@ features:
 
 - [推理基础：原理与硬件](/infra/inference-fundamentals) — Part 1 Transformer 推理原理 · Part 2 硬件组件内部结构
 - [推理 IO 优化：完整技术全景](/infra/inference-io-tech-complete) — 芯片内到跨数据中心的 IO 技术栈
+- [KV Cache C++ Backend 优化方向细则](/infra/kv-cache-cpp-backend-direction) — 推理推动力 → C++ backend 服务 → 技术实现 → 对位与切入点
 
 ### AI 存储
 

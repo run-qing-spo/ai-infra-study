@@ -1,8 +1,10 @@
 import { defineConfig } from 'vitepress'
 // @ts-ignore - no bundled types
 import taskLists from 'markdown-it-task-lists'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
-export default defineConfig({
+export default withMermaid(
+  defineConfig({
   title: 'AI Infra Study',
   description: 'AI 推理与基础设施学习笔记',
   base: '/ai-infra-study/',
@@ -30,6 +32,10 @@ export default defineConfig({
             {
               text: '推理 IO 优化：技术全景',
               link: '/infra/inference-io-tech-complete',
+            },
+            {
+              text: 'KV Cache C++ Backend 优化方向细则',
+              link: '/infra/kv-cache-cpp-backend-direction',
             },
           ],
         },
@@ -68,4 +74,5 @@ export default defineConfig({
       },
     ],
   },
-})
+  }),
+)

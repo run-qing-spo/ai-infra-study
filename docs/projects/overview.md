@@ -95,10 +95,12 @@ AI 存储 · KV Cache 基础项目总览
 
 #### 项目 4：2 层缓存引擎
 
-**交付**：DRAM + SSD，支持 LRU/LFU 淘汰策略，真实 trace 回放验证。
+**交付**：DRAM + SSD，block 化布局，支持 LRU / LFU / W-TinyLFU / ARC 淘汰策略，真实 trace 回放验证，策略间命中率对比。
 
 **重点**：
+- Block 化布局：固定大小 block（对齐 FlexKV/vLLM 的 16 tokens/block），block id → 物理地址偏移，与后续 GPU KV 同 shape
 - 冷热分层（什么时候从 DRAM 淘汰到 SSD）
+- 多种淘汰策略对比：LRU / LFU 作为基线，W-TinyLFU / ARC 作为优化，trace 回放对比命中率（对齐方向文档候选 A 的 PR 切入点）
 - 预取策略（什么时候提前把 SSD 的数据拉回 DRAM）
 - trace-driven 验证方法
 
@@ -110,9 +112,10 @@ AI 存储 · KV Cache 基础项目总览
 
 #### 项目 5：3 层缓存引擎
 
-**交付**：HBM + DRAM + SSD，租用 GPU 几小时验证完整路径。
+**交付**：HBM + DRAM + SSD，block 化布局贯穿三层，租用 GPU 几小时验证完整路径。
 
 **重点**：
+- Block 化布局贯穿三层：block id 在三层间统一，升降级只改 block 所在 tier 标记，不重写数据
 - pinned memory（为什么需要，如何分配）
 - `cudaMemcpyAsync` + CUDA stream
 - GPU ↔ CPU ↔ SSD 的数据流
@@ -146,6 +149,7 @@ AI 存储 · KV Cache 基础项目总览
 - RadixTree 数据结构（如何支持高效的 prefix 命中）
 - 并发安全的读路径（读路径无锁，写路径加锁）
 - 为什么 RadixTree 比 hashmap 更适合 KV Cache 的 prefix 复用
+- Copy-on-Write block 共享：多请求共享相同 prefix block，新增 token 才分裂（stretch goal）
 
 **代码**：`projects/project7_radixtree/`
 

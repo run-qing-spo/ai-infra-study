@@ -78,44 +78,37 @@ description: "推理场景的推动力量 → CPP backend 为推理提供的服�
 
 ### 服务全景图
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│  Python 调度层（vLLM Scheduler / SGLang Engine）              │
-│  ─ 决定哪个请求进 batch、哪个 swap out                        │
-│  ─ 调 backend 查 prefix → 拿到 hit_info → 决定是否复用       │
-│   （索引/RadixTree 由 backend 维护，Python 只是调用与决策方）│
-└───────────────────────────────┬───────────────────────────────┘
-                                │  KVConnector / HiCache API
-┌───────────────────────────────▼───────────────────────────────┐
-│  C++ KV Backend                ★ 我要做的工作在这里            │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ 服务 A：分级存储       ← 显存墙催生                      │ │
-│  │  StorageEngine                                           │ │
-│  │  - HBM / DRAM / SSD / Remote 多级 pool                  │ │
-│  │  - block 化的 KV 物理布局与内存管理                       │ │
-│  │  - 内存索引压缩、Hugepage、NUMA aware                    │ │
-│  ├─────────────────────────────────────────────────────────┤ │
-│  │ 服务 B：前缀命中       ← 重复计算催生                    │ │
-│  │  GlobalCacheEngine                                       │ │
-│  │  - 分布式 RadixTree / 前缀 Hash（服务于跨 worker 共享）  │ │
-│  │  - eviction (LRU / LFU / ARC / W-TinyLFU)               │ │
-│  │  - lease / 跨节点元数据 (Redis GMS)                      │ │
-│  ├─────────────────────────────────────────────────────────┤ │
-│  │ 服务 C：跨层级搬运     ← 显存墙催生（分级的前提是能搬）  │ │
-│  │  本地 TransferEngine                                     │ │
-│  │  - 本地：io_uring / GDS / pinned memory / CUDA stream    │ │
-│  │  - 多网卡 + NUMA + PCIe root complex 亲和                │ │
-│  ├─────────────────────────────────────────────────────────┤ │
-│  │ 服务 D：跨节点传输     ← 存算分离催生                    │ │
-│  │  Distributed TransferEngine                              │ │
-│  │  - 跨节点：RDMA / GDR / NIXL / Mooncake TE              │ │
-│  │  - 多网卡 + NUMA + PCIe root complex 亲和                │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-┌───────────────────────────────▼───────────────────────────────┐
-│  操作系统 + 硬件层（PCIe / NVLink / RDMA NIC / NVMe / CXL）    │
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Python["🐍 Python 调度层"]
+        S["vLLM Scheduler / SGLang Engine<br/>决定 batch / swap / 复用<br/>调 backend 查 prefix → hit_info"]
+    end
+
+    subgraph Backend["⭐ C++ KV Backend"]
+        direction TB
+        subgraph Upper["上层服务"]
+            A["<b>服务 A：分级存储</b><br/>StorageEngine<br/><hr/>HBM / DRAM / SSD 多级 pool<br/>Block 化 KV 物理布局<br/>Memory Pool + NUMA<br/><i>← 显存墙催生</i>"]
+            B["<b>服务 B：前缀命中</b><br/>GlobalCacheEngine<br/><hr/>RadixTree / Hash 索引<br/>Eviction / 热点副本<br/>Lease + GMS<br/><i>← 重复计算催生</i>"]
+        end
+        subgraph Lower["下层服务"]
+            C["<b>服务 C：跨层级搬运</b><br/>本地 TransferEngine<br/><hr/>io_uring / GDS / pinned memory<br/>CUDA stream pipeline<br/>写开销控制<br/><i>← 显存墙催生</i>"]
+            D["<b>服务 D：跨节点传输</b><br/>Distributed TransferEngine<br/><hr/>RDMA / GDR / NIXL<br/>Mooncake TE<br/>多 QP + 拓扑亲和<br/><i>← 存算分离催生</i>"]
+        end
+    end
+
+    subgraph HW["⚙️ OS + 硬件层"]
+        HW1["PCIe / NVLink / RDMA NIC / NVMe / CXL"]
+    end
+
+    S -->|"KVConnector / HiCache API"| A
+    S -->|"查询 hit_info"| B
+
+    A -->|"swap out / in"| C
+    B -->|"命中远端 KV"| D
+    B -->|"命中低层级 KV"| C
+
+    C --> HW1
+    D --> HW1
 ```
 
 ::: tip 这张图与全景图的关系
@@ -217,15 +210,13 @@ description: "推理场景的推动力量 → CPP backend 为推理提供的服�
 
 ### 服务间的依赖关系
 
-```
-服务 A（分级存储）──── 依赖 ────→ 服务 C（跨层级搬运）
-       │                                │
-       │ 命中后需搬回 KV               │ 本地路径的延伸
-       ▼                                ▼
-服务 B（前缀命中）──── 依赖 ────→ 服务 D（跨节点传输）
-       │   命中的 KV 若在远端
-       │
-       └→ 服务 A 提供存储池，服务 B 在其上建索引
+```mermaid
+graph LR
+    A["服务 A<br/>分级存储"] -->|"分级的前提是能搬"| C["服务 C<br/>跨层级搬运"]
+    B["服务 B<br/>前缀命中"] -->|"命中低层级 KV<br/>需搬回"| C
+    B -->|"命中远端 KV<br/>需传输"| D["服务 D<br/>跨节点传输"]
+    A -.->|"提供存储池<br/>B 在其上建索引"| B
+    C -.->|"本地路径的<br/>跨机延伸"| D
 ```
 
 - **A → C**：分级存储定义了"KV 应该在哪"，搬运服务执行搬运动作
