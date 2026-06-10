@@ -10,7 +10,7 @@
 本文记录两项决策的理由：
 
 1. 拷贝删除 + 移动保留
-2. `assert` + `std::terminate()` 双重守卫而非异常
+2. Debug 用 `assert`、Release 用 `std::terminate()`，而非异常
 
 ---
 
@@ -75,25 +75,28 @@ C++ 标准 [list.cons] 保证：移动后，指向被移动 list 中元素的迭
 
 ---
 
-## 决策 2：`assert` + `std::terminate()` 而非异常
+## 决策 2：Debug `assert` / Release `std::terminate()` 而非异常
 
 ### 当前策略
 
+通过 `#ifndef NDEBUG` 在两种构建模式下各用一种机制，避免 Debug 中 assert 与 terminate 重复检查：
+
 ```cpp
 explicit LRUCacheBase(size_t capacity) : capacity_(capacity) {
-    assert(capacity > 0 && "LRU capacity must be > 0");  // Debug: 立即崩溃 + 消息
+#ifndef NDEBUG
+    assert(capacity > 0 && "LRU capacity must be > 0");
+#else
     if (capacity == 0) {
-        std::terminate();  // Release: 保证不会静默出错
+        std::terminate();
     }
+#endif
 }
 ```
 
-两层守卫各司其职：
-
-| 层 | 构建模式 | 行为 | 目的 |
-|----|---------|------|------|
-| `assert` | Debug | 打印表达式、文件名、行号后 `abort()` | 开发阶段快速定位 bug |
-| `std::terminate()` | Release | 调用 `std::terminate_handler`（默认 `abort()`） | 保证不静默进入 UB |
+| 构建模式 | 机制 | 行为 | 目的 |
+|----------|------|------|------|
+| Debug（无 `NDEBUG`） | `assert` | 打印表达式、文件名、行号后 `abort()` | 开发阶段快速定位 bug |
+| Release（`-DNDEBUG`） | `std::terminate()` | 调用 `std::terminate_handler`（默认 `abort()`） | 保证不静默进入 UB |
 
 ### 为何不用异常
 
@@ -139,7 +142,7 @@ if (list_.size() >= capacity_) {  // 0 >= 0 → true
 │  → 调用方有明确的处理路径                           │
 ├──────────────────────────────────────────────────┤
 │  不可恢复的编程错误（capacity ≤ 0）                  │
-│  → assert + std::terminate()                     │
+│  → Debug: assert / Release: std::terminate()     │
 │  → 调用方违反前置条件，程序不应继续                  │
 ├──────────────────────────────────────────────────┤
 │  系统级资源耗尽（内存分配失败）                       │

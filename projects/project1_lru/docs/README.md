@@ -5,4 +5,4 @@
 | # | 文档 | 摘要 |
 |---|------|------|
 | 1 | [组合 vs 继承：LRUCache 与 LRUCacheBase](composition-vs-inheritance.md) | 线程安全包装层为何用成员组合而非 public 继承 |
-| 2 | [特殊成员函数与错误处理策略](special-members-and-error-handling.md) | 拷贝删除 / 移动保留的理由；assert + terminate 而非异常 |
+| 2 | [特殊成员函数与错误处理策略](special-members-and-error-handling.md) | 拷贝删除 / 移动保留的理由；Debug assert / Release terminate |

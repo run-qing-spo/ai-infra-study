@@ -14,10 +14,13 @@ template <typename K, typename V>
 class LRUCacheBase {
 public:
     explicit LRUCacheBase(size_t capacity) : capacity_(capacity) {
+#ifndef NDEBUG
         assert(capacity > 0 && "LRU capacity must be > 0");
+#else
         if (capacity == 0) {
-            std::terminate();  // Safety net in release builds (NDEBUG)
+            std::terminate();
         }
+#endif
     }
 
     // --- Copy: deleted -------------------------------------------------------
