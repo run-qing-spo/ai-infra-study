@@ -15,6 +15,7 @@ export default withMermaid(
     },
   },
   themeConfig: {
+    outline: 'deep',
     nav: [
       { text: '首页', link: '/' },
       { text: '基础设施', link: '/infra/inference-fundamentals' },
