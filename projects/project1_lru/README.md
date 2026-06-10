@@ -27,6 +27,7 @@ projects/project1_lru/
 │   ├── build.sh                # 构建脚本
 │   ├── run_tests.sh            # 运行全部测试 + TSan
 │   └── run_bench.sh            # 运行基准测试 → PERF_RESULTS.md
+├── docs/                       # 设计 tradeoff 文档（见 docs/README.md）
 ├── build/                      # 编译产物（.gitignore）
 ├── PERF_RESULTS.md             # 基准测试结果
 └── README.md                   # 本文件
@@ -34,10 +35,12 @@ projects/project1_lru/
 
 ## 设计决策
 
+详细 tradeoff 说明见 [docs/](docs/README.md)。
+
 ### 三层分离：Base → V1 → V2
 
 - **`LRUCacheBase<K,V>`**：纯数据结构（hash map + doubly linked list），无任何锁
-- **`LRUCache<K,V>`（V1）**：组合 `LRUCacheBase` + `std::mutex`，每个方法加 `lock_guard`
+- **`LRUCache<K,V>`（V1）**：组合 `LRUCacheBase` + `std::mutex`，每个方法加 `lock_guard`（[为何用组合而非继承](docs/composition-vs-inheritance.md)）
 - **`ShardedLRUCache<K,V>`（V2）**：64 个 `Shard`，每个 Shard = `LRUCacheBase` + `std::mutex`，`alignas(64)` 避免伪共享
 
 这样避免了 V2 中双重加锁的问题（shard mutex + 全局 mutex）。

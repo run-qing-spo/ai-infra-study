@@ -61,6 +61,19 @@ public:
         return num_shards_;
     }
 
+    // --- Copy: deleted -------------------------------------------------------
+    // Shard contains std::mutex (non-copyable) and LRUCacheBase (copy-deleted).
+    ShardedLRUCache(const ShardedLRUCache&) = delete;
+    ShardedLRUCache& operator=(const ShardedLRUCache&) = delete;
+
+    // --- Move: deleted -------------------------------------------------------
+    // Shard is alignas(64) and contains std::mutex, making it non-move-
+    // assignable.  std::array<Shard, 64> is therefore non-movable.  If move
+    // semantics are needed in the future, replace std::array with
+    // std::unique_ptr<Shard[]> or std::vector<Shard>.
+    ShardedLRUCache(ShardedLRUCache&&) = delete;
+    ShardedLRUCache& operator=(ShardedLRUCache&&) = delete;
+
 private:
     static constexpr size_t kDefaultShards = 64;
 

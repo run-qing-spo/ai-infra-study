@@ -41,6 +41,20 @@ public:
         return base_.capacity();
     }
 
+    // --- Copy: deleted -------------------------------------------------------
+    // std::mutex is non-copyable, and copying would also copy the internal
+    // LRUCacheBase whose iterators would dangle (see lrucache_base.hpp).
+    LRUCache(const LRUCache&) = delete;
+    LRUCache& operator=(const LRUCache&) = delete;
+
+    // --- Move: defaulted -----------------------------------------------------
+    // Both LRUCacheBase (node-transfer, iterators stay valid) and std::mutex
+    // are move-constructible.  The moved-from cache is left in a valid-but-
+    // empty state; its mutex is in an unspecified-but-valid state per the
+    // standard, so it can be destructed safely.
+    LRUCache(LRUCache&&) = default;
+    LRUCache& operator=(LRUCache&&) = default;
+
 private:
     LRUCacheBase<K, V> base_;
     mutable std::mutex mutex_;

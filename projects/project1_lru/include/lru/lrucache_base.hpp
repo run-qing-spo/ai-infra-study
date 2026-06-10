@@ -8,13 +8,31 @@
 #include <optional>
 #include <utility>
 #include <cassert>
+#include <exception>  // std::terminate
 
 template <typename K, typename V>
 class LRUCacheBase {
 public:
     explicit LRUCacheBase(size_t capacity) : capacity_(capacity) {
         assert(capacity > 0 && "LRU capacity must be > 0");
+        if (capacity == 0) {
+            std::terminate();  // Safety net in release builds (NDEBUG)
+        }
     }
+
+    // --- Copy: deleted -------------------------------------------------------
+    // map_ stores iterators into list_; copying list_ creates new nodes at
+    // new addresses, but the copied map_ iterators would still point into the
+    // *original* list — instant dangling iterators on any mutation.
+    LRUCacheBase(const LRUCacheBase&) = delete;
+    LRUCacheBase& operator=(const LRUCacheBase&) = delete;
+
+    // --- Move: defaulted -----------------------------------------------------
+    // std::list move transfers nodes in-place (splice); iterators remain valid
+    // and now refer to the moved-to list.  The moved-from object is left in a
+    // valid-but-empty state.
+    LRUCacheBase(LRUCacheBase&&) = default;
+    LRUCacheBase& operator=(LRUCacheBase&&) = default;
 
     // Returns the value if key exists, moves key to most-recent position.
     // Returns std::nullopt on miss.
