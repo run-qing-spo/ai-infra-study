@@ -48,6 +48,10 @@ export default withMermaid(
               text: '项目总览',
               link: '/projects/overview',
             },
+            {
+              text: '项目 1 · Thread-safe LRU Cache',
+              link: '/projects/project1-lru',
+            },
           ],
         },
       ],

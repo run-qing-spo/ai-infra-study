@@ -35,6 +35,11 @@ features:
 
 - [项目总览](/projects/overview) — KV Cache 分层卸载 + 异步 Checkpoint，两个动手项目的路线图与进度追踪
 
+### 算法与数据结构
+
+- [多线程缓存设计综述](/algorithms/concurrent-cache) — Sharding、全局锁、不同算法的并发方案
+- [LRU/ARC/LFU 算法对比](/algorithms/lru-arc-lfu-comparison) — 原理、性能对比、适用场景
+
 ### AI
 
 （待补充）
