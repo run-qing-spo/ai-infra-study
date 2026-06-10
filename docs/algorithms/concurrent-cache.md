@@ -195,7 +195,7 @@ class ShardedCache {
 |------|---------|------|
 | **本文档** | P1, P4, P5 | 多线程缓存设计模式 |
 | [LRU/ARC/LFU 对比](./lru-arc-lfu-comparison.md) | P4, P5 | 淘汰策略选择与 trade-off |
-| [项目 1 设计](/projects/project1-lru) | P1 | Thread-safe LRU 实现 |
+| [项目 1 设计](/projects/project1_lru/README) | P1 | Thread-safe LRU 实现 |
 
 ---
 

@@ -323,4 +323,4 @@ Linux 5.x 引入了 working set 检测，用于识别"页面被回收后又立�
 
 ---
 
-*上一篇：[多线程缓存设计综述](./concurrent-cache.md) | 下一篇：[项目 1 实现](/projects/project1-lru)*
+*上一篇：[多线程缓存设计综述](./concurrent-cache.md) | 下一篇：[项目 1 实现](/projects/project1_lru/README)*

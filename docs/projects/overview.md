@@ -62,7 +62,7 @@ AI 存储 · KV Cache 基础项目总览
 - TSan 使用
 - Sharding 优化（64 shards，对比全局锁）
 
-**详细设计**：[项目 1 README](./project1-lru)
+**详细设计**：[项目 1 README](./project1_lru/README)
 **背景阅读**：[多线程缓存设计综述](../algorithms/concurrent-cache.md) · [LRU/ARC/LFU 算法对比](../algorithms/lru-arc-lfu-comparison.md)
 
 **代码**：`projects/project1_lru/`
