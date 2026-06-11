@@ -3,6 +3,59 @@
 #include "lru/sharded_lrucache.hpp"
 #include "test_helpers.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <type_traits>
+
+struct HashKey {
+    int value;
+};
+
+inline bool operator==(const HashKey& lhs, const HashKey& rhs) {
+    return lhs.value == rhs.value;
+}
+
+namespace std {
+template <>
+struct hash<HashKey> {
+    size_t operator()(const HashKey& key) const noexcept {
+        return static_cast<size_t>(key.value);
+    }
+};
+} // namespace std
+
+namespace {
+
+template <typename Fn>
+bool process_dies(Fn fn) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (std::freopen("/dev/null", "w", stderr) == nullptr) {
+            std::_Exit(127);
+        }
+        fn();
+        std::_Exit(0);
+    }
+    if (pid < 0) {
+        return false;
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return false;
+    }
+    return WIFSIGNALED(status) ||
+           (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+}
+
+} // namespace
+
+static_assert(!std::is_move_constructible<ShardedLRUCache<int, int>>::value,
+              "ShardedLRUCache should not be movable");
+
 TEST(sharded_put_and_get) {
     ShardedLRUCache<int, int> cache(100);
     cache.put(1, 100);
@@ -20,16 +73,59 @@ TEST(sharded_get_miss) {
 }
 
 TEST(sharded_eviction) {
-    // Total capacity 6 → each of 64 shards gets ceil(6/64)=1.
-    // But we need multiple keys in the same shard for eviction.
-    // Use a small total capacity and rely on hash collisions or
-    // just verify that the total size stays bounded.
     ShardedLRUCache<int, int> cache(128);
     for (int i = 0; i < 300; i++) {
         cache.put(i, i * 10);
     }
-    // Size should be bounded by total capacity
     EXPECT_TRUE(cache.size() <= 128u);
+}
+
+TEST(sharded_strict_total_capacity) {
+    ShardedLRUCache<HashKey, int> cache(100);
+    for (int i = 0; i < 200; i++) {
+        cache.put(HashKey{i}, i);
+    }
+    EXPECT_EQ(cache.size(), 100u);
+}
+
+TEST(sharded_small_capacity_eviction) {
+    ShardedLRUCache<HashKey, int> cache(3, 2);
+    EXPECT_EQ(cache.num_shards(), 2u);
+
+    cache.put(HashKey{0}, 100);
+    cache.put(HashKey{2}, 200);
+    cache.get(HashKey{0});       // make key 0 recent within shard 0
+    cache.put(HashKey{4}, 400);  // shard 0 capacity is 2, evicts key 2
+
+    EXPECT_TRUE(!cache.get(HashKey{2}).has_value());
+    EXPECT_EQ(cache.get(HashKey{0}).value_or(0), 100);
+    EXPECT_EQ(cache.get(HashKey{4}).value_or(0), 400);
+
+    cache.put(HashKey{1}, 10);
+    cache.put(HashKey{3}, 30);   // shard 1 capacity is 1, evicts key 1
+
+    EXPECT_TRUE(!cache.get(HashKey{1}).has_value());
+    EXPECT_EQ(cache.get(HashKey{3}).value_or(0), 30);
+    EXPECT_EQ(cache.size(), 3u);
+}
+
+TEST(sharded_rejects_invalid_parameters) {
+    EXPECT_TRUE(process_dies([]() {
+        ShardedLRUCache<int, int> cache(0, 1);
+        (void)cache;
+    }));
+    EXPECT_TRUE(process_dies([]() {
+        ShardedLRUCache<int, int> cache(100, 0);
+        (void)cache;
+    }));
+    EXPECT_TRUE(process_dies([]() {
+        ShardedLRUCache<int, int> cache(100, 65);
+        (void)cache;
+    }));
+    EXPECT_TRUE(process_dies([]() {
+        ShardedLRUCache<int, int> cache(3, 4);
+        (void)cache;
+    }));
 }
 
 TEST(sharded_update_existing) {

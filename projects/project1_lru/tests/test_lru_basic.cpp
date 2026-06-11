@@ -3,6 +3,11 @@
 #include "lru/lrucache.hpp"
 #include "test_helpers.hpp"
 
+#include <type_traits>
+
+static_assert(!std::is_move_constructible<LRUCache<int, int>>::value,
+              "LRUCache should not be movable");
+
 TEST(put_and_get) {
     LRUCache<int, int> cache(3);
     cache.put(1, 100);
