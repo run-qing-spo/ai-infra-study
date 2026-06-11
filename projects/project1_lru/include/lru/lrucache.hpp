@@ -47,13 +47,11 @@ public:
     LRUCache(const LRUCache&) = delete;
     LRUCache& operator=(const LRUCache&) = delete;
 
-    // --- Move: defaulted -----------------------------------------------------
-    // Both LRUCacheBase (node-transfer, iterators stay valid) and std::mutex
-    // are move-constructible.  The moved-from cache is left in a valid-but-
-    // empty state; its mutex is in an unspecified-but-valid state per the
-    // standard, so it can be destructed safely.
-    LRUCache(LRUCache&&) = default;
-    LRUCache& operator=(LRUCache&&) = default;
+    // --- Move: deleted -------------------------------------------------------
+    // std::mutex is neither copyable nor movable.  Moving a thread-safe cache
+    // would also be unsafe while another thread may hold or wait on its mutex.
+    LRUCache(LRUCache&&) = delete;
+    LRUCache& operator=(LRUCache&&) = delete;
 
 private:
     LRUCacheBase<K, V> base_;

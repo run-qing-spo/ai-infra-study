@@ -9,17 +9,21 @@
 #include <optional>
 #include <utility>
 #include <functional>
+#include <cassert>
+#include <exception>  // std::terminate
 
 template <typename K, typename V>
 class ShardedLRUCache {
 public:
     explicit ShardedLRUCache(size_t total_capacity,
                              size_t num_shards = kDefaultShards)
-        : num_shards_(num_shards) {
-        // Distribute capacity evenly; each shard gets ceil(total / num_shards)
-        size_t per_shard = (total_capacity + num_shards - 1) / num_shards;
-        for (size_t i = 0; i < num_shards; i++) {
-            shards_[i].cache = LRUCacheBase<K, V>(per_shard);
+        : num_shards_(checked_num_shards(total_capacity, num_shards)) {
+        // Distribute exact total capacity; first shards receive the remainder.
+        const size_t base_capacity = total_capacity / num_shards_;
+        const size_t extra = total_capacity % num_shards_;
+        for (size_t i = 0; i < num_shards_; i++) {
+            const size_t shard_capacity = base_capacity + (i < extra ? 1 : 0);
+            shards_[i].cache = LRUCacheBase<K, V>(shard_capacity);
         }
     }
 
@@ -81,6 +85,21 @@ private:
         LRUCacheBase<K, V> cache{1};  // placeholder; overwritten in constructor
         std::mutex mutex;
     };
+
+    static size_t checked_num_shards(size_t total_capacity, size_t num_shards) {
+#ifndef NDEBUG
+        assert(total_capacity > 0 && "ShardedLRUCache total capacity must be > 0");
+        assert(num_shards > 0 && "ShardedLRUCache shard count must be > 0");
+        assert(num_shards <= kDefaultShards && "ShardedLRUCache shard count exceeds fixed shard storage");
+        assert(num_shards <= total_capacity && "ShardedLRUCache shard count must not exceed total capacity");
+#else
+        if (total_capacity == 0 || num_shards == 0 ||
+            num_shards > kDefaultShards || num_shards > total_capacity) {
+            std::terminate();
+        }
+#endif
+        return num_shards;
+    }
 
     Shard& shard_for(const K& key) {
         size_t idx = std::hash<K>{}(key) % num_shards_;

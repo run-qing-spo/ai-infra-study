@@ -6,3 +6,4 @@
 |---|------|------|
 | 1 | [组合 vs 继承：LRUCache 与 LRUCacheBase](composition-vs-inheritance.md) | 线程安全包装层为何用成员组合而非 public 继承 |
 | 2 | [特殊成员函数与错误处理策略](special-members-and-error-handling.md) | 拷贝删除 / 移动保留的理由；Debug assert / Release terminate |
+| 3 | [ShardedLRUCache 容量契约与参数校验](sharded-capacity-and-validation.md) | 分片数边界、严格总容量上限与非法参数处理 |

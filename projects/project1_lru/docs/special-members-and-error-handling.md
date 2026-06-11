@@ -9,7 +9,7 @@
 
 本文记录两项决策的理由：
 
-1. 拷贝删除 + 移动保留
+1. 拷贝删除 + `LRUCacheBase` 移动保留，线程安全包装层移动删除
 2. Debug 用 `assert`、Release 用 `std::terminate()`，而非异常
 
 ---
@@ -58,14 +58,16 @@ C++ 标准 [list.cons] 保证：移动后，指向被移动 list 中元素的迭
 | 类 | 拷贝 | 移动 | 原因 |
 |----|------|------|------|
 | `LRUCacheBase` | `= delete` | `= default` | 迭代器悬空风险；list 节点转移使移动安全 |
-| `LRUCache` | `= delete` | `= default` | `std::mutex` 不可拷贝；`LRUCacheBase` 拷贝已删除 |
+| `LRUCache` | `= delete` | `= delete` | `std::mutex` 不可拷贝也不可移动；移动线程安全对象容易破坏锁语义 |
 | `ShardedLRUCache` | `= delete` | `= delete` | `Shard` 含 `std::mutex`（不可拷贝/移动）且 `alignas(64)` + `std::array` 使整体不可移动 |
 
-### ShardedLRUCache 为何移动也删除
+### 线程安全包装层为何移动也删除
 
-`Shard` 结构体含 `std::mutex`（不可移动赋值），且 `alignas(64)` 使其不可被简单地逐字节搬移。`std::array<Shard, 64>` 的移动赋值要求元素可移动赋值，因此整个 `ShardedLRUCache` 不可移动。
+`LRUCache` 直接持有 `std::mutex`，`ShardedLRUCache` 的 `Shard` 也含 `std::mutex`（不可移动赋值）。这使两个线程安全包装层都不能安全默认移动。
 
-如果未来需要移动语义，可将 `std::array` 替换为 `std::unique_ptr<Shard[]>` 或 `std::vector<Shard>`。
+即使未来通过指针间接持有 mutex，移动一个可能正被其他线程访问的 cache 也会让锁的所有权和对象身份变得模糊。因此当前设计显式删除移动语义，只允许在固定地址上使用线程安全 cache。
+
+`ShardedLRUCache` 额外包含 `alignas(64)` 的 `std::array<Shard, 64>`。如果未来需要移动语义，可将 `std::array` 替换为 `std::unique_ptr<Shard[]>` 或 `std::vector<Shard>`，并明确规定只能在未并发访问时移动。
 
 ### 为何显式声明而非依赖隐式
 
