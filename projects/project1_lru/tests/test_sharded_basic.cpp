@@ -29,12 +29,16 @@ struct hash<HashKey> {
 
 namespace {
 
+// Returns true iff fn() caused the child to die via signal (abort / terminate).
+// A "setup failure" exit code (125) is treated as a test infrastructure failure,
+// NOT as a successful validation — otherwise a missing /dev/null could make the
+// test pass while the validation code under test never actually ran.
 template <typename Fn>
 bool process_dies(Fn fn) {
     pid_t pid = fork();
     if (pid == 0) {
         if (std::freopen("/dev/null", "w", stderr) == nullptr) {
-            std::_Exit(127);
+            std::_Exit(125);  // setup failure — distinct from validation kill
         }
         fn();
         std::_Exit(0);
@@ -47,8 +51,9 @@ bool process_dies(Fn fn) {
     if (waitpid(pid, &status, 0) < 0) {
         return false;
     }
-    return WIFSIGNALED(status) ||
-           (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    // Only signal death (abort / SIGABRT from std::terminate) counts as
+    // "validation triggered". Normal exit (0) or setup failure (125) → false.
+    return WIFSIGNALED(status);
 }
 
 } // namespace
@@ -119,7 +124,7 @@ TEST(sharded_rejects_invalid_parameters) {
         (void)cache;
     }));
     EXPECT_TRUE(process_dies([]() {
-        ShardedLRUCache<int, int> cache(100, 65);
+        ShardedLRUCache<int, int> cache(100, ShardedLRUCache<int, int>::kMaxShards + 1);
         (void)cache;
     }));
     EXPECT_TRUE(process_dies([]() {

@@ -19,21 +19,23 @@ TSAN_FLAGS="-O1 -g -fsanitize=thread"
 
 mkdir -p "$BUILD"
 
+TEST_MAIN="$SRC_TESTS/test_main.cpp"
+
 build_test_basic() {
     echo "[BUILD] test_lru_basic"
-    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_lru_basic.cpp" -o "$BUILD/test_lru_basic"
+    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_lru_basic.cpp" "$TEST_MAIN" -o "$BUILD/test_lru_basic"
     echo "[BUILD] test_sharded_basic"
-    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_sharded_basic.cpp" -o "$BUILD/test_sharded_basic"
+    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_sharded_basic.cpp" "$TEST_MAIN" -o "$BUILD/test_sharded_basic"
 }
 
 build_test_concurrent() {
     echo "[BUILD] test_lru_concurrent"
-    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_lru_concurrent.cpp" -o "$BUILD/test_lru_concurrent"
+    "$CXX" $COMMON_FLAGS $OPT_FLAGS $INCLUDE "$SRC_TESTS/test_lru_concurrent.cpp" "$TEST_MAIN" -o "$BUILD/test_lru_concurrent"
 }
 
 build_test_tsan() {
     echo "[BUILD] test_lru_concurrent_tsan (TSan)"
-    "$CXX" $COMMON_FLAGS $TSAN_FLAGS $INCLUDE "$SRC_TESTS/test_lru_concurrent.cpp" -o "$BUILD/test_lru_concurrent_tsan"
+    "$CXX" $COMMON_FLAGS $TSAN_FLAGS $INCLUDE "$SRC_TESTS/test_lru_concurrent.cpp" "$TEST_MAIN" -o "$BUILD/test_lru_concurrent_tsan"
 }
 
 build_bench() {

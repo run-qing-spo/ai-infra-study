@@ -123,6 +123,7 @@ inline int run_all_tests() {
     return ::test_detail::fail_count() > 0 ? 1 : 0;
 }
 
-#ifndef TEST_HELPERS_NO_MAIN
-int main() { return run_all_tests(); }
-#endif
+// main() lives in tests/test_main.cpp — `main` cannot be `inline` per the
+// C++ standard, so putting it in a header risks a multiple-definition error
+// the moment a test binary gains a second .cpp. Keeping it in a single TU
+// (linked into every test binary) is the safe form.

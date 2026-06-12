@@ -52,26 +52,15 @@ public:
 
     void add(uint64_t ns) { samples_.push_back(ns); }
 
-    LatencyStats compute() const {
-        if (samples_.empty()) return {0, 0, 0, 0, 0, 0};
-
+    // const-lvalue overload: copies samples, leaves collector intact.
+    LatencyStats compute() const & {
         std::vector<uint64_t> sorted = samples_;
-        std::sort(sorted.begin(), sorted.end());
+        return compute_from_sorted(std::move(sorted));
+    }
 
-        auto percentile = [&](double p) -> double {
-            size_t idx = static_cast<size_t>(p / 100.0 * (sorted.size() - 1));
-            return static_cast<double>(sorted[std::min(idx, sorted.size() - 1)]);
-        };
-
-        double sum = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-        return LatencyStats{
-            percentile(50),
-            percentile(90),
-            percentile(99),
-            static_cast<double>(sorted.back()),
-            static_cast<double>(sorted.front()),
-            sum / sorted.size()
-        };
+    // rvalue overload: sorts in place, avoiding the temporary copy.
+    LatencyStats compute() && {
+        return compute_from_sorted(std::move(samples_));
     }
 
     void merge(const LatencyCollector& other) {
@@ -81,6 +70,27 @@ public:
     size_t count() const { return samples_.size(); }
 
 private:
+    static LatencyStats compute_from_sorted(std::vector<uint64_t>&& xs) {
+        if (xs.empty()) return {0, 0, 0, 0, 0, 0};
+        std::sort(xs.begin(), xs.end());
+
+        // p in [0,100] → idx in [0, xs.size()-1], no clamp needed.
+        auto percentile = [&](double p) -> double {
+            size_t idx = static_cast<size_t>(p / 100.0 * (xs.size() - 1));
+            return static_cast<double>(xs[idx]);
+        };
+
+        double sum = std::accumulate(xs.begin(), xs.end(), 0.0);
+        return LatencyStats{
+            percentile(50),
+            percentile(90),
+            percentile(99),
+            static_cast<double>(xs.back()),
+            static_cast<double>(xs.front()),
+            sum / xs.size()
+        };
+    }
+
     std::vector<uint64_t> samples_;
 };
 
@@ -112,8 +122,12 @@ inline void print_results_table(const std::vector<BenchResult>& results) {
 
 // ---- Per-thread latency sampler ----
 // Records individual operation latencies with minimal overhead.
+// alignas(64): adjacent samplers in std::vector<OpSampler> must not share a
+// cache line; otherwise per-op push_back from different threads false-shares
+// the vector header bytes and inflates measured tail latencies — defeating
+// the whole point of comparing V1's global mutex against V2's sharded mutex.
 
-class OpSampler {
+class alignas(64) OpSampler {
 public:
     void reserve(size_t n) { samples_.reserve(n); }
 
@@ -122,7 +136,7 @@ public:
     void end() {
         auto finish = ScopedTimer::Clock::now();
         uint64_t ns = static_cast<uint64_t>(
-            std::chrono::duration<double, std::nano>(finish - start_).count());
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start_).count());
         samples_.push_back(ns);
     }
 

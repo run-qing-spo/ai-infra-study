@@ -65,10 +65,12 @@ BenchResult run_benchmark(const char* label, int num_threads, Cache& cache) {
         threads.emplace_back(worker, i);
     }
 
-    // Wait for all threads to be ready, then start
+    // Wait for all threads to be ready, then start the timer AFTER signalling
+    // go=1.  Starting before the store would include the store→load propagation
+    // delay and the workers' final spin iterations in the measured wall time.
     while (ready.load() < num_threads) { /* spin */ }
-    ScopedTimer wall_timer;
     go.store(1);
+    ScopedTimer wall_timer;
 
     for (auto& t : threads) {
         t.join();

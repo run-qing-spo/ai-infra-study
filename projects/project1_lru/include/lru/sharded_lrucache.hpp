@@ -15,6 +15,16 @@
 template <typename K, typename V>
 class ShardedLRUCache {
 public:
+    // Maximum supported shard count; the underlying storage is a fixed-size
+    // std::array of this length, so num_shards passed to the constructor must
+    // not exceed kMaxShards.  Exposed publicly so callers can query the upper
+    // bound instead of guessing at the implementation detail.
+    static constexpr size_t kMaxShards = 64;
+    // kDefaultShards: shard count used when the caller omits the argument.
+    // Currently equal to kMaxShards (the cache is sized for full sharding by
+    // default) but the two concepts are kept separate for future evolution.
+    static constexpr size_t kDefaultShards = kMaxShards;
+
     explicit ShardedLRUCache(size_t total_capacity,
                              size_t num_shards = kDefaultShards)
         : num_shards_(checked_num_shards(total_capacity, num_shards)) {
@@ -79,8 +89,6 @@ public:
     ShardedLRUCache& operator=(ShardedLRUCache&&) = delete;
 
 private:
-    static constexpr size_t kDefaultShards = 64;
-
     struct alignas(64) Shard {
         LRUCacheBase<K, V> cache{1};  // placeholder; overwritten in constructor
         std::mutex mutex;
@@ -90,11 +98,11 @@ private:
 #ifndef NDEBUG
         assert(total_capacity > 0 && "ShardedLRUCache total capacity must be > 0");
         assert(num_shards > 0 && "ShardedLRUCache shard count must be > 0");
-        assert(num_shards <= kDefaultShards && "ShardedLRUCache shard count exceeds fixed shard storage");
+        assert(num_shards <= kMaxShards && "ShardedLRUCache shard count exceeds kMaxShards");
         assert(num_shards <= total_capacity && "ShardedLRUCache shard count must not exceed total capacity");
 #else
         if (total_capacity == 0 || num_shards == 0 ||
-            num_shards > kDefaultShards || num_shards > total_capacity) {
+            num_shards > kMaxShards || num_shards > total_capacity) {
             std::terminate();
         }
 #endif
@@ -112,5 +120,5 @@ private:
     }
 
     size_t num_shards_;
-    std::array<Shard, kDefaultShards> shards_;
+    std::array<Shard, kMaxShards> shards_;
 };
