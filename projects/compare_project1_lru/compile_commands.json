@@ -1,0 +1,19 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-std=c++17",
+      "-Wall",
+      "-Wextra",
+      "-g",
+      "-Iinclude",
+      "-o",
+      "test/test_bin",
+      "test/test.cpp"
+    ],
+    "directory": "/home/runqing/ai-infra-study/projects/compare_project1_lru",
+    "file": "/home/runqing/ai-infra-study/projects/compare_project1_lru/test/test.cpp",
+    "output": "/home/runqing/ai-infra-study/projects/compare_project1_lru/test/test_bin"
+  }
+]
