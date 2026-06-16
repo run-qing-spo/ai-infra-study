@@ -6,17 +6,18 @@
 
 TEST(LruCacheBaseTest, PushAddsNodesAfterHead) {
     std::vector<int> values{1, 2, 4, 3};
-    lru_base::lrucache_base node(1);
+    lru_base::lrucache_base<int, int> node(4);
 
     for (int value : values) {
-        node.push(value);
+        node.push(value, std::make_shared<int>(std::move(value))); 
     }
 
     std::vector<int> actual;
-    for (lru_base::lrucache_base* cur = &node; cur != nullptr; cur = cur->next) {
-        actual.emplace_back(cur->val);
+    auto shared_actual = node.show();
+    for (const auto& v:shared_actual) {
+        actual.emplace_back(*v);
     }
 
-    const std::vector<int> expected{1, 3, 4, 2, 1};
+    const std::vector<int> expected{3, 4, 2, 1};
     EXPECT_EQ(expected, actual);
 }

@@ -3,3 +3,5 @@ docs/.vitepress/dist
 docs/.vitepress/cache
 projects/project1_lru/build/
 */.claude/*
+*/.cache/*
+*/test/*.bin
