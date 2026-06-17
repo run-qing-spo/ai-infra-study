@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <memory>
 #include<optional>
 #include<vector>
@@ -14,6 +16,10 @@ namespace lru_base {
         public:
             explicit lrucache_base(int32_t x):_capacity(x), _head_free(0), used_head_sentinel_(x), used_tail_sentinel_(x+1){
                 // 在这个函数体内部可以用_capacity了，列表初始化结束后才会执行函数体中的内容
+                if (x <= 0) {
+                    std::abort();
+                }
+                assert(x > 0);
                 pool.reserve(x+2);
                 for(int i = 0; i < x; ++i) {
                     pool.emplace_back(i+1, i-1);
@@ -26,7 +32,10 @@ namespace lru_base {
                 // 使用智能指针就不需要自己delete了
             }
             void push(const K& key, std::shared_ptr<V> value) {
-                if (key2idx.find(key) != key2idx.end()) {
+                auto it = key2idx.find(key);
+                if (it != key2idx.end()) {
+                    pool[it->second].value = value;
+                    moveToHead(it->second);
                     return;
                 }
                 if (_head_free == _capacity) {
@@ -38,7 +47,7 @@ namespace lru_base {
                 pool[addPage].key = key;
                 pool[addPage].value = value;
                 key2idx[key] = addPage;
-                moveToHead(addPage);
+                insertAtHead(addPage);
             }
 
             std::shared_ptr<V> get(const K& key) {
@@ -94,11 +103,19 @@ namespace lru_base {
                 key2idx.erase(pool[idx].key);
             }
 
+            void insertAtHead(int32_t addPage) {
+                // addPage变为新头
+                pool[pool[used_head_sentinel_].next].prev = addPage; // 原来的头往前指向addPage
+                pool[addPage].next = pool[used_head_sentinel_].next; // addPage往后指向原来头
+                pool[used_head_sentinel_].next = addPage; // 哨兵头往后指向addpage
+                pool[addPage].prev = used_head_sentinel_; // addPage往前指向哨兵头
+            }
             void moveToHead(int32_t addPage) {
-                pool[addPage].next = pool[used_head_sentinel_].next; // 当前下一位
-                pool[used_head_sentinel_].next = addPage; // 头的下一位
-                pool[pool[addPage].next].prev = addPage; // 下一位的上一位
-                pool[addPage].prev = used_head_sentinel_;
+                // 断开addPage两端
+                pool[pool[addPage].next].prev = pool[addPage].prev;
+                pool[pool[addPage].prev].next = pool[addPage].next;
+                // addPage变为新头
+                insertAtHead(addPage);
             }
     };
 }
