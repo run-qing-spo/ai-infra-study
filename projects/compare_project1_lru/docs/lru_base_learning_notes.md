@@ -44,6 +44,18 @@ struct Node {
 
 零额外结构、零碎片化逻辑。比"区间型 free list（存 start+length）"简单得多，性能等价。
 
+**终止符要显式**：最后一个 free 节点的 `next` 写成一个**不可能合法**的索引，作为"链表到底了"的标记。LRU 里选 `-1`：
+
+```cpp
+static constexpr int32_t free_tail_sentinel_ = -1;
+// 初始化时
+pool[x - 1].next = free_tail_sentinel_;
+// 判空
+if (_head_free == free_tail_sentinel_) { /* cache 满 */ }
+```
+
+> 早期写法用 `_head_free == _capacity` 判空（因为最后一个 free 节点的 `next` 凑巧被赋成 `_capacity`），能跑但是**靠数值巧合**——`_capacity` 同时也是 head sentinel 的索引，逻辑上是两个不同的东西。一旦 sentinel 位置改动，整套判空静默失效。用专门的 `-1` 把"链表终止"和"sentinel 索引"在语义上分开。
+
 ### 1.4 双哨兵：消除边界分支
 
 `used` 链表两端各放一个永远存在的 sentinel Node：
@@ -114,6 +126,25 @@ lrucache_base<V>::lrucache_base() { ... }
 ```
 
 注意：写"半个"模板参数（比如双参类模板里只写一个）会让类型名残缺，**编译失败**。要么全写，要么用 injected name 一个不写。
+
+### 2.3 `static_assert`：编译期约束模板参数
+
+模板参数有"必须满足某些性质"的隐含要求时（比如 LRU 池槽位需要 `K` 默认可构造），把它写成 `static_assert` 让编译期直接挂，比让代码在某行 `K()` 莫名失败更早暴露：
+
+```cpp
+template<typename K, typename V>
+class lrucache_base {
+    static_assert(std::is_default_constructible_v<K>,
+                  "K must be default-constructible for free-list slot init");
+public:
+    // ...
+};
+```
+
+要点：
+- 运行时 `assert` ↔ 编译期 `static_assert` 是两套机制：前者 `NDEBUG` 下被宏掉，后者**永远生效**，但条件必须是**编译期常量表达式**；
+- C++17 起 message 可省，写上更友好；
+- **放在类体顶部**（不属于任何 `public`/`private` 区段，放哪里都行），这样类模板**一被实例化**就检查，而不是等到构造器被实例化才触发。`lrucache_base<NoDefault, V>* p;` 这种只声明指针的写法也能被它抓到。
 
 ---
 
@@ -214,6 +245,43 @@ explicit lrucache_base(int32_t x) : _capacity(x), ... {
     pool.reserve(_capacity + 2);
 }
 ```
+
+### 4.5 `static` 成员的初始化位置
+
+访问性（`public`/`private`）和"能不能在类内初始化"**无关**。决定能不能类内初始化的是**类型 + 限定符**：
+
+| 形式 | 类内初始化？ | 备注 |
+|---|---|---|
+| `static constexpr T x = ...;` | ✅ 必须 | C++17 起隐式 `inline`，头文件友好 |
+| `static const int x = 5;`（整型/枚举） | ✅ 可以 | C++98 就支持 |
+| `static const std::string s = ...;`（非整型） | ❌ 类内只声明，类外定义 | 否则链接重复 |
+| `inline static T x = ...;`（C++17） | ✅ 任何类型 | 现代写法 |
+| `static T x;`（普通） | ❌ 类内声明 + `.cpp` 里定义 | 类外形如 `T Foo::x;` |
+
+类外定义不是"全局变量"，而是**带类名作用域**：
+
+```cpp
+// .hpp
+class Foo { static std::string s; };
+
+// .cpp
+std::string Foo::s = "hi";    // 不是 global s，是 Foo::s
+```
+
+**模板类 + 仅头文件**的场景里这条不可行（多 TU 会重复定义），所以模板类的 static 成员只能选 `static constexpr` 或 `inline static`。LRU 里 `free_tail_sentinel_` 走的是 `static constexpr`。
+
+### 4.6 `static const` vs `static constexpr`
+
+| | `static const` | `static constexpr` |
+|---|---|---|
+| 含义 | "我不会改" | "编译期就能算出来" |
+| 用作数组大小 / 模板参数 / 其他 constexpr | 仅当编译期常量 | 总是可以 |
+| 头文件类内初始化 | 仅整型/枚举 | 任意 literal type |
+| C++17 隐式 inline | ✗ | ✓ |
+
+判断：表达"真编译期常量"用 `constexpr`，表达"运行时确定但之后不变的只读引用"用 `const`。
+- LRU 里 `_capacity`、`used_head_sentinel_` 这类是构造时**才**确定的（依赖参数 x），逻辑上属于 `const`；
+- `free_tail_sentinel_ = -1` 是真编译期常量、跨实例共享，用 `static constexpr` 更准、还省 4 字节/实例。
 
 ---
 
@@ -348,6 +416,22 @@ b->next = a;   // a.refcount = 2
 | 多方共享 | 不支持 | 核心能力 |
 
 **`optional<shared_ptr<T>>` 是冗余**：两种"空"语义重复。`get` 返回 `shared_ptr<V>` 即可，nullptr 表示没命中。
+
+### 5.8a 栈 vs 堆 / 为什么不写 `new`
+
+```cpp
+lrucache_base<int, int> cache(4);                              // 栈上
+auto* cache = new lrucache_base<int, int>(4);                   // 堆上裸指针（要自己 delete）
+auto cache = std::make_unique<lrucache_base<int, int>>(4);      // 堆上 RAII（自动释放）
+```
+
+C++ **默认值语义**：`T x(...)` 直接在当前作用域（栈/容器内/对象成员里）构造，出作用域**自动析构**。这是 RAII 的根基。`new` 把对象放到堆上、返回裸指针，从此**所有权由你掌管**。
+
+来自 Go 的直觉差：
+- Go 里 `NewCache(4)` 几乎总返回指针，GC 兜底，不太需要管栈/堆；
+- C++ 没 GC，所以**能在栈上就别上堆**——无需手动释放、cache 局部性更好、构造析构成本更低。**只有对象需要超出当前作用域、需要多态分派、或太大撑爆栈时**才上堆。
+
+测试里 `lrucache_base<int, int> node(4);` 就是栈对象，TEST body 结束自动析构。完美场景，根本不需要 `new`。
 
 ### 5.8 `reset()`
 
@@ -545,6 +629,59 @@ int main() {
 
 测试框架（GTest / Catch2）已经替你做了这件事，`EXPECT_THROW` 也会打 `what()`。
 
+### 7.5 `std::abort` vs `std::terminate`：处理链的差别
+
+两者都让进程死，但路径不同：
+
+```
+未捕获异常 / noexcept 函数里抛 / 析构期间再抛
+        ↓
+   std::terminate()
+        ↓
+   当前注册的 terminate_handler  ← std::set_terminate 可换
+        ↓ （默认 handler）
+   std::abort()  →  SIGABRT
+```
+
+- `std::terminate()` 走 **terminate_handler 链**，生产环境常用来"死前刷日志、上报 crash"——你**主动**调它也会触发钩子；
+- `std::abort()` 直接 raise SIGABRT，**绕过 handler**。
+
+实用判断：
+- "调用方 bug，理论上不该触发" → `assert`（debug 期挂、release 期消失）；
+- "严重错误，立刻死，不在意 handler" → `std::abort`；
+- "运行时可能合理失败，调用方可以 catch" → `throw`。
+
+LRU 里 `capacity <= 0` 是程序员错误，`assert` 或 `std::abort` 都合理。`std::terminate` 偏严重——如果项目接了 crash reporter，触发它就会发上报。
+
+### 7.6 构造器没法返回错误码 — Go ↔ C++ 风格
+
+Go 习惯 `NewFoo() (*Foo, error)` 让上层处理。C++ 构造器**不能返回值**，三种应对：
+
+```cpp
+// (A) 抛异常
+explicit lrucache_base(int32_t x) {
+    if (x <= 0) throw std::invalid_argument("capacity must be positive");
+}
+
+// (B) 不变量违反 → assert / abort
+explicit lrucache_base(int32_t x) {
+    if (x <= 0) std::abort();
+}
+
+// (C) 静态工厂 + std::optional / std::expected —— 最接近 Go 风格
+class lrucache_base {
+public:
+    static std::optional<lrucache_base> create(int32_t x) {
+        if (x <= 0) return std::nullopt;
+        return lrucache_base(x);
+    }
+private:
+    explicit lrucache_base(int32_t x) { /* 私有，强制走 create */ }
+};
+```
+
+（C）完美对应 Go 的 `(T, error)`，代价是构造器私有 + 多一层函数。工程上**只在"真有可能失败"时用**——比如初始化要读文件、连网络。大多数构造器走（A）或（B）就够。
+
 ---
 
 ## 八、设计经验沉淀
@@ -557,6 +694,22 @@ int main() {
 4. **`eraseFromTail` 用 O(N) 扫尾** → 抹掉了 LRU 的 O(1) 卖点（双哨兵后用 `pool[tail].prev` O(1) 拿到）；
 5. **`get` 用 `erase + push` 模拟"移到头"** → 触发 hash 表/free list/shared_ptr 多次抖动，提取 `moveToHead(idx)` 简洁又高效；
 6. **每次 `pool[next]` 没判哨兵** → 单 sentinel 方案下越界 UB；双哨兵直接消掉这类分支。
+7. **`moveToHead` 把"unlink 旧位置"和"插入到头"耦合在一个函数里**，调用方必须保证"节点当前确实在 used 链上"。`push` 把刚从 free list 弹出的节点插链，节点的 `prev`/`next` 是 **stale**（首次用是构造器初始化时的 `-1`/相邻 free 节点；evict 复用是它上次在 used 链上的旧邻居），直接调 `moveToHead` 要么越界、要么改坏无辜邻居。解法：**拆成两个函数**——
+   - `insertAtHead(idx)`：假设 `idx` 不在链上，挂到头部 → 给 `push` 用；
+   - `moveToHead(idx)` = unlink + `insertAtHead` → 给 `get` 和 push 的 update 分支用。
+8. **`insertAtHead` 的写入顺序敏感**：必须**先**用旧的 `pool[head_sentinel].next` 给 `pool[addPage].next` 赋值，**再**覆盖 `pool[head_sentinel].next`。反过来写会读到刚写进去的 `addPage` 自己，造成 `pool[addPage].next = addPage` 自环：
+   ```cpp
+   // ✗ 错误顺序：自环
+   pool[used_head_sentinel_].next = addPage;             // 已覆盖
+   pool[addPage].next = pool[used_head_sentinel_].next;   // 读回 addPage 自己
+
+   // ✓ 正确顺序：先读旧值
+   pool[pool[used_head_sentinel_].next].prev = addPage;
+   pool[addPage].next = pool[used_head_sentinel_].next;   // 此时仍是旧 head
+   pool[used_head_sentinel_].next = addPage;              // 最后覆盖
+   pool[addPage].prev = used_head_sentinel_;
+   ```
+9. **`erase` 公开走 key 路径，内部转发到 `eraseByIdx`**：避免内部已经拿到 idx 还要 `pool[idx].key` 反查 hash 表（evict 路径上发生过）。直接 `eraseByIdx(tail_idx)` 替代 `erase(pool[tail_idx].key)`。
 
 ### 8.2 接口设计的几个小决定
 
@@ -585,13 +738,16 @@ LRU 这版命名两种风格混用了：`_head_free` (前缀下划线) vs `used_
 ```cpp
 template<typename K, typename V>
 class lrucache_base {
+    static_assert(std::is_default_constructible_v<K>,
+                  "K must be default-constructible for free-list slot init");
 public:
-    explicit lrucache_base(int32_t capacity);    // throws on capacity <= 0
-    ~lrucache_base() = default;                  // 智能指针自动收尾
+    explicit lrucache_base(int32_t capacity);             // capacity <= 0 → abort
+    ~lrucache_base() = default;                           // 智能指针自动收尾
 
-    void push(const K& key, std::shared_ptr<V> value);   // sink by value
+    void push(const K& key, std::shared_ptr<V> value);    // sink by value; 重复 key 走 update + moveToHead
     std::shared_ptr<V> get(const K& key);                 // nullptr = miss
     void erase(const K& key);
+    std::vector<std::shared_ptr<V>> values();             // 从最新到最旧
 
 private:
     struct Node {
@@ -602,15 +758,17 @@ private:
         Node(int32_t n, int32_t p);
     };
 
-    const int32_t _capacity;
-    const int32_t _head_sentinel;     // = _capacity
-    const int32_t _tail_sentinel;     // = _capacity + 1
+    int32_t _capacity;
     int32_t _head_free;
+    const int32_t used_head_sentinel_;                    // = _capacity
+    const int32_t used_tail_sentinel_;                    // = _capacity + 1
+    static constexpr int32_t free_tail_sentinel_ = -1;    // free list 终止符
 
-    std::vector<Node> pool;           // size = _capacity + 2
+    std::vector<Node> pool;                               // size = _capacity + 2
     std::unordered_map<K, int32_t> key2idx;
 
     void eraseByIdx(int32_t idx);
-    void moveToHead(int32_t idx);
+    void insertAtHead(int32_t idx);                       // 假设 idx 不在 used 链上
+    void moveToHead(int32_t idx);                         // unlink + insertAtHead
 };
 ```

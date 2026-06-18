@@ -1,29 +1,28 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <exception>
 #include <memory>
-#include<optional>
-#include<vector>
-#include<utility>
+#include <vector>
 #include <unordered_map>
-#include <assert.h>
+#include <type_traits>
 
 namespace lru_base {
 
     template<typename K, typename V>
     class lrucache_base {
+        static_assert(std::is_default_constructible_v<K>, "K must be default-constructible");
         public:
             explicit lrucache_base(int32_t x):_capacity(x), _head_free(0), used_head_sentinel_(x), used_tail_sentinel_(x+1){
                 // 在这个函数体内部可以用_capacity了，列表初始化结束后才会执行函数体中的内容
                 if (x <= 0) {
                     std::abort();
                 }
-                assert(x > 0);
-                pool.reserve(x+2);
+                pool.reserve(static_cast<std::size_t>(x+2)); // std::size_t和size_t有什么区别？
                 for(int i = 0; i < x; ++i) {
                     pool.emplace_back(i+1, i-1);
                 }
+                pool[x-1].next = free_tail_sentinel_;
                 pool.emplace_back(used_tail_sentinel_, used_head_sentinel_);
                 pool.emplace_back(used_tail_sentinel_, used_head_sentinel_);
             }
@@ -38,7 +37,7 @@ namespace lru_base {
                     moveToHead(it->second);
                     return;
                 }
-                if (_head_free == _capacity) {
+                if (_head_free == free_tail_sentinel_) {
                     auto tail = pool[_capacity+1].prev;
                     erase(pool[tail].key);
                 }
@@ -51,8 +50,9 @@ namespace lru_base {
             }
 
             std::shared_ptr<V> get(const K& key) {
-                if (key2idx.find(key) != key2idx.end()) {
-                    int idx = key2idx[key];
+                auto it = key2idx.find(key);
+                if (it != key2idx.end()) {
+                    int32_t idx = it->second;
                     moveToHead(idx);
                     return pool[idx].value;
                 }
@@ -60,13 +60,14 @@ namespace lru_base {
             }
 
             void erase(const K& key) {
-                if (key2idx.find(key) != key2idx.end()) {
-                    int idx = key2idx[key];
+                auto it = key2idx.find(key);
+                if (it != key2idx.end()) {
+                    int32_t idx = it->second;
                     eraseByIdx(idx);
                 }
             }
 
-            std::vector<std::shared_ptr<V>> show() {
+            std::vector<std::shared_ptr<V>> values() {
                 std::vector<std::shared_ptr<V>> res;
                 int32_t cur = pool[used_head_sentinel_].next;
                 while(cur != used_tail_sentinel_) {
@@ -84,7 +85,6 @@ namespace lru_base {
                 int32_t next; // 存idx
                 int32_t prev;
                 Node(int32_t _nxt, int32_t _prv):value(nullptr), next(_nxt), prev(_prv){}
-                Node(std::shared_ptr<V> val, int32_t _nxt, int32_t _prv):value(val), next(_nxt), prev(_prv){}
             };
 
             std::vector<Node> pool;
@@ -93,6 +93,7 @@ namespace lru_base {
             int32_t _head_free;
             const int32_t used_head_sentinel_;
             const int32_t used_tail_sentinel_;
+            static constexpr int32_t free_tail_sentinel_ = -1;
 
             void eraseByIdx(int32_t idx) {
                 pool[pool[idx].next].prev = pool[idx].prev;
