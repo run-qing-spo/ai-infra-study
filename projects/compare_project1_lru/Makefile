@@ -3,7 +3,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -g -Iinclude
 GTEST_CFLAGS := $(shell pkg-config --cflags gtest 2>/dev/null)
 GTEST_LIBS   := $(shell pkg-config --libs gtest_main 2>/dev/null || echo -lgtest -lgtest_main -pthread)
 
-TEST_BIN := test/test_bin
+TEST_BIN := build/test_bin
 TEST_SRC := test/test.cpp
 HEADERS  := include/lru_base.hpp
 

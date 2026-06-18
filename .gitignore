@@ -1,7 +1,7 @@
 node_modules/
 docs/.vitepress/dist
 docs/.vitepress/cache
-projects/project1_lru/build/
+**/build/
 */.claude/*
-*/.cache/*
+**/.cache/
 */test/*.bin
