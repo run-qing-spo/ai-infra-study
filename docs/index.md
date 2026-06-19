@@ -33,7 +33,7 @@ features:
 
 ### AI 存储
 
-- [项目总览](/projects/overview) — KV Cache 分层卸载 + 异步 Checkpoint，两个动手项目的路线图与进度追踪
+- [项目总览](/projects/overview) — 围绕 KV Cache 存储的 10 个渐进式 C++ 小项目（单层缓存 → 4 层完整路径）路线图
 
 ### 算法与数据结构
 
