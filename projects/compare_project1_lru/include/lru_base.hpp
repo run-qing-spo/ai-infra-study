@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <type_traits>
+#include <stdexcept>
 
 namespace lru_base {
 
@@ -16,9 +17,9 @@ namespace lru_base {
             explicit lrucache_base(int32_t x):_capacity(x), _head_free(0), used_head_sentinel_(x), used_tail_sentinel_(x+1){
                 // 在这个函数体内部可以用_capacity了，列表初始化结束后才会执行函数体中的内容
                 if (x <= 0) {
-                    std::abort();
+                    throw std::invalid_argument("capacity must > 0");
                 }
-                pool.reserve(static_cast<std::size_t>(x+2)); // std::size_t和size_t有什么区别？
+                pool.reserve(static_cast<std::size_t>(x+2));
                 for(int i = 0; i < x; ++i) {
                     pool.emplace_back(i+1, i-1);
                 }
@@ -33,19 +34,20 @@ namespace lru_base {
             void push(const K& key, std::shared_ptr<V> value) {
                 auto it = key2idx.find(key);
                 if (it != key2idx.end()) {
-                    pool[it->second].value = value;
+                    pool[it->second].value = std::move(value);
                     moveToHead(it->second);
                     return;
                 }
                 if (_head_free == free_tail_sentinel_) {
-                    auto tail = pool[_capacity+1].prev;
+                    auto tail = pool[used_tail_sentinel_].prev;
                     erase(pool[tail].key);
                 }
+                
                 int32_t addPage = _head_free;
-                _head_free = pool[_head_free].next;
                 pool[addPage].key = key;
-                pool[addPage].value = value;
                 key2idx[key] = addPage;
+                _head_free = pool[_head_free].next;
+                pool[addPage].value = std::move(value);
                 insertAtHead(addPage);
             }
 
@@ -96,12 +98,12 @@ namespace lru_base {
             static constexpr int32_t free_tail_sentinel_ = -1;
 
             void eraseByIdx(int32_t idx) {
+                key2idx.erase(pool[idx].key);
                 pool[pool[idx].next].prev = pool[idx].prev;
                 pool[pool[idx].prev].next = pool[idx].next;
                 pool[idx].value.reset();
                 pool[idx].next = _head_free;
                 _head_free = idx;
-                key2idx.erase(pool[idx].key);
             }
 
             void insertAtHead(int32_t addPage) {
