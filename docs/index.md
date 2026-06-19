@@ -34,11 +34,14 @@ features:
 ### AI 存储
 
 - [项目总览](/projects/overview) — 围绕 KV Cache 存储的 10 个渐进式 C++ 小项目（单层缓存 → 4 层完整路径）路线图
+- [项目 1 · Thread-safe LRU Cache](/projects/project1_lru/README) — 16 线程并发 LRU，`-fsanitize=thread` 0 race
+- 背景知识（服务 P1/P2）：
+  - [多线程缓存设计综述](/algorithms/concurrent-cache) — Sharding、全局锁、不同算法的并发方案
+  - [LRU/ARC/LFU 算法对比](/algorithms/lru-arc-lfu-comparison) — 原理、性能对比、适用场景
 
-### 算法与数据结构
+### C++
 
-- [多线程缓存设计综述](/algorithms/concurrent-cache) — Sharding、全局锁、不同算法的并发方案
-- [LRU/ARC/LFU 算法对比](/algorithms/lru-arc-lfu-comparison) — 原理、性能对比、适用场景
+- [C++ 异常安全 与 数据安全](/cpp/exception-safety) — 三层异常保证、RAII 与持久化场景的边界
 
 ### AI
 

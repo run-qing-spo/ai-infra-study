@@ -3,6 +3,30 @@ import { defineConfig } from 'vitepress'
 import taskLists from 'markdown-it-task-lists'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
+const aiStorageSidebar = () => [
+  {
+    text: 'AI 存储',
+    items: [
+      { text: '项目总览', link: '/projects/overview' },
+    ],
+  },
+  {
+    text: '背景知识（服务 P1/P2）',
+    collapsed: false,
+    items: [
+      { text: '多线程缓存设计综述', link: '/algorithms/concurrent-cache' },
+      { text: 'LRU/ARC/LFU 算法对比', link: '/algorithms/lru-arc-lfu-comparison' },
+    ],
+  },
+  {
+    text: '项目 1 · Thread-safe LRU Cache',
+    collapsed: false,
+    items: [
+      { text: 'README', link: '/projects/project1_lru/README' },
+    ],
+  },
+]
+
 export default withMermaid(
   defineConfig({
   title: 'AI Infra Study',
@@ -20,6 +44,7 @@ export default withMermaid(
       { text: '首页', link: '/' },
       { text: '基础设施', link: '/infra/inference-fundamentals' },
       { text: 'AI 存储', link: '/projects/overview' },
+      { text: 'C++', link: '/cpp/exception-safety' },
     ],
     sidebar: {
       '/infra/': [
@@ -41,17 +66,15 @@ export default withMermaid(
           ],
         },
       ],
-      '/projects/': [
+      '/projects/': aiStorageSidebar(),
+      '/algorithms/': aiStorageSidebar(),
+      '/cpp/': [
         {
-          text: 'AI 存储',
+          text: 'C++',
           items: [
             {
-              text: '项目总览',
-              link: '/projects/overview',
-            },
-            {
-              text: '项目 1 · Thread-safe LRU Cache',
-              link: '/projects/project1_lru/README',
+              text: '异常安全 与 数据安全',
+              link: '/cpp/exception-safety',
             },
           ],
         },
