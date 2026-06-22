@@ -22,7 +22,8 @@ test: $(TEST_BIN)
 
 compdb:
 	$(MAKE) clean
-	bear -- $(MAKE) all
+	compiledb make
+# 	bear -- $(MAKE) all
 
 clean:
 	rm -f $(TEST_BIN)

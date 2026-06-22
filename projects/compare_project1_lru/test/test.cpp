@@ -85,3 +85,12 @@ TEST(LruCacheBaseTest, useAfterErase) {
     std::vector<int> expect{2};
     EXPECT_EQ(s, expect);
 }
+
+TEST(LruCacheBaseTest, useAfterEvict) {
+    lru_base::lrucache_base<int, int> node(1);
+    node.push(1, std::make_shared<int>(1));
+    auto cur = node.get(1);
+    node.push(2, std::make_shared<int>(2));
+    ASSERT_NE(cur, nullptr);
+    EXPECT_EQ(*cur, 1);
+}
