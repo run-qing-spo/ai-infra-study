@@ -4,6 +4,10 @@
 #include <mutex>
 #include <vector>
 
+#ifdef LRU_TEST_HOOKS
+#include <string>
+#endif
+
 namespace lru_mutex {
     template<typename K, typename V>
     class lrucache_mutex{
@@ -28,6 +32,13 @@ namespace lru_mutex {
                 std::lock_guard<std::mutex> g(mu);
                 return lru_base_.values();
             }
+
+#ifdef LRU_TEST_HOOKS
+            std::string audit() const {
+                std::lock_guard<std::mutex> g(mu);
+                return lru_base_.audit();
+            }
+#endif
 
         private:
             mutable std::mutex mu;
