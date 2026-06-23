@@ -2,7 +2,7 @@ node_modules/
 docs/.vitepress/dist
 docs/.vitepress/cache
 **/build/
-*/.claude/*
+**/.claude/settings.local.json
 **/.cache/
 */test/*.bin
 compile_commands.json
