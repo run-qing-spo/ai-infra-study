@@ -1,5 +1,5 @@
 CXX      := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -g -Iinclude
+CXXFLAGS := -std=c++17 -Wall -Wextra -g -Iinclude -DLRU_TEST_HOOKS
 GTEST_CFLAGS := $(shell pkg-config --cflags gtest 2>/dev/null)
 GTEST_LIBS   := $(shell pkg-config --libs gtest_main 2>/dev/null || echo -lgtest -lgtest_main -pthread)
 

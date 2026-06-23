@@ -58,6 +58,8 @@ TEST(LruCacheBaseTest, EvictFullPages) {
         s[i] = *a[i];
     }
     EXPECT_EQ(s, std::vector<int>{2});
+    auto x = node.get(1);
+    EXPECT_EQ(x, nullptr);
 }
 
 TEST(LruCacheBaseTest, PushSameKey) {
@@ -93,4 +95,200 @@ TEST(LruCacheBaseTest, useAfterEvict) {
     node.push(2, std::make_shared<int>(2));
     ASSERT_NE(cur, nullptr);
     EXPECT_EQ(*cur, 1);
+}
+
+TEST(LruCacheBaseTest, ConstructorThrowsOnNonPositiveCapacity) {
+    EXPECT_THROW((lru_base::lrucache_base<int, int>(0)), std::invalid_argument);
+    EXPECT_THROW((lru_base::lrucache_base<int, int>(-1)), std::invalid_argument);
+}
+
+TEST(LruCacheBaseTest, EraseNonExistingIsNoop) {
+    lru_base::lrucache_base<int, int> c(2);
+    c.push(1, std::make_shared<int>(1));
+    c.erase(99);
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_EQ(*v[0], 1);
+    // free list 仍可用
+    c.push(2, std::make_shared<int>(2));
+    auto v2 = c.values();
+    ASSERT_EQ(v2.size(), 2u);
+    EXPECT_EQ(*v2[0], 2);
+    EXPECT_EQ(*v2[1], 1);
+}
+
+TEST(LruCacheBaseTest, GetMissDoesNotChangeOrder) {
+    lru_base::lrucache_base<int, int> c(3);
+    c.push(1, std::make_shared<int>(1));
+    c.push(2, std::make_shared<int>(2));
+    c.push(3, std::make_shared<int>(3));
+    auto before = c.values();
+    EXPECT_EQ(c.get(99), nullptr);
+    auto after = c.values();
+    ASSERT_EQ(before.size(), after.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+        EXPECT_EQ(*before[i], *after[i]);
+    }
+}
+
+TEST(LruCacheBaseTest, PushSameKeyAtCapacityUpdatesValueWithoutEviction) {
+    lru_base::lrucache_base<int, int> c(3);
+    c.push(1, std::make_shared<int>(10));
+    c.push(2, std::make_shared<int>(20));
+    c.push(3, std::make_shared<int>(30));
+    c.push(2, std::make_shared<int>(222));  // 装满后覆盖 key=2
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 3u);
+    EXPECT_EQ(*v[0], 222);
+    EXPECT_EQ(*v[1], 30);
+    EXPECT_EQ(*v[2], 10);
+    auto g1 = c.get(1); ASSERT_NE(g1, nullptr); EXPECT_EQ(*g1, 10);
+    auto g3 = c.get(3); ASSERT_NE(g3, nullptr); EXPECT_EQ(*g3, 30);
+}
+
+TEST(LruCacheBaseTest, EraseHead) {
+    lru_base::lrucache_base<int, int> c(3);
+    c.push(1, std::make_shared<int>(1));
+    c.push(2, std::make_shared<int>(2));
+    c.push(3, std::make_shared<int>(3));
+    c.erase(3);  // head
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(*v[0], 2);
+    EXPECT_EQ(*v[1], 1);
+    c.push(4, std::make_shared<int>(4));
+    auto v2 = c.values();
+    ASSERT_EQ(v2.size(), 3u);
+    EXPECT_EQ(*v2[0], 4);
+    EXPECT_EQ(*v2[1], 2);
+    EXPECT_EQ(*v2[2], 1);
+}
+
+TEST(LruCacheBaseTest, EraseTail) {
+    lru_base::lrucache_base<int, int> c(3);
+    c.push(1, std::make_shared<int>(1));
+    c.push(2, std::make_shared<int>(2));
+    c.push(3, std::make_shared<int>(3));
+    c.erase(1);  // tail
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(*v[0], 3);
+    EXPECT_EQ(*v[1], 2);
+    c.push(4, std::make_shared<int>(4));
+    auto v2 = c.values();
+    ASSERT_EQ(v2.size(), 3u);
+    EXPECT_EQ(*v2[0], 4);
+    EXPECT_EQ(*v2[1], 3);
+    EXPECT_EQ(*v2[2], 2);
+}
+
+TEST(LruCacheBaseTest, EraseMiddle) {
+    lru_base::lrucache_base<int, int> c(3);
+    c.push(1, std::make_shared<int>(1));
+    c.push(2, std::make_shared<int>(2));
+    c.push(3, std::make_shared<int>(3));
+    c.erase(2);  // middle
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(*v[0], 3);
+    EXPECT_EQ(*v[1], 1);
+    c.push(4, std::make_shared<int>(4));
+    auto v2 = c.values();
+    ASSERT_EQ(v2.size(), 3u);
+    EXPECT_EQ(*v2[0], 4);
+    EXPECT_EQ(*v2[1], 3);
+    EXPECT_EQ(*v2[2], 1);
+}
+
+TEST(LruCacheBaseTest, FreeListIntegrityAfterManyCycles) {
+    constexpr int cap = 4;
+    constexpr int cycles = 1000;
+    lru_base::lrucache_base<int, int> c(cap);
+    for (int i = 0; i < cap; ++i) {
+        c.push(i, std::make_shared<int>(i));
+    }
+    // 反复 erase + push,持续从 free list 取出又归还
+    for (int i = 0; i < cycles; ++i) {
+        int evict_key = i % cap;
+        c.erase(evict_key);
+        int new_key = cap + i;  // 永不与现存 key 撞
+        c.push(new_key, std::make_shared<int>(new_key));
+    }
+    auto v = c.values();
+    EXPECT_EQ(v.size(), static_cast<size_t>(cap));
+    for (const auto& sp : v) {
+        ASSERT_NE(sp, nullptr);
+    }
+}
+
+TEST(LruCacheBaseTest, CapacityOneEraseThenPush) {
+    lru_base::lrucache_base<int, int> c(1);
+    c.push(1, std::make_shared<int>(1));
+    c.erase(1);
+    EXPECT_TRUE(c.values().empty());
+    c.push(2, std::make_shared<int>(2));
+    auto v = c.values();
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_EQ(*v[0], 2);
+}
+
+TEST(LruCacheBaseTest, AuditHoldsAcrossOperations) {
+    lru_base::lrucache_base<int, int> c(3);
+    EXPECT_EQ(c.audit(), "");  // 空缓存
+    c.push(1, std::make_shared<int>(1));
+    EXPECT_EQ(c.audit(), "");
+    c.push(2, std::make_shared<int>(2));
+    c.push(3, std::make_shared<int>(3));
+    EXPECT_EQ(c.audit(), "");  // 满
+    c.push(4, std::make_shared<int>(4));  // 触发 evict
+    EXPECT_EQ(c.audit(), "");
+    c.erase(3);                            // 中间 erase
+    EXPECT_EQ(c.audit(), "");
+    c.erase(99);                           // 不存在
+    EXPECT_EQ(c.audit(), "");
+    c.get(2);                              // 移动到头
+    EXPECT_EQ(c.audit(), "");
+    c.push(2, std::make_shared<int>(222)); // 覆盖同 key
+    EXPECT_EQ(c.audit(), "");
+}
+
+TEST(LruCacheBaseTest, AuditHoldsThroughHeavyChurn) {
+    constexpr int cap = 4;
+    constexpr int cycles = 1000;
+    lru_base::lrucache_base<int, int> c(cap);
+    for (int i = 0; i < cap; ++i) {
+        c.push(i, std::make_shared<int>(i));
+    }
+    for (int i = 0; i < cycles; ++i) {
+        c.erase(i % cap);
+        c.push(cap + i, std::make_shared<int>(cap + i));
+        if (i % 100 == 0) {
+            ASSERT_EQ(c.audit(), "") << "audit failed at cycle " << i;
+        }
+    }
+    EXPECT_EQ(c.audit(), "");
+}
+
+TEST(LruCacheBaseTest, KeyValueConsistencyAfterMixedOps) {
+    // 借助 v == k 不变量,审计 key2idx 是否指向正确节点
+    constexpr int cap = 8;
+    lru_base::lrucache_base<int, int> c(cap);
+    std::vector<int> seq{1, 2, 3, 4, 5, 6, 7, 8, 3, 9, 10, 2, 11, 12, 5};
+    for (int k : seq) {
+        c.push(k, std::make_shared<int>(k));
+    }
+    c.erase(11);
+    c.erase(2);
+    int alive = 0;
+    for (int k = 1; k <= 12; ++k) {
+        auto sp = c.get(k);
+        if (sp) {
+            EXPECT_EQ(*sp, k) << "key " << k << " maps to wrong value";
+            ++alive;
+        }
+    }
+    EXPECT_EQ(c.get(11), nullptr);
+    EXPECT_EQ(c.get(2), nullptr);
+    EXPECT_EQ(static_cast<size_t>(alive), c.values().size());
+    EXPECT_LE(c.values().size(), static_cast<size_t>(cap));
 }

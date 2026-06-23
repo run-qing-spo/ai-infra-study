@@ -8,6 +8,11 @@
 #include <type_traits>
 #include <stdexcept>
 
+#ifdef LRU_TEST_HOOKS
+#include <string>
+#include <vector>
+#endif
+
 namespace lru_base {
 
     template<typename K, typename V>
@@ -78,6 +83,75 @@ namespace lru_base {
                 }
                 return res;
             }
+
+#ifdef LRU_TEST_HOOKS
+            // 返回空串表示所有不变量成立,否则返回首个被违反的不变量描述。
+            std::string audit() const {
+                const int max_steps = _capacity + 2;
+
+                std::vector<int32_t> used_fwd;
+                int32_t cur = pool[used_head_sentinel_].next;
+                int steps = 0;
+                while (cur != used_tail_sentinel_) {
+                    if (++steps > max_steps) return "used list forward: cycle or overflow";
+                    if (cur < 0 || cur >= _capacity) return "used list forward: idx out of range";
+                    used_fwd.push_back(cur);
+                    cur = pool[cur].next;
+                }
+
+                std::vector<int32_t> used_bwd;
+                cur = pool[used_tail_sentinel_].prev;
+                steps = 0;
+                while (cur != used_head_sentinel_) {
+                    if (++steps > max_steps) return "used list backward: cycle or overflow";
+                    if (cur < 0 || cur >= _capacity) return "used list backward: idx out of range";
+                    used_bwd.push_back(cur);
+                    cur = pool[cur].prev;
+                }
+
+                if (used_fwd.size() != used_bwd.size()) {
+                    return "used list: forward/backward length mismatch";
+                }
+                for (size_t i = 0; i < used_fwd.size(); ++i) {
+                    if (used_fwd[i] != used_bwd[used_bwd.size() - 1 - i]) {
+                        return "used list: forward/backward order mismatch";
+                    }
+                }
+
+                std::vector<int32_t> free_idxs;
+                cur = _head_free;
+                steps = 0;
+                while (cur != free_tail_sentinel_) {
+                    if (++steps > max_steps) return "free list: cycle or overflow";
+                    if (cur < 0 || cur >= _capacity) return "free list: idx out of range";
+                    free_idxs.push_back(cur);
+                    cur = pool[cur].next;
+                }
+
+                std::vector<bool> seen(static_cast<size_t>(_capacity), false);
+                for (int32_t i : used_fwd) {
+                    if (seen[i]) return "duplicate idx in used list";
+                    seen[i] = true;
+                }
+                for (int32_t i : free_idxs) {
+                    if (seen[i]) return "idx appears in both used and free";
+                    seen[i] = true;
+                }
+                for (int32_t i = 0; i < _capacity; ++i) {
+                    if (!seen[i]) return "idx missing from both lists";
+                }
+
+                if (key2idx.size() != used_fwd.size()) {
+                    return "key2idx size != used list length";
+                }
+                for (int32_t i : used_fwd) {
+                    auto it = key2idx.find(pool[i].key);
+                    if (it == key2idx.end()) return "used node key missing from key2idx";
+                    if (it->second != i) return "key2idx maps key to wrong idx";
+                }
+                return "";
+            }
+#endif
 
         private:
             int32_t _capacity;
