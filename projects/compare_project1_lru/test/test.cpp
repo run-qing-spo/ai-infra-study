@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 TEST(LruCacheBaseTest, PushAddsNodesAfterHead) {
@@ -291,4 +292,109 @@ TEST(LruCacheBaseTest, KeyValueConsistencyAfterMixedOps) {
     EXPECT_EQ(c.get(2), nullptr);
     EXPECT_EQ(static_cast<size_t>(alive), c.values().size());
     EXPECT_LE(c.values().size(), static_cast<size_t>(cap));
+}
+
+// === Layer 2: 鲁棒性 ===
+//
+// 当前实现观察到的异常安全保证 (用 audit() 验证不变量始终成立):
+//   * 构造: capacity <= 0 抛 invalid_argument,所有已构造成员被正常析构。
+//   * push 新 key + 容量未满: K 拷贝赋值若抛,旧条目原封不动,
+//     容量未缩水 (strong-like)。
+//   * push 新 key + 容量已满: K 拷贝赋值抛出前 evict 已发生,
+//     LRU 项丢失但新项未进入 (basic exception safety, 非 strong)。
+//   * erase / get: 仅触及 hash/equal,假设它们 noexcept。
+
+namespace robust_test {
+struct Throwy {
+    int v;
+    static inline thread_local int countdown = -1;  // -1 = 关闭注入
+    Throwy() : v(0) {}
+    explicit Throwy(int x) : v(x) {}
+    Throwy(const Throwy&) = default;
+    Throwy(Throwy&&) = default;
+    Throwy& operator=(const Throwy& o) {
+        tick();
+        v = o.v;
+        return *this;
+    }
+    Throwy& operator=(Throwy&&) = default;
+    bool operator==(const Throwy& o) const noexcept { return v == o.v; }
+private:
+    static void tick() {
+        if (countdown < 0) return;
+        if (countdown == 0) {
+            countdown = -1;
+            throw std::runtime_error("Throwy injected");
+        }
+        --countdown;
+    }
+};
+}  // namespace robust_test
+
+namespace std {
+template <> struct hash<robust_test::Throwy> {
+    size_t operator()(const robust_test::Throwy& t) const noexcept {
+        return std::hash<int>{}(t.v);
+    }
+};
+}  // namespace std
+
+TEST(LruBaseRobustness, PushThrowOnKeyAssignNotFullPreservesEverything) {
+    using K = robust_test::Throwy;
+    lru_base::lrucache_base<K, int> c(3);
+    c.push(K(1), std::make_shared<int>(1));
+    ASSERT_EQ(c.audit(), "");
+
+    K::countdown = 0;  // 让下一次 K 拷贝赋值抛出
+    EXPECT_THROW(c.push(K(2), std::make_shared<int>(2)), std::runtime_error);
+    K::countdown = -1;
+
+    EXPECT_EQ(c.audit(), "");
+    // 旧条目完整
+    auto sp = c.get(K(1));
+    ASSERT_NE(sp, nullptr);
+    EXPECT_EQ(*sp, 1);
+    // 新条目未进入
+    EXPECT_EQ(c.get(K(2)), nullptr);
+    // capacity 未缩:仍能再装两条
+    c.push(K(2), std::make_shared<int>(2));
+    c.push(K(3), std::make_shared<int>(3));
+    EXPECT_EQ(c.values().size(), 3u);
+    EXPECT_EQ(c.audit(), "");
+}
+
+TEST(LruBaseRobustness, PushThrowOnKeyAssignAtCapacityEvictsButDoesNotInsert) {
+    // 暴露并钉住当前语义:满容量下 push 抛出时,LRU 项已被驱逐,
+    // 即不满足 strong exception safety;但 audit 表明不变量仍然成立。
+    using K = robust_test::Throwy;
+    lru_base::lrucache_base<K, int> c(2);
+    c.push(K(1), std::make_shared<int>(1));  // LRU
+    c.push(K(2), std::make_shared<int>(2));  // MRU
+    ASSERT_EQ(c.audit(), "");
+
+    K::countdown = 0;
+    EXPECT_THROW(c.push(K(3), std::make_shared<int>(3)), std::runtime_error);
+    K::countdown = -1;
+
+    EXPECT_EQ(c.audit(), "");
+    EXPECT_EQ(c.get(K(1)), nullptr);  // 已被驱逐
+    auto sp = c.get(K(2));
+    ASSERT_NE(sp, nullptr);
+    EXPECT_EQ(*sp, 2);
+    EXPECT_EQ(c.get(K(3)), nullptr);  // 未插入
+}
+
+TEST(LruBaseRobustness, ErasedSharedPtrStaysAlive) {
+    lru_base::lrucache_base<int, int> c(2);
+    c.push(1, std::make_shared<int>(42));
+    auto sp = c.get(1);
+    ASSERT_NE(sp, nullptr);
+    EXPECT_EQ(sp.use_count(), 2);  // cache + 外部
+    c.erase(1);
+    EXPECT_EQ(c.get(1), nullptr);
+    // erase 不应影响外部持有的 shared_ptr
+    ASSERT_NE(sp, nullptr);
+    EXPECT_EQ(*sp, 42);
+    EXPECT_EQ(sp.use_count(), 1);  // cache 内部副本已释放
+    EXPECT_EQ(c.audit(), "");
 }
