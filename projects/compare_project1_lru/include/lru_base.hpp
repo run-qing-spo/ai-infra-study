@@ -4,6 +4,7 @@
 // #include <cstdlib>
 // #include <memory>
 // #include <vector>
+#include <functional>     // std::hash, std::equal_to
 #include <unordered_map>
 #include <type_traits>
 #include <stdexcept>
@@ -15,7 +16,11 @@
 
 namespace lru_base {
 
-    template<typename K, typename V>
+    template<
+        typename K,
+        typename V,
+        typename Hash = std::hash<K>,
+        typename KeyEqual = std::equal_to<K>>
     class lrucache_base {
         static_assert(std::is_default_constructible_v<K>, "K must be default-constructible");
         public:
@@ -164,7 +169,7 @@ namespace lru_base {
             };
 
             std::vector<Node> pool;
-            std::unordered_map<K, int32_t> key2idx;
+            std::unordered_map<K, int32_t, Hash, KeyEqual> key2idx;
 
             int32_t _head_free;
             const int32_t used_head_sentinel_;

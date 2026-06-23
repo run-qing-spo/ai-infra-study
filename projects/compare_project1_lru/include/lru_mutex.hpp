@@ -1,6 +1,7 @@
 #pragma once
 #include "lru_base.hpp"
 #include <cstddef> // 这个头提供std::size_t
+#include <functional>     // std::hash, std::equal_to
 #include <mutex>
 #include <vector>
 
@@ -9,7 +10,11 @@
 #endif
 
 namespace lru_mutex {
-    template<typename K, typename V>
+    template<
+        typename K,
+        typename V,
+        typename Hash = std::hash<K>,
+        typename KeyEqual = std::equal_to<K>>
     class lrucache_mutex{
         public:
             explicit lrucache_mutex(std::size_t capacity_):lru_base_(capacity_){}
@@ -42,6 +47,6 @@ namespace lru_mutex {
 
         private:
             mutable std::mutex mu;
-            lru_base::lrucache_base<K, V> lru_base_;
+            lru_base::lrucache_base<K, V, Hash, KeyEqual> lru_base_;
     };
 }

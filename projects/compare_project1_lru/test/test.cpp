@@ -329,19 +329,18 @@ private:
         --countdown;
     }
 };
-}  // namespace robust_test
 
-namespace std {
-template <> struct hash<robust_test::Throwy> {
-    size_t operator()(const robust_test::Throwy& t) const noexcept {
+// Hasher 作为模板参数传给 lru_base,不需要进 std 名字空间
+struct ThrowyHash {
+    size_t operator()(const Throwy& t) const noexcept {
         return std::hash<int>{}(t.v);
     }
 };
-}  // namespace std
+}  // namespace robust_test
 
 TEST(LruBaseRobustness, PushThrowOnKeyAssignNotFullPreservesEverything) {
     using K = robust_test::Throwy;
-    lru_base::lrucache_base<K, int> c(3);
+    lru_base::lrucache_base<K, int, robust_test::ThrowyHash> c(3);
     c.push(K(1), std::make_shared<int>(1));
     ASSERT_EQ(c.audit(), "");
 
@@ -367,7 +366,7 @@ TEST(LruBaseRobustness, PushThrowOnKeyAssignAtCapacityEvictsButDoesNotInsert) {
     // 暴露并钉住当前语义:满容量下 push 抛出时,LRU 项已被驱逐,
     // 即不满足 strong exception safety;但 audit 表明不变量仍然成立。
     using K = robust_test::Throwy;
-    lru_base::lrucache_base<K, int> c(2);
+    lru_base::lrucache_base<K, int, robust_test::ThrowyHash> c(2);
     c.push(K(1), std::make_shared<int>(1));  // LRU
     c.push(K(2), std::make_shared<int>(2));  // MRU
     ASSERT_EQ(c.audit(), "");
