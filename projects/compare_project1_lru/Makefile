@@ -7,7 +7,7 @@ GTEST_LIBS   := $(shell pkg-config --libs gtest_main 2>/dev/null || echo -lgtest
 TEST_BIN      := build/test_bin
 TEST_TSAN_BIN := build/test_tsan_bin
 BENCH_BIN     := build/bench_bin
-TEST_SRC := test/test.cpp test/test_mutex.cpp
+TEST_SRC := test/test.cpp test/test_mutex.cpp test/test_sharded.cpp
 BENCH_SRC := test/bench.cpp
 HEADERS  := $(wildcard include/*.hpp)
 

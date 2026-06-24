@@ -26,6 +26,7 @@
 
 #include "lru_base.hpp"
 #include "lru_mutex.hpp"
+#include "lru_sharded.hpp"
 
 namespace {
 
@@ -107,11 +108,15 @@ ThroughputResult run_throughput_single(
     return {ops, hits, gets, std::chrono::duration<double>(end - start).count()};
 }
 
-ThroughputResult run_throughput_multi(
+// 多线程吞吐核心实现。模板化是为了同时给 lru_mutex 和 lru_sharded 用,
+// 两者构造签名不同(一个 cap,一个 cap+shard_count),所以由外层 wrapper 负责构造,
+// 这里只接 cache&。
+template <typename Cache>
+ThroughputResult run_throughput_multi_impl(
+    Cache& cache,
     int capacity, int key_space, const Workload& w,
     std::chrono::milliseconds duration, int n_threads)
 {
-    lru_mutex::lrucache_mutex<int, int> cache(capacity);
     warm_up(cache, capacity, key_space);
 
     std::atomic<int> ready{0};
@@ -173,6 +178,25 @@ ThroughputResult run_throughput_multi(
         gets += per_gets[i];
     }
     return {ops, hits, gets, std::chrono::duration<double>(end - start).count()};
+}
+
+// 单一互斥锁版的多线程吞吐
+ThroughputResult run_throughput_multi(
+    int capacity, int key_space, const Workload& w,
+    std::chrono::milliseconds duration, int n_threads)
+{
+    lru_mutex::lrucache_mutex<int, int> cache(capacity);
+    return run_throughput_multi_impl(cache, capacity, key_space, w, duration, n_threads);
+}
+
+// 分片版的多线程吞吐
+ThroughputResult run_throughput_multi_sharded(
+    int capacity, int shard_count, int key_space, const Workload& w,
+    std::chrono::milliseconds duration, int n_threads)
+{
+    lru_sharded::lrucache_sharded<int, int> cache(
+        static_cast<std::size_t>(capacity), static_cast<std::size_t>(shard_count));
+    return run_throughput_multi_impl(cache, capacity, key_space, w, duration, n_threads);
 }
 
 struct LatencyResult {
@@ -309,7 +333,36 @@ int main() {
         }
     }
 
-    // --- 3. 延迟分位数 (lru_mutex, 单线程, balanced) ---
+    // --- 3. lru_sharded 分片数扫描 ---
+    // 固定 8 线程,扫 shard ∈ {1, 2, 4, 8, 16, 32, 64, 128}。
+    // 预期:
+    //   * shards=1 ≈ lru_mutex 8 线程基线(略低,因为多了 mod 和函数转发开销)
+    //   * shards 增加 → 吞吐爬升,直到 shard 数 ≫ 线程数后饱和
+    //   * write-heavy 改善幅度最大(临界区最长,锁竞争最显著)
+    //   * 命中率随 shards 上升而略降 —— 全局容量被切碎,热点 key 簇聚提前 evict
+    std::cout << "\n=== Sharded scaling (8 threads, varying shard count) ===\n";
+    std::cout << std::left << std::setw(14) << "workload"
+              << std::right << std::setw(9) << "shards"
+              << std::setw(14) << "total (M/s)"
+              << std::setw(12) << "hit rate"
+              << "\n";
+    constexpr int shard_counts[] = {1, 2, 4, 8, 16, 32, 64, 128};
+    constexpr int sharded_threads = 8;
+    for (const auto& w : kWorkloads) {
+        for (int sc : shard_counts) {
+            auto r = run_throughput_multi_sharded(
+                capacity, sc, key_space, w, duration, sharded_threads);
+            double mps = r.ops_per_sec() / 1e6;
+            std::cout << std::left << std::setw(14) << w.name
+                      << std::right << std::setw(9) << sc
+                      << std::fixed << std::setprecision(2)
+                      << std::setw(14) << mps
+                      << std::setw(11) << std::setprecision(1) << (r.hit_rate() * 100) << "%"
+                      << "\n";
+        }
+    }
+
+    // --- 4. 延迟分位数 (lru_mutex, 单线程, balanced) ---
     std::cout << "\n=== Latency percentiles (lru_mutex, single thread, balanced) ===\n";
     std::cout << "iters: " << latency_iters << "\n";
     auto lat = run_latency_single(capacity, key_space, kWorkloads[1], latency_iters);
