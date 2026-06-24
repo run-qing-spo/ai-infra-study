@@ -127,7 +127,104 @@ lrucache_base<V>::lrucache_base() { ... }
 
 注意：写"半个"模板参数（比如双参类模板里只写一个）会让类型名残缺，**编译失败**。要么全写，要么用 injected name 一个不写。
 
-### 2.3 `static_assert`：编译期约束模板参数
+### 2.3 默认模板参数与 Hasher 定制 —— 不污染 `std` 的写法
+
+`unordered_map` / `set` / `priority_queue` 这些容器为什么要把 Hash、Compare 作为模板参数？因为这样**用户既能享受默认行为，也能在不侵入 `std` 的前提下换实现**。我们让 `lrucache_base` 也走同样的路：
+
+```cpp
+template<
+    typename K,
+    typename V,
+    typename Hash     = std::hash<K>,        // ← 默认模板实参
+    typename KeyEqual = std::equal_to<K>>
+class lrucache_base {
+    // ...
+    std::unordered_map<K, int32_t, Hash, KeyEqual> key2idx;
+};
+```
+
+#### 默认模板实参 vs 全特化
+
+两种"给自定义类型加 hash"的路子有本质区别：
+
+| | **全特化 `std::hash<T>`** | **模板参数 + 默认值** |
+|---|---|---|
+| 写法 | `namespace std { template<> struct hash<MyType> {...}; }` | `struct MyHash { size_t operator()(...) const; };` |
+| 必须进 `std` 名字空间？ | ✓ 必须 | ✗ 不需要 |
+| 需要 `template<>` 语法？ | ✓ 必须 | ✗ 普通 struct |
+| 想用时调用方写什么？ | `unordered_map<MyType, V>` 自动选 | `lrucache_base<MyType, V, MyHash>` 显式传 |
+| 适用场景 | 你**无法**改容器的模板参数（标准库容器嵌死了 hash），只能特化 | 你能控制容器声明 |
+
+`std::unordered_map` 自己就同时支持两条路：它声明成 `template<class Key, class T, class Hash = std::hash<Key>, ...>`，你可以特化 `std::hash<Key>` 走默认参数，也可以传第三个模板参数。
+
+#### "全特化"到底是什么意思
+
+```cpp
+namespace std {
+    // primary template (标准库已经提供,内部对常见类型有偏特化)
+    template<class T> struct hash;
+
+    // 我们做的:给 T = MyType 的情况"覆盖"primary template
+    template<> struct hash<MyType> {
+        size_t operator()(const MyType& t) const noexcept { ... }
+    };
+}
+```
+
+- `template<>` 那对空尖括号告诉编译器：**这不是定义一个新模板，而是给已存在的模板 `hash<>` 提供一个针对特定 T 的版本**；
+- 全特化的 T 必须**完全具体化**（没有任何模板参数残留）；
+- 写在哪里？标准要求**和 primary 同名字空间**，所以是 `namespace std { ... }`。其他类型（你自己的 `MyHash`）想放哪儿放哪儿。
+
+#### 默认实参的细节
+
+```cpp
+template<typename K, typename V,
+         typename Hash = std::hash<K>>   // ← 注意这里 Hash 的默认值用到了 K
+class lrucache_base { ... };
+```
+
+- 默认实参里**可以引用前面声明过的模板形参**（如 `K`）。所以形参顺序很重要：`K` 必须出现在 `Hash` 之前。
+- 类似函数的默认形参，**只有从右往左可以默认**。比如 `<K, V, Hash, KeyEqual>`，你可以传 3 个、4 个，但不能跳过 `Hash` 只传 `KeyEqual`。
+- 调用方完全不感知：原来的 `lrucache_base<int, int>` 一行都不改，编译器自动补齐默认参数。
+
+#### 透传给底层
+
+`lru_mutex` 自己也带 4 个模板参数，转发给内部 `lru_base`：
+
+```cpp
+template<typename K, typename V,
+         typename Hash     = std::hash<K>,
+         typename KeyEqual = std::equal_to<K>>
+class lrucache_mutex {
+    // ...
+    lru_base::lrucache_base<K, V, Hash, KeyEqual> lru_base_;   // 原样转发
+};
+```
+
+这就是"模板参数转发"模式。STL 里 `stack<T, Container=deque<T>>` / `priority_queue<T, Container, Compare>` 也是这么写的。
+
+#### 使用对比
+
+```cpp
+// 用法 1：什么都不传,走默认 std::hash<MyType>
+//   前提：你为 MyType 全特化了 std::hash<MyType>,或者用 int 这种自带 hash 的类型
+lrucache_base<int, int> cache(1024);
+
+// 用法 2：自己写个 Hasher 类型,作为模板实参传进去
+struct MyHash {
+    size_t operator()(const MyType& m) const noexcept { return ...; }
+};
+lrucache_base<MyType, int, MyHash> cache(1024);
+//                       ^^^^^^ 不污染 std,不需要 template<>
+```
+
+#### 何时走哪条路
+
+- 你写的是一个**会被很多容器和算法用到**的类型（业务实体）→ 全特化 `std::hash`，一处覆盖到处生效；
+- 你只在某个特定容器里需要"按某种规则 hash"（例如 case-insensitive 字符串、忽略部分字段）→ 走自定义 Hasher 类型 + 模板实参，**不污染 `std`**；
+- 你做的是库设计者（像 `lru_base` 这种）→ 永远把 Hasher 作为模板参数暴露出来，给上层留口子。
+
+### 2.4 `static_assert`：编译期约束模板参数
 
 模板参数有"必须满足某些性质"的隐含要求时（比如 LRU 池槽位需要 `K` 默认可构造），把它写成 `static_assert` 让编译期直接挂，比让代码在某行 `K()` 莫名失败更早暴露：
 
@@ -736,12 +833,16 @@ LRU 这版命名两种风格混用了：`_head_free` (前缀下划线) vs `used_
 ## 附：最终结构速览
 
 ```cpp
-template<typename K, typename V>
+template<
+    typename K,
+    typename V,
+    typename Hash     = std::hash<K>,        // 默认走 std::hash<K>,允许传自定义 Hasher
+    typename KeyEqual = std::equal_to<K>>
 class lrucache_base {
     static_assert(std::is_default_constructible_v<K>,
                   "K must be default-constructible for free-list slot init");
 public:
-    explicit lrucache_base(int32_t capacity);             // capacity <= 0 → abort
+    explicit lrucache_base(int32_t capacity);             // capacity <= 0 → throw invalid_argument
     ~lrucache_base() = default;                           // 智能指针自动收尾
 
     void push(const K& key, std::shared_ptr<V> value);    // sink by value; 重复 key 走 update + moveToHead
@@ -765,7 +866,7 @@ private:
     static constexpr int32_t free_tail_sentinel_ = -1;    // free list 终止符
 
     std::vector<Node> pool;                               // size = _capacity + 2
-    std::unordered_map<K, int32_t> key2idx;
+    std::unordered_map<K, int32_t, Hash, KeyEqual> key2idx;
 
     void eraseByIdx(int32_t idx);
     void insertAtHead(int32_t idx);                       // 假设 idx 不在 used 链上
