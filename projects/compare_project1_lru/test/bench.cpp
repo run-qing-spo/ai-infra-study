@@ -1,7 +1,10 @@
 // Layer 4: 性能基准
 //
 // 用法: make bench
-// 编译选项: -O2,不带 sanitizer / LRU_TEST_HOOKS,避免污染数据。
+// 编译选项: -O2,不带 sanitizer / LRU_TEST_HOOKS。
+//   - sanitizer: 真的会插桩拖慢热路径,必须关。
+//   - LRU_TEST_HOOKS: 当前只门控 audit() 方法,bench 没调用,关不关对当前数据没差;
+//     关掉是防御性纪律 —— 防止未来 audit 类钩子被加进热路径后悄悄污染 bench。
 //
 // 报告三组数据:
 //   1) 单线程吞吐: lru_base vs lru_mutex (看 mutex 净开销)

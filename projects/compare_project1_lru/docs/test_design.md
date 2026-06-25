@@ -170,7 +170,7 @@ key 在 `[0, 2048)` 均匀随机抽。**为什么是 2x 容量**:稳态命中率
 ## 六、配套约束(Makefile 里写死的事)
 
 - 测试编译带 `-DLRU_TEST_HOOKS`,这是 `audit()` 的开关。**绕开 Makefile 用 `g++ test.cpp ...` 单独编译会让 audit 失效**,详见 `.claude/skills/lru-verify/`
-- bench 编译**不带** `LRU_TEST_HOOKS`,避免 audit 干扰性能数据
+- bench 编译**不带** `LRU_TEST_HOOKS`。当前 hook 只门控 `audit()` 方法本身,bench 不调用它,所以现在两种构建的热路径指令几乎一致。**这条规则是防御性的**:未来若有人把 audit 类钩子塞进热路径(例如每次 push 后自动 sanity check),bench 自动免疫,数据不会被悄悄污染。顺带让 bench 二进制干净、跟测试构建解耦
 - TSan 走单独二进制 `build/test_tsan_bin`,需要重新插桩,不能复用 `test_bin`
 
 ---
