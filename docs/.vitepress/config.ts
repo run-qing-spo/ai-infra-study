@@ -76,22 +76,15 @@ export default withMermaid(
               text: '异常安全 与 数据安全',
               link: '/cpp/exception-safety',
             },
+            {
+              text: '定义、声明与实现',
+              link: '/cpp/forward-declaration-vs-complete-definition',
+            },
+            {
+              text: '原子操作内存序',
+              link: '/cpp/atomic-memory-order',
+            },
           ],
-        },
-      ],
-      '/canvas/': [
-        {
-          text: 'Canvas',
-          items: [
-            { text: 'Basic', link: '/canvas/basic' },
-            { text: 'Animation', link: '/canvas/animation' },
-          ],
-        },
-      ],
-      '/ai/': [
-        {
-          text: 'AI',
-          items: [],
         },
       ],
     },
