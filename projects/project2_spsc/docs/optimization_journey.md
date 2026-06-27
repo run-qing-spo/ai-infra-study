@@ -112,9 +112,15 @@ P 写 `cached_tail_` 不触及 C 任何 line, false sharing 消除.
 
 ## 第 3 轮: 位运算 wrap
 
-**假设**: `(h+1) % cap_` 里的 `cap_` 是运行时 `size_t`, 不是编译期常量,
-所以 `%` 编译成真的 `div` / `udiv` 指令 (arm64 上需要约 7 个周期).
-如果限定 cap 是 2 的幂, 可以换成 `(h+1) & (cap_-1)`, 单指令.
+**优化点: 把热路径上每次 push / pop 必走的 `(idx + 1) % cap_` 换成 `(idx + 1) & mask_`,
+从 `div` 指令 (arm64 上 ~7 周期, 不能流水) 降到 `and` (1 周期)**.
+
+为什么编译器不自己做: `%` 在除数是**编译期常量**时, 编译器会自动优化成移位 + 位与.
+但我们的 `cap_` 是构造时才传进来的运行时 `size_t`, 编译器不知道它是不是 2 的幂,
+只能发一条通用的 `udiv` —— 这是热路径上最贵的单一指令.
+
+数学恒等式: 当 n 是 2 的幂时 `x % n == x & (n - 1)`. 自己加约束, 把 cap 限制成 2 的幂,
+预存 `mask_ = cap_ - 1`, 热路径改成 `& mask_`, 单条 `and`.
 
 **改动**:
 
@@ -129,7 +135,12 @@ explicit SpscQueue(size_t capacity)
 // size_approx: (h - t) & mask_   // size_t 下负数 wrap 的算术对 2 的幂模运算也成立
 ```
 
-**代价**: 容量参数受限. 所有现有测试 / bench 用的 cap 都是 2 的幂, 没破坏.
+`(cap & (cap-1)) == 0` 是判 2 的幂的标准技巧 (2 的幂二进制只有一个 1, 减 1 后那位
+变 0 后面全 1, 与起来必然 0).
+
+**代价**: API 受限到 2 的幂. 现有 test / bench 用的 4 / 64 / 1024 / 65536 都满足.
+这是一个**纯妥协**: 拿 API 灵活性换硬件指令简化, 没有 cache 副作用, 没有架构敏感性 ——
+不像前两轮的优化要看访问模式 / cache line 布局.
 
 **数据** (vs alignas + cached):
 
@@ -142,19 +153,31 @@ explicit SpscQueue(size_t capacity)
 
 **学到的**:
 
-- 每个 cap 都吃到加速 —— 因为热路径上每次 push/pop 都要走一次 wrap, 这是确定能消的开销.
-- cap=65536 之前持续偏慢, 加位运算后回到 baseline 水平 (~47 ns/op),
-  说明 cap=65536 反复反常的 5 ns 里, 其中相当一部分是 `div` 指令 + memory subsystem 噪声叠加.
-- 位运算 wrap 是"无脑加速": 没有 cache 层面副作用, 没有架构敏感性, 唯一代价是 API 受限.
+- **每个 cap 都吃到加速**, 因为 wrap 在热路径上每次 push/pop 都走一次, 是确定能消的
+  开销, 不依赖访问模式 —— 不像第 1 / 2 轮要看高争用 vs 稳态.
+
+- cap=65536 这一档加位运算后从持续偏慢 (~62) 回到 baseline 水平 (~47), 落差 15 ns,
+  比其他 cap 上 bitwise 单独的收益 (5-10 ns) 大一截. **一个 hedged 解读**:
+  这一档 buf_ 4 MB 超 L1, 内存子系统在吃力, CPU 流水线被 memory 阻塞时, div 这种
+  长 latency 不能流水的指令更容易把 stall 暴露出来 (port contention / 流水线掩盖
+  不掉). **但这个推理不严格** —— 末尾的分布探查显示这档 stddev 就有 ~7 ns, 与这里
+  讨论的差距同量级. 这 5 ns 里相当一部分可能根本就是测量噪声, 这条 takeaway 应当
+  在读到分布探查那一节之后回头打个折扣, 不是确切因果.
 
 ---
 
 ## 第 4 轮: move 语义
 
-到此 trivial T (int 类) 的吞吐基本到顶 (中等 cap 接近 baseline 的 2x).
-T 是大对象时, 瓶颈不再是队列, 而是**每次 push/pop 都走两次 deep copy**.
+**优化点: 加 `push(T&&)` 重载 (pop 内部用 `std::move`), 让用户把大对象的所有权直接
+交给队列, 避免 push 把外部对象 copy 进槽位、pop 把槽位 copy 给用户, 这两次各一次
+deep copy.**
 
-**改动**: 加 `push(T&&)` 重载, pop 用 `std::move`. 实现走 private 模板共享:
+前 3 轮压扁的是**队列内部**的开销 (atomic 路径 + wrap). 但 push / pop 在槽位上还各
+做一次 `buf_[i] = item` / `out = buf_[i]`, 这两个赋值在 trivial T (int) 上是 8 字节
+mov, 几乎免费; 在大 T (`std::string(256)`) 上是 256 字节 memcpy + 可能的 malloc/free,
+**这才是大对象路径下新的瓶颈, 而且根本不在队列里, 在 T 自己**.
+
+**改动**: 加 `push(T&&)` 重载, 实现走 private 模板共享:
 
 ```cpp
 public:
@@ -163,22 +186,50 @@ public:
 private:
     template <typename U> bool push_impl(U&& item) {
         ...
-        buf_[h] = std::forward<U>(item);  // 左值 → copy, 右值 → move
+        buf_[h] = std::forward<U>(item);   // 左值 → copy, 右值 → move
         ...
     }
 ```
 
 ```cpp
-out = std::move(buf_[t]);  // pop 把槽位资源转给 out
+out = std::move(buf_[t]);   // pop 把槽位资源转给 out
 ```
 
-**附带收益**: move-only 类型 (`std::unique_ptr<T>`) 现在能直接放进队列了 —— 之前
-`buf_[h] = item` 走拷贝赋值, 而 unique_ptr 拷贝赋值是 `= delete`, 根本编不过.
+两个 public overload 共享一个 private template, 用 `std::forward` 保值类别, 不重复
+写两份逻辑.
+
+**为什么是 `std::forward<U>` 而不是 `std::move`** (这是个深坑, 不是风格选择):
+
+`push_impl(U&& item)` 里的 `U&&` 是 **forwarding reference** (因为 U 是被推导的模板
+参数, 不是具体类型 T). 这种写法在引用塌缩规则下同时接受左值和右值:
+
+- 调用方传左值, U 推导成 `T&`, `U&&` = `T& &&` 经引用塌缩 → `T&`, item 是左值引用
+- 调用方传右值, U 推导成 `T`, `U&&` = `T&&`, item 是右值引用
+
+`std::forward<U>(item)` 是**条件 cast**: U 是左值引用类型就保持左值 (走 copy), 是
+右值引用类型就给出右值 (走 move). 这是 perfect forwarding 的标准写法.
+
+如果换成 `std::move(item)`, 它**无条件**把 item cast 成右值 —— 左值路径上原本应该
+copy 的, 会被强制走 move 解析, **用户传进来的左值对象会被偷偷搬空**. 是个潜伏 bug.
+
+(在我们当前代码里它恰好被 `push(const T&)` 路径上的 const 挡住了: const 右值绑不上
+非 const 的 move assignment, fallback 到 copy assignment. 但只要左值重载将来被改成
+`T&` 非 const, 这层意外保险就消失. 所以不能依赖.)
+
+`LvaluePushPreservesSource` 测试专门防这条潜伏 bug.
+
+**附带收益, 而且这其实是判 API 设计对不对的关键**:
+
+move-only 类型 (`std::unique_ptr<T>`) 现在能直接放进队列了 —— 之前 `buf_[h] = item`
+走拷贝赋值, 而 unique_ptr 拷贝赋值是 `= delete`, **根本编不过**. 这是性能之外的功能
+扩展, 比"省 95 ns"更结构性 —— 它把一类此前完全不能用队列的 T 从"不可用"变成"可用".
 
 **测试**: 新增 `test/test_spsc_move.cpp`, 4 条:
 - `MoveOnlyTypeCompiles`: 用 `unique_ptr<int>` 推 / 拉, 验证编译通过 + 行为正确
 - `RvaluePushEmptiesSource`: 右值 push 之后源 string 应被 move 掏空
-- `LvaluePushPreservesSource`: 左值 push 之后源 string 必须保留 (防 T&& 重载吃左值)
+- `LvaluePushPreservesSource`: 左值 push 之后源 string 必须保留 —— 防 forwarding
+  被误改成 std::move, 也防 push 重载被改成按值传 (`push(T item)` + 内部 std::move
+  会偷偷搬走左值)
 - `PopMovesOutOfSlot`: pop 多轮, 验证 moved-from 槽位能被下一轮 push 覆盖
 
 **数据** (大对象 bench, `std::string(256)`, N=1M):
