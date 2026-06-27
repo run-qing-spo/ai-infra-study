@@ -342,3 +342,29 @@ cap=65536, N=10M, 30 rounds, ns/op:
 
 实验脚本: `scratchpad/cap65k_dist.cpp` (会话临时文件, 不进 repo). 复现就用同样
 的 N=10M, 30 rounds, 跑最终态代码, 期望看到类似分布.
+
+---
+
+## 后续加强方向 (未做)
+
+从上面 cap=65536 那节延伸出来的两条 TODO, 不影响现在的结论, 留作下一轮:
+
+1. **bench 工具支持"宽分布档位"**.
+   现在 bench 框架统一用 best-of-N, 对 cap=4/64/1024 这种窄分布够用,
+   对 cap=65536 这种宽分布会系统性低估 (抓到 P10-P25 而不是中位数).
+   改动方向: 给框架加一个开关, 大 cap 输出 `median / p25 / p75 / stddev`,
+   而不是 best-of-N. 改完后 cap=65536 列的数字才有可比性, 也才能回头给前面
+   各轮的"快了/慢了"重新判定哪些是真信号哪些在噪声里.
+
+2. **darwin 下用 Instruments Counters template 诊断"为什么宽"**.
+   现在对宽分布的解释 (L2/L3 容量边界 + HW prefetcher 抖动 + TLB miss) 是
+   合理假设, 但没 PMU 数据. darwin 没有 linux 的 `perf`, 替代品是 Xcode
+   Instruments 的 Counters template, 能读 L1/L2/L3 miss rate / dTLB miss /
+   prefetcher 命中率. 钉 CPU + 关 turbo 后跑同样的 N=10M 30 rounds, 看高/低
+   round 之间哪些计数器差距大, 就能把"宽"从假设升级为有数据支持的结论.
+
+   **明确**: 这条不会改善性能 (memory-bound 不会变), 目的是搞清楚机制 + 学
+   darwin 下的 PMU 工具链. 真要做性能优化 (prefetch / huge page / 改步幅)
+   也必须先做完这条, 不然就是赌博.
+
+两条独立, 不必同时做. 收口优先做 (1), 学习优先做 (2).
