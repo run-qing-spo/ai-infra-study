@@ -1,26 +1,17 @@
 # SPSC Queue 优化迭代记录
 
-本文档复盘 `SpscQueue<T>` 的优化过程, 重点不是讲"最终是怎么写的", 而是
-**为什么每一步那样改、改完数据怎么动、哪里出过反预期、为什么回滚再来**。
-最终代码读 `include/spsc_queue.hpp` 即可, 文档保留思考过程。
+本文档复盘 `SpscQueue<T>` 的优化过程, 重点是**每一轮的核心机制 + 数据怎么动**,
+不讲"最终代码怎么写". 最终实现读 `include/spsc_queue.hpp` 即可.
 
 测试平台: macOS, Apple Silicon (arm64), `-O2`, gcc 13.
-Bench 工具: `make bench` (见 `test/bench.cpp`).
-每个数据点 = 5 轮取最小耗时 (排除调度抖动).
+Bench: `make bench` (`test/bench.cpp`). 每个数据点 = 5 轮取最小耗时.
 
 ---
 
 ## 起点 (Baseline)
 
-最小可用实现:
-
-- 两个原子下标 `head_` / `tail_`, 用 release-acquire 配对保证可见性
-  - 生产者: `buf_[h] = item; head_.store(next, release)`
-  - 消费者: `head_.load(acquire); out = buf_[t]; tail_.store(t+1, release)`
-- wrap 用 `% cap_`, 没有 false-sharing 防护, 没有本地缓存
-- 单线程 + 多线程 + TSan 测试已经全过, 正确性站住了
-
-baseline bench (M ops/sec, 越大越好):
+最小可用实现: 两个原子下标 `head_` / `tail_`, release-acquire 配对, 用 `% cap_`
+做 wrap, 没有 false sharing 防护, 没有本地缓存.
 
 | cap | ns/op | M ops/sec |
 |---|---|---|
@@ -29,139 +20,93 @@ baseline bench (M ops/sec, 越大越好):
 | 1024 | 51.4 | 19.5 |
 | 65536 | 48.6 | 20.6 |
 
-从这个表能直接读到的事:
-
-- 从极小 cap 到很大 cap, 吞吐只涨 1.43x —— 说明**瓶颈不是"容量小导致频繁打满"**,
-  而是两条 atomic 路径自身的代价 (跨核 load + cache line 弹跳).
-- cap 1024 → 65536 只快 6%, 单纯扩容已经到顶, 想再快得动算法 / 内存布局.
-
-接下来三轮优化都是为了把这两条路径压扁。
+从极小 cap 到很大 cap 吞吐只涨 1.43x —— **瓶颈不是容量, 是两条 atomic 路径自身的
+cache 弹跳代价**. 后面三轮就是为了压扁这个开销.
 
 ---
 
-## 第 1 轮: false sharing — `alignas(128)` 拆 cache line
+## 第 1 轮: false sharing — `alignas(128)`
 
-**假设**: `head_` / `tail_` 紧挨着, 大概率落进同一条 cache line.
-生产者写 `head_` 让消费者持有的 cache line 失效, 消费者写 `tail_` 让生产者持有的失效,
-两核为同一条线反复抢所有权 (cache line ping-pong), 这是 false sharing.
+**优化点: 消除"读自己变量被对方写误伤"的 cache miss**.
 
-**改动**:
+push 里 `h = head_.load(relaxed)` 这一步本应是本地 hit (P 自己刚写过 head_).
+但 `head_` 和 `tail_` 同一条 cache line 时, C 每写 `tail_` 一次就把整条 line 在 P
+失效, P 下次读自己的 `head_` 就 miss —— 跟 `head_` 本身的值变化无关. C 读自己 `tail_`
+对称受 P 写 `head_` 误伤.
 
 ```cpp
 alignas(kCacheLine) std::atomic<size_t> head_{0};
 alignas(kCacheLine) std::atomic<size_t> tail_{0};
 ```
 
-`kCacheLine = 128`. 选 128 而不是 64 是因为 Apple Silicon L1 cache line 是 128 字节;
-x86 是 64. 取 128 多浪费一点 padding, 但不会让 false sharing 漏过.
+`kCacheLine = 128`: Apple Silicon L1 cache line 是 128 字节 (x86 是 64). 取 128
+多浪费 padding, 但保证不会漏掉 false sharing.
 
-**数据** (vs baseline):
-
-| cap | baseline | alignas-only | 变化 |
+| cap | baseline | alignas | 变化 |
 |---|---|---|---|
 | 4 | 69.4 | ~59 | -15% |
 | 64 | 55.2 | ~40 | **-28%** |
 | 1024 | 51.4 | ~40 | **-22%** |
-| 65536 | 48.6 | ~50 | 不稳, ±20% 抖动 |
+| 65536 | 48.6 | ~50 | 抖动 ±20%, 不可信 (见末尾分布实验) |
 
-**学到的**:
-
-- 中等 cap (64/1024) 拿到清晰的 ~25% 加速 —— 这就是 false sharing 的真实代价.
-- cap=4 (高争用) 加速 ~15%, 比中等 cap 少 —— 因为高争用下 acquire load 必然 miss,
-  本来就要付 cross-core 代价, false sharing 多出来的代价相对小.
-- cap=65536 这一档**抖动很大** (单次能跳 22%): 这档 buf_ 已经 4 MB, 远超 L1,
-  数据吞吐被 memory subsystem 主导, 受系统噪声影响大, 不应当从这一档读优化效果.
+cap=4 加速少, 是因为高争用下 acquire load 必然 miss, 本来就要付 cross-core 代价,
+false sharing 的相对收益变小.
 
 ---
 
-## 第 2 轮 (失败): 单独加 cached head/tail
+## 第 2 轮: 本地快照 `cached_tail_` / `cached_head_`
 
-**假设**: 生产者每次 push 都得做一次 cross-core `tail_.load(acquire)`,
-但实际上 `tail_` 在两次推进之间一直稳定. 用本地变量 `cached_tail_` 缓存上次看到的 `tail_`:
-缓存说不满就直接 push, 不去 cross-core 读. 同理 `cached_head_` 给消费者用.
+**优化点: 让大多数 push 不必跨核读真的 `tail_`, 改读 P 自己 line 上的本地快照**.
 
-**改动**: 在已经 `alignas` 的基础上加 cached. 等等 —— 这次为了 **isolate** 出
-cached 单独的收益, 我先把 `alignas` 回滚到 baseline, 只加 cached.
+push 只判断"满没满", 这个判断不需要 `tail_` 最新值, 只需要保守快照: `cached_tail_`
+落后于真值是 OK 的, 因为 `tail_` 只会向前推进, 真值只会"更不满". 只在 cached 看起来
+满了才回去 acquire load 真 `tail_`. 对称地 `cached_head_` 给消费者用.
 
-```cpp
-// 在 baseline 之上加 cached_tail_, cached_head_ (两个 size_t, 紧跟在 head_/tail_ 后)
-size_t cached_tail_{0};
-size_t cached_head_{0};
-```
+### 失败的中间步: cached 紧跟 tail_
 
-push fast path: `if (next == cached_tail_) { cached_tail_ = tail_.load(acquire); ... }`
-pop 对称.
-
-**数据** (vs baseline): **全线变慢 30-72%**
+第一次直接在 baseline 之上加 cached, 没拆 line, 结果**全线变慢 30-72%**:
 
 | cap | baseline | cached-only | 变化 |
 |---|---|---|---|
-| 4 | 69.4 | 90.6 | **+30%** |
-| 64 | 55.2 | 67.2 | **+22%** |
-| 1024 | 51.4 | 66.4 | **+29%** |
-| 65536 | 48.6 | 83.5 | **+72%** |
+| 4 | 69.4 | 90.6 | +30% |
+| 64 | 55.2 | 67.2 | +22% |
+| 1024 | 51.4 | 66.4 | +29% |
+| 65536 | 48.6 | 83.5 | +72% |
 
-**为什么反预期** (这是最有价值的一步学习):
+原因: `cached_tail_` 紧跟 `tail_`, 同一条 line. P 每次 refresh **写 `cached_tail_`**,
+把 C 的 `tail_` 整条失效 —— **人为给 C 制造了一个原本不存在的 false sharing**.
+多了一次写, 该省的 miss 一次没省, 净亏.
 
-布局上, `head_` / `tail_` / `cached_tail_` / `cached_head_` 全挤在同一条 64-128 字节
-cache line:
+cap=65536 慢得最离谱: 该 cap fast path 命中率高, `cached_tail_` 被写的频率最接近
+每次 push, ping-pong 最频繁.
 
-```
-[ buf_  cap_  head_  tail_  cached_tail_  cached_head_ ]
-                       └─── 全在同一条 cache line ───┘
-```
+**这一步的真正价值**: 让 "**alignas 是 cached 的地基**" 从直觉变成数据强证.
+没有把 `head_` / `tail_` 拆到独立 cache line, cached_*_ 放哪都会撞到对方关心的变量,
+false sharing 跑不掉.
 
-- 生产者 push 写 `cached_tail_` (本地变量, 想省时间) —— 但因为它和 `tail_` 同一条线,
-  消费者的 `tail_` cache 跟着被失效.
-- 消费者下次 `acquire load tail_` 必然 miss (本来 cached 想省掉的 miss, 现在没省).
-- 同时还多了一份对 `cached_tail_` 的写 + 一层 if 判断.
-- 净效果: **多了写动作, 没省下 cache miss, 越慢越严重**.
-
-cap=65536 慢得最离谱也合这个解释 —— 越大 cap, fast path 命中率越高,
-`cached_*` 被写的频率越接近每次 push/pop, ping-pong 最频繁.
-
-**决策**: 回滚 cached, 单独把 `alignas` 加回来 (就是第 1 轮的最终态),
-然后**在 alignas 之上**再叠加 cached. **cache line 拆分是 cached 的地基,
-没拆就上 cached 是反效果**.
-
-这次失败的迭代价值不在数据本身, 而在让 "cache line 拆分必须先做" 这个判断
-从 "听起来合理" 变成 "数据强烈支持". 没有它, 第 2 轮成功就只是凭直觉的运气.
-
----
-
-## 第 2 轮 (成功): alignas + cached (布局正确版)
-
-**改动**: 把 `cached_*` 放进**正确的 cache line**:
+### 正确版: cached 放在自己一侧的 line
 
 ```cpp
-// 生产者侧 cache line: head_ + cached_tail_ 都只有生产者写
+// 生产者侧 line: head_ + cached_tail_ 都只有 P 写
 alignas(kCacheLine) std::atomic<size_t> head_{0};
 size_t cached_tail_{0};
 
-// 消费者侧 cache line: tail_ + cached_head_ 都只有消费者写
+// 消费者侧 line: tail_ + cached_head_ 都只有 C 写
 alignas(kCacheLine) std::atomic<size_t> tail_{0};
 size_t cached_head_{0};
 ```
 
-关键: `cached_tail_` 紧贴 `head_`, `cached_head_` 紧贴 `tail_`. 上一次失败的成因
-正是 `cached_*` 落进了消费者 cache line, 这次显式按"谁写就放谁那条线"分组.
-
-**数据** (vs alignas-only):
+P 写 `cached_tail_` 不触及 C 任何 line, false sharing 消除.
 
 | cap | alignas-only | + cached | 额外加速 |
 |---|---|---|---|
 | 4 | ~59 | ~58 | 持平 |
-| 64 | ~40 | ~37 | **-8%** |
+| 64 | ~40 | ~37 | -8% |
 | 1024 | ~40 | ~32 | **-19%** |
 | 65536 | ~50 | ~62 | 偏慢 (memory-bound 噪声) |
 
-**学到的**:
-
+- cap=4 持平: 高争用下 fast path 几乎从不命中, cached 退化成死代码.
 - cap=1024 是甜点: fast path 命中率高 + cache line 没 ping-pong + buf_ 仍在 L1.
-- cap=4 持平: 高争用下 fast path 几乎从不命中 (基本每次都判满), cached 退化成死代码.
-- 兑现了上一轮的判断: cache line 拆分之后 cached 才能真的发挥作用.
-
-到这里中等 cap 累计加速 ~40%.
 
 ---
 
@@ -258,18 +203,18 @@ out = std::move(buf_[t]);  // pop 把槽位资源转给 out
 
 ## 总览
 
-整个优化栈, 每一步的累计加速 (int64, M ops/sec):
+int64 路径累计加速 (M ops/sec):
 
-| cap | baseline | + alignas | + cached | + 位运算 wrap | 总加速 |
+| cap | baseline | + alignas | + cached | + 位运算 | 总加速 |
 |---|---|---|---|---|---|
 | 4 | 14.4 | 16.9 | 17.2 | **21.3** | **1.48x** |
 | 64 | 18.1 | 25.0 | 27.0 | **36.5** | **2.02x** |
 | 1024 | 19.5 | 25.0 | 31.2 | **35.9** | **1.84x** |
-| 65536 | 20.6 | ~20 | ~16 | 21.8 | ~持平 |
+| 65536 | 20.6 | ~20 | ~16 | 21.8 | ~持平 (数据不可信, 见末尾) |
 
-大对象路径 (std::string, 第 4 轮的 move 重载):
+大对象路径 (`std::string`):
 
-| cap | copy 路径 | move 路径 | 加速 |
+| cap | copy | move | 加速 |
 |---|---|---|---|
 | 64 | 2.67 M/s | 3.59 M/s | 1.35x |
 | 1024 | 2.70 M/s | 3.53 M/s | 1.31x |
