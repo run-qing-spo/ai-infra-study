@@ -35,7 +35,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
@@ -96,6 +98,74 @@ static Result run_best(size_t cap, std::int64_t n, int rounds) {
     return best;
 }
 
+// ============================================================
+// 大对象路径 (std::string, 远超 SSO 阈值) — 对比 copy vs move
+// ============================================================
+//
+// 目的: int64 是 trivial 类型, move 退化为 copy, 看不出 move 的真实收益.
+// 用 std::string(payload>SSO) 作为 T:
+//   copy 路径: 每次 push 都做一次堆内容深拷贝, pop 再深拷贝出来
+//   move 路径: push 把堆指针交给槽位 (源置空), pop 再把指针交给 out
+// 预期 move 把每次 push/pop 周期里的 2 次 memcpy + 0~2 次 malloc 都省掉.
+//
+// 注意: 每轮生产者都 new 一个新 string (无论 copy / move 都得有源对象),
+// 这次 alloc 的开销是两条路径共有的, 不计入 "copy vs move" 的差异.
+
+template <bool UseMove>
+static Result run_once_str(size_t cap, std::int64_t n, size_t payload) {
+    spsc::SpscQueue<std::string> q(cap);
+    std::size_t total = 0;
+
+    auto start = Clock::now();
+
+    std::thread prod([&] {
+        for (std::int64_t i = 0; i < n; ++i) {
+            std::string s(payload, 'x'); // 每轮都新分配, 两条路径共有的开销
+            if constexpr (UseMove) {
+                while (!q.push(std::move(s))) {}
+            } else {
+                while (!q.push(s)) {} // 左值 → 走 const T& 重载, 深拷贝
+            }
+        }
+    });
+
+    std::thread cons([&] {
+        std::string out;
+        for (std::int64_t i = 0; i < n; ++i) {
+            while (!q.pop(out)) {}
+            total += out.size(); // 防优化 + 对账依据
+        }
+    });
+
+    prod.join();
+    cons.join();
+
+    auto end = Clock::now();
+
+    const std::size_t expected = static_cast<std::size_t>(n) * payload;
+    if (total != expected) {
+        std::fprintf(stderr,
+                     "BENCH FAILED (str, cap=%zu, n=%lld, %s): total=%zu expected=%zu\n",
+                     cap, (long long)n, UseMove ? "move" : "copy", total, expected);
+        std::exit(1);
+    }
+
+    double ns = std::chrono::duration<double, std::nano>(end - start).count();
+    double ns_per_op = ns / static_cast<double>(n);
+    double mops_per_sec = 1000.0 / ns_per_op;
+    return {ns_per_op, mops_per_sec};
+}
+
+template <bool UseMove>
+static Result run_best_str(size_t cap, std::int64_t n, size_t payload, int rounds) {
+    Result best{1e18, 0.0};
+    for (int r = 0; r < rounds; ++r) {
+        Result cur = run_once_str<UseMove>(cap, n, payload);
+        if (cur.ns_per_op < best.ns_per_op) best = cur;
+    }
+    return best;
+}
+
 int main() {
     constexpr std::int64_t N = 10'000'000;
     constexpr int ROUNDS = 5;
@@ -104,13 +174,33 @@ int main() {
     //   → 中 → 大 → 很大 (基本不打满, 主要测裸 atomic 路径)
     const std::vector<size_t> caps = {4, 64, 1024, 65536};
 
-    std::printf("SPSC bench  |  N=%lld per run  |  %d rounds, best taken\n",
-                (long long)N, ROUNDS);
+    std::printf("SPSC bench  |  %d rounds, best taken\n", ROUNDS);
+
+    std::printf("\n== int64 (trivial: move 退化为 copy)  N=%lld ==\n", (long long)N);
     std::printf("%-10s %-14s %-14s\n", "cap", "ns/op", "M ops/sec");
     std::printf("----------------------------------------\n");
     for (size_t cap : caps) {
         Result r = run_best(cap, N, ROUNDS);
         std::printf("%-10zu %-14.2f %-14.2f\n", cap, r.ns_per_op, r.mops_per_sec);
+    }
+
+    // 大对象路径: N 缩小 10 倍, 每次都涉及堆分配, 跑 10M 会非常慢且 heap 噪声大.
+    // payload=256 远超 libc++/libstdc++ 的 SSO 阈值 (15/22 字节), 保证走堆.
+    constexpr std::int64_t N_STR = 1'000'000;
+    constexpr size_t kPayload = 256;
+    const std::vector<size_t> caps_str = {64, 1024};
+
+    std::printf("\n== std::string(payload=%zu)  N=%lld  copy vs move ==\n",
+                kPayload, (long long)N_STR);
+    std::printf("%-10s %-14s %-14s %-10s\n",
+                "cap", "copy ns/op", "move ns/op", "speedup");
+    std::printf("------------------------------------------------\n");
+    for (size_t cap : caps_str) {
+        Result cpy = run_best_str<false>(cap, N_STR, kPayload, ROUNDS);
+        Result mov = run_best_str<true>(cap, N_STR, kPayload, ROUNDS);
+        double speedup = cpy.ns_per_op / mov.ns_per_op;
+        std::printf("%-10zu %-14.2f %-14.2f %.2fx\n",
+                    cap, cpy.ns_per_op, mov.ns_per_op, speedup);
     }
     return 0;
 }
