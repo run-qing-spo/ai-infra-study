@@ -170,11 +170,21 @@ int main(int argc, char** argv) {
         // 至少等 1 个完成,顺手把当下能取的都取了
         size_t k = backend->reap(cqe_buf.data(), cqe_buf.size(), 1);
         auto now = clk::now();
+
+        // 关键:先把整批的 lat 算完再统一 submit_one(),不能在循环里混着做。
+        // 原因:submit_one() 内部会写 submit_ts[next_id % qd] = clk::now(),这个
+        // 时间戳比当前 batch 共用的 now 更晚。如果 sync 后端乱序完成,同一批 reap
+        // 里既有"较新 id"又有"较旧 id",前者触发的 submit_one 会覆盖后者依赖的
+        // submit_ts[slot],于是 lat = now - submit_ts[slot] 变成负的几十 ns,
+        // 强转 uint64_t 下溢成 ~UINT64_MAX 进 max 统计。
+        size_t to_resubmit = 0;
         for (size_t i = 0; i < k; ++i) {
             uint64_t id  = cqe_buf[i].user_data;
             int32_t  res = cqe_buf[i].res;
             if (res < 0) {
                 std::fprintf(stderr, "IO err: %s\n", std::strerror(-res));
+                // 注意:出错路径也要补 in-flight,否则管线深度会永久少 1
+                ++to_resubmit;
                 continue;
             }
             uint32_t slot = static_cast<uint32_t>(id % a.qd);
@@ -183,10 +193,11 @@ int main(int argc, char** argv) {
             latencies_ns.push_back(static_cast<uint64_t>(lat));
             ++completed;
             bytes += static_cast<uint64_t>(res);
-
-            // 每完成一个就立刻补一个,保持管线满
-            submit_one();
+            ++to_resubmit;
         }
+
+        // 整批 lat 都算完了,submit_ts 可以安全被覆盖
+        for (size_t i = 0; i < to_resubmit; ++i) submit_one();
     }
 
     // 收尾:把还在飞的请求 drain 掉,避免 buffer 被析构后内核还在 DMA
