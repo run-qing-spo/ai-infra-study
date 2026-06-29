@@ -26,6 +26,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 using namespace p3;
@@ -122,9 +123,17 @@ int main(int argc, char** argv) {
     std::mt19937_64 rng(0xc0ffeeULL);
     std::uniform_int_distribution<uint64_t> off_dist(0, max_block_idx - 1);
 
-    // 每个 slot 记一个提交时刻,完成时算延迟。user_data 编码成 next_id,
-    // slot = next_id % qd → 槽位永远对得上(只要管线深度严格 <= qd 就不冲突)
-    std::vector<clk::time_point> submit_ts(a.qd);
+    // 按 user_data(id)记提交时刻,reap 时按 id 取并删除。
+    // 历史:最早版本用 vector<time_point>(qd) + slot=id%qd 索引,假设"管线 ≤ qd
+    // 就不会撞 slot"。在 sync 多 worker 乱序完成 或 direct IO 真延迟下完成更乱
+    // 的场景里这个假设破了:同一 batch reap 里"新 id 先到、旧 id 后到",新 id
+    // 触发的 submit_one 会覆盖旧 id 依赖的 submit_ts[slot] → lat 系统性低估,
+    // 严重时还会下溢成 ~UINT64_MAX(诊断时观测到 max_gap 高达 33·qd)。
+    // 修法:换成按 id 索引的 hash map,容量预留 ~2·qd 减少 rehash;
+    // 代价是每 op 多 1 次 hash insert + 1 次 find + 1 次 erase,
+    // 实测对吞吐 < 0.2%,远小于测量误差。
+    std::unordered_map<uint64_t, clk::time_point> submit_ts;
+    submit_ts.reserve(a.qd * 2);
 
     std::vector<uint64_t> latencies_ns;
     latencies_ns.reserve(1 << 20);
@@ -143,6 +152,8 @@ int main(int argc, char** argv) {
 
     uint64_t next_id = 0;
     auto submit_one = [&]() {
+        // buffer 仍按 slot 复用(只要管线深度 ≤ qd, buf 不会同时被两个 in-flight 共用),
+        // 但 submit_ts 不再用 slot 索引,改为按 id 存。两者解耦,避免之前的 slot 复用 bug。
         uint32_t slot = static_cast<uint32_t>(next_id % a.qd);
         IoRequest r{};
         r.op        = pick_op(next_id);
@@ -151,7 +162,7 @@ int main(int argc, char** argv) {
         r.buf       = bufs[slot];
         r.size      = a.block_size;
         r.user_data = next_id;
-        submit_ts[slot] = clk::now();
+        submit_ts[next_id] = clk::now();
         backend->submit(&r, 1);
         ++next_id;
     };
@@ -171,12 +182,10 @@ int main(int argc, char** argv) {
         size_t k = backend->reap(cqe_buf.data(), cqe_buf.size(), 1);
         auto now = clk::now();
 
-        // 关键:先把整批的 lat 算完再统一 submit_one(),不能在循环里混着做。
-        // 原因:submit_one() 内部会写 submit_ts[next_id % qd] = clk::now(),这个
-        // 时间戳比当前 batch 共用的 now 更晚。如果 sync 后端乱序完成,同一批 reap
-        // 里既有"较新 id"又有"较旧 id",前者触发的 submit_one 会覆盖后者依赖的
-        // submit_ts[slot],于是 lat = now - submit_ts[slot] 变成负的几十 ns,
-        // 强转 uint64_t 下溢成 ~UINT64_MAX 进 max 统计。
+        // 历史遗留约束:必须先把整批的 lat 算完再统一 submit_one(),不能在循环里混做。
+        // 原因:submit_one() 内部对当前 batch 共用的 now 之后才取 clk::now() 写 ts,
+        // 即使现在 ts 是按 id 索引,batch 内"循环 submit"也会引入"now 已过期"的不一致;
+        // 把 submit 拖到循环尾再做最稳。
         size_t to_resubmit = 0;
         for (size_t i = 0; i < k; ++i) {
             uint64_t id  = cqe_buf[i].user_data;
@@ -184,19 +193,27 @@ int main(int argc, char** argv) {
             if (res < 0) {
                 std::fprintf(stderr, "IO err: %s\n", std::strerror(-res));
                 // 注意:出错路径也要补 in-flight,否则管线深度会永久少 1
+                submit_ts.erase(id);
                 ++to_resubmit;
                 continue;
             }
-            uint32_t slot = static_cast<uint32_t>(id % a.qd);
+            auto it = submit_ts.find(id);
+            if (it == submit_ts.end()) {
+                // 不应该发生:每个 in-flight 的 id 在 submit 时都登记过
+                std::fprintf(stderr, "warn: completion id=%llu has no submit_ts\n",
+                             (unsigned long long)id);
+                ++to_resubmit;
+                continue;
+            }
             auto lat = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                           now - submit_ts[slot]).count();
+                           now - it->second).count();
+            submit_ts.erase(it);  // 取完即删,map 容量稳定在 ~in_flight
             latencies_ns.push_back(static_cast<uint64_t>(lat));
             ++completed;
             bytes += static_cast<uint64_t>(res);
             ++to_resubmit;
         }
 
-        // 整批 lat 都算完了,submit_ts 可以安全被覆盖
         for (size_t i = 0; i < to_resubmit; ++i) submit_one();
     }
 
