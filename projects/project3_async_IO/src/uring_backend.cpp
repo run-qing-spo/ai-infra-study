@@ -41,7 +41,10 @@ size_t UringBackend::submit(const IoRequest* reqs, size_t n) {
             io_uring_prep_write(sqe, r.fd, r.buf, r.size, r.offset);
         }
         // user_data 会原样跟着 CQE 返回,用来对应"这是哪个请求完成了"
-        io_uring_sqe_set_data64(sqe, r.user_data);
+        // 注:liburing 2.2+ 有 io_uring_sqe_set_data64 直接收 __u64;
+        // Ubuntu 22.04 自带的是 2.1,只有收 void* 的老 API。
+        // SQE 里的 user_data 槽位本身就是 64-bit,两者底层等价。
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(r.user_data));
         ++prepared;
     }
 
@@ -74,7 +77,7 @@ size_t UringBackend::reap(IoCompletion* out, size_t max_n, size_t min_complete) 
         if (ret == -EAGAIN || !cqe) break;
         if (ret < 0) break;
 
-        out[reaped].user_data = io_uring_cqe_get_data64(cqe);
+        out[reaped].user_data = reinterpret_cast<uint64_t>(io_uring_cqe_get_data(cqe));
         out[reaped].res       = cqe->res;
         // 必须调用,告诉内核这个 CQE 槽我消费完了,可以复用
         io_uring_cqe_seen(&ring_, cqe);
