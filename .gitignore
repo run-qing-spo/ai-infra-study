@@ -7,3 +7,4 @@ docs/.vitepress/cache
 */test/*.bin
 compile_commands.json
 tsan
+projects/project3_async_IO/docs/interview_level_distillation.md
