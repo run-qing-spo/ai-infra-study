@@ -44,7 +44,7 @@ namespace lru_base {
             void push(const K& key, std::shared_ptr<V> value) {
                 auto it = key2idx.find(key);
                 if (it != key2idx.end()) {
-                    pool[it->second].value = std::move(value);
+                    // pool[it->second].value = std::move(value); kv cache场景下不会有不同
                     moveToHead(it->second);
                     return;
                 }
