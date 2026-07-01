@@ -8,3 +8,4 @@ docs/.vitepress/cache
 compile_commands.json
 tsan
 projects/project3_async_IO/docs/interview_level_distillation.md
+projects/PLAN_v3.md
