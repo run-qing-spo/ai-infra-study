@@ -30,4 +30,14 @@ BlockId LruPolicy::evict() {
     return victim;
 }
 
+void LruPolicy::on_erase(BlockId id) {
+    // O(1) 定点删除:跟 on_access 一样靠 iterator hash 表拿到 list 节点。
+    // list.erase 只让被删节点本身失效,其他 iterator 保持有效 —— splice/erase
+    // 混用 std::list 才敢做这种"iterator 存进 map"的骚操作。
+    auto it = index_.find(id);
+    assert(it != index_.end() && "on_erase 一个不在账本里的 id");
+    lru_list_.erase(it->second);
+    index_.erase(it);
+}
+
 } // namespace p4

@@ -26,6 +26,12 @@ public:
     // 返回后,Cache 会拿这个 id 去 BlockStore::evict(id)。
     virtual BlockId evict() = 0;
 
+    // 从账本里删掉指定的 id(不是挑最冷的那个)。前置:此 id 在账本里。
+    // 用途:tiered cache 中把 id 从 L1 policy 迁到 L2 policy 时,L1 侧要显式
+    //      erase 掉;以及 L2 覆盖分支里需要"先删旧记账再走 insert 路径"。
+    // 跟 evict() 的区别 —— evict 是"策略挑谁走",on_erase 是"外部指定谁走"。
+    virtual void on_erase(BlockId id) = 0;
+
     // 账本内 block 数。debug / 不变量检查用。
     virtual size_t size() const = 0;
 };

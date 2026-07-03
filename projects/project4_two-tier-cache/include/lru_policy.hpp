@@ -17,6 +17,7 @@ public:
     void   on_insert(BlockId id) override;
     void   on_access(BlockId id) override;
     BlockId evict() override;
+    void   on_erase(BlockId id) override;
     size_t size() const override { return index_.size(); }
 
 private:
