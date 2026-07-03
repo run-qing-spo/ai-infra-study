@@ -11,6 +11,7 @@
 // 量的是:吞吐(ops/s, MB/s) + 延迟分位数 p50/p90/p99/p99.9
 
 #include "sync_backend.hpp"
+#include "cached_backend.hpp"
 #ifdef __linux__
 #  include "uring_backend.hpp"
 #endif
@@ -33,6 +34,10 @@ using namespace p3;
 using clk = std::chrono::steady_clock;
 
 struct Args {
+    // 三个正交维度:
+    //   backend    (底层 IO 接口)  sync | uring
+    //   o_direct   (open flag)     --direct
+    //   cache      (装饰器叠加)    --cache + --cache-slots
     std::string backend     = "sync";              // sync | uring
     std::string file        = "/tmp/p3_bench.dat";
     uint64_t    file_size   = 4ull << 30;          // 4 GiB
@@ -42,13 +47,20 @@ struct Args {
     uint32_t    duration_s  = 10;
     uint32_t    qd          = 32;                  // queue depth / worker count
     bool        o_direct    = false;
+    bool        cache       = false;               // 是否套用户态 LRU cache 装饰器
+    // cache 池 slot 数。默认远大于 qd,给随机模式一定命中概率;
+    // 跟 --file-size / --block-size 一起决定命中率上限。
+    uint32_t    cache_slots = 1024;
 };
 
 static void usage() {
     std::fprintf(stderr,
-        "usage: bench [--backend sync|uring] [--file PATH] [--file-size BYTES]\n"
-        "             [--block-size BYTES] [--op read|write|mixed]\n"
-        "             [--pattern seq|rand] [--duration SECS] [--qd N] [--direct]\n");
+        "usage: bench [--backend sync|uring]\n"
+        "             [--file PATH] [--file-size BYTES] [--block-size BYTES]\n"
+        "             [--op read|write|mixed] [--pattern seq|rand]\n"
+        "             [--duration SECS] [--qd N] [--direct]\n"
+        "             [--cache] [--cache-slots N]\n"
+        "  三个维度正交:backend(sync/uring) x direct(O_DIRECT) x cache(用户态 LRU)\n");
 }
 
 static bool parse_args(int argc, char** argv, Args& a) {
@@ -67,6 +79,8 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--duration")   a.duration_s = static_cast<uint32_t>(std::stoul(next()));
         else if (k == "--qd")         a.qd         = static_cast<uint32_t>(std::stoul(next()));
         else if (k == "--direct")     a.o_direct   = true;
+        else if (k == "--cache")      a.cache      = true;
+        else if (k == "--cache-slots") a.cache_slots = static_cast<uint32_t>(std::stoul(next()));
         else { usage(); return false; }
     }
     return true;
@@ -95,18 +109,32 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::unique_ptr<IoBackend> backend;
+    // 第一步:按 --backend 建底层 IO 抽象
+    std::unique_ptr<IoBackend> inner;
     if (a.backend == "sync") {
-        backend = std::make_unique<SyncBackend>(a.qd);
+        inner = std::make_unique<SyncBackend>(a.qd);
     }
 #ifdef __linux__
     else if (a.backend == "uring") {
-        backend = std::make_unique<UringBackend>(a.qd);
+        inner = std::make_unique<UringBackend>(a.qd);
     }
 #endif
     else {
         std::fprintf(stderr, "unknown backend: %s\n", a.backend.c_str());
         return 1;
+    }
+
+    // 第二步:按 --cache 决定是否套 CachedBackend 装饰器。
+    // cached_ptr 保留一个裸指针,收尾打印命中率用;所有权仍在 unique_ptr 链上。
+    std::unique_ptr<IoBackend> backend;
+    CachedBackend* cached_ptr = nullptr;
+    if (a.cache) {
+        auto p = std::make_unique<CachedBackend>(
+            std::move(inner), a.qd, a.cache_slots, a.block_size);
+        cached_ptr = p.get();
+        backend = std::move(p);
+    } else {
+        backend = std::move(inner);
     }
 
     // 每个 in-flight 槽位一个独立 buffer。O_DIRECT 要求 buffer 按 block 大小对齐,
@@ -248,6 +276,20 @@ int main(int argc, char** argv) {
                 (unsigned long long)pct(0.99),
                 (unsigned long long)pct(0.999),
                 (unsigned long long)pct(1.0));
+
+    if (cached_ptr) {
+        auto s = cached_ptr->stats();
+        double total = static_cast<double>(s.hits + s.misses);
+        double hit_rate = total > 0 ? (s.hits / total) : 0.0;
+        std::printf("  cache: slots=%u  hits=%llu  misses=%llu  hit_rate=%.2f%%  "
+                    "writes_inval=%llu  passthrough=%llu\n",
+                    a.cache_slots,
+                    (unsigned long long)s.hits,
+                    (unsigned long long)s.misses,
+                    hit_rate * 100.0,
+                    (unsigned long long)s.writes_invalidated,
+                    (unsigned long long)s.passthrough);
+    }
 
     for (auto* b : bufs) ::free(b);
     ::close(fd);
