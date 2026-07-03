@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 namespace p4 {
@@ -32,20 +33,24 @@ DramBlockStore::~DramBlockStore() {
     std::free(slab_);
 }
 
-std::byte* DramBlockStore::alloc(BlockId id) {
-    assert(!full() && "Cache 层应在 full 时先 evict 再 alloc");
-    assert(index_.find(id) == index_.end() && "重复 alloc 同一个 id");
+bool DramBlockStore::write(BlockId id, const std::byte* src) {
+    assert(!full() && "Cache 层应在 full 时先 evict 再 write");
+    assert(index_.find(id) == index_.end() && "重复 write 同一个 id");
 
+    // 找一个空槽,记账,再拷进去。顺序:先占坑再写字节 —— 万一 memcpy 抛
+    // (对 raw byte 不会抛,但保持这个纪律以后加校验/加密扩展时不容易乱)。
     const size_t slot = free_list_.back();
     free_list_.pop_back();
     index_.emplace(id, slot);
-    return slot_ptr(slot);
+    std::memcpy(slot_ptr(slot), src, block_size_);
+    return true;   // DRAM 后端永远成功
 }
 
-std::byte* DramBlockStore::get(BlockId id) {
+bool DramBlockStore::read(BlockId id, std::byte* dst) {
     auto it = index_.find(id);
-    if (it == index_.end()) return nullptr;
-    return slot_ptr(it->second);
+    if (it == index_.end()) return false;
+    std::memcpy(dst, slot_ptr(it->second), block_size_);
+    return true;
 }
 
 bool DramBlockStore::contains(BlockId id) const {
@@ -57,6 +62,7 @@ void DramBlockStore::evict(BlockId id) {
     assert(it != index_.end() && "evict 一个不存在的 id");
     free_list_.push_back(it->second);
     index_.erase(it);
+    // 物理字节留在 slab 里等下一次 write 覆盖 —— 逻辑不可达就够了。
 }
 
 } // namespace p4

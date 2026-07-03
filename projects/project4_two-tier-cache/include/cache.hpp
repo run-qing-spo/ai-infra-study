@@ -14,12 +14,10 @@ public:
     Cache(BlockStore& store, EvictionPolicy& policy)
         : store_(store), policy_(policy) {}
 
-    // hit: 返回数据指针(只读视角),并通知策略 on_access。
-    // miss: 返 nullptr。
-    // 注意生命周期:返回的指针在下一次 put 之前有效;put 可能触发 evict
-    // 把别的 block 踢掉 —— 但本次返回的 id 自身不会被立刻踢
-    // (LRU 刚 on_access 过它是最热的;其它策略需自己保证语义)。
-    const std::byte* get(BlockId id);
+    // hit: 把数据拷进 dst,通知策略 on_access,返 true。
+    // miss: 不动 dst,返 false。
+    // 调用方持有 dst,长度至少 store.block_size() 字节。
+    bool get(BlockId id, std::byte* dst);
 
     // 插入 / 覆盖:把 src 的 block_size() 字节拷进 store。
     // 已存在 → 覆盖数据 + on_access(算一次"写命中")。
@@ -27,7 +25,7 @@ public:
     //     由 token 序列决定的,id 一样内容就一样)。所以"已存在"应该几乎不发生;
     //     真发生了直接覆盖是安全的。先按这个简单语义来,后面如果上 RadixTree
     //     再重新审视。
-    // 不存在 → 满了先 evict 一个,再 alloc + 拷贝 + on_insert。
+    // 不存在 → 满了先 evict 一个,再 write + on_insert。
     void put(BlockId id, const std::byte* src);
 
     size_t size() const { return store_.size(); }

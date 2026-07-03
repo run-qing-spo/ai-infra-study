@@ -19,6 +19,12 @@ namespace p4 {
 //   - slab 的核心好处是 "同构、固定大小、连续",这正是 P5 接 GPU 时
 //     做 pinned memory 或大段 cudaMemcpy 的前提。
 //   - 这一层就把 layout 定下来,后面 SSD 层、HBM 层都按同 shape 镜像。
+//
+// 关于新接口 write/read:
+//   DRAM 版本失去了"直接返 slab 指针零拷贝"的旧取巧,write/read 各多一次
+//   memcpy。这是为了跟 SSD/GPU 层接口对称付出的代价 —— 但 KV cache 场景
+//   下 block 是 4KB~64KB 级别,memcpy 相对于后续 KV attention 计算的开销
+//   完全可以忽略,交换到的可组合性远比这一次 memcpy 值。
 class DramBlockStore : public BlockStore {
 public:
     DramBlockStore(size_t block_size, size_t capacity);
@@ -31,10 +37,10 @@ public:
     size_t capacity() const override { return capacity_; }
     size_t size() const override { return index_.size(); }
 
-    std::byte* alloc(BlockId id) override;
-    std::byte* get(BlockId id) override;
-    bool       contains(BlockId id) const override;
-    void       evict(BlockId id) override;
+    bool write(BlockId id, const std::byte* src) override;
+    bool read(BlockId id, std::byte* dst) override;
+    bool contains(BlockId id) const override;
+    void evict(BlockId id) override;
 
 private:
     std::byte* slot_ptr(size_t slot) {

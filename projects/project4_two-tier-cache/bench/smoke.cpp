@@ -39,7 +39,8 @@ int main() {
     LruPolicy      policy;
     Cache          cache(store, policy);
 
-    std::vector<std::byte> buf(kBlockSize);
+    std::vector<std::byte> buf(kBlockSize);    // 写入用
+    std::vector<std::byte> out(kBlockSize);    // 读出用(新接口:调用方持 dst)
 
     // 1) 填到满:0,1,2,3 全部 put,LRU 顺序应为 (头) 3,2,1,0 (尾)
     for (BlockId id = 0; id < 4; ++id) {
@@ -50,9 +51,8 @@ int main() {
 
     // 2) 全部 hit + 数据正确
     for (BlockId id = 0; id < 4; ++id) {
-        const std::byte* p = cache.get(id);
-        assert(p && "应该全部命中");
-        assert(check_block(p, kBlockSize, id));
+        assert(cache.get(id, out.data()) && "应该全部命中");
+        assert(check_block(out.data(), kBlockSize, id));
     }
     // 经过这轮 get,LRU 顺序变成 (头) 3,2,1,0 (尾) → 顺序 access 后是 (头) 3,2,1,0
     //   ↑ 等等,access 顺序是 0,1,2,3,所以每次 access 都把它移到头部,
@@ -62,30 +62,31 @@ int main() {
     fill_block(buf, 4);
     cache.put(4, buf.data());
     assert(cache.size() == 4);
-    assert(cache.get(0) == nullptr && "0 应被淘汰");
-    assert(cache.get(4) != nullptr && "4 应在");
+    assert(!cache.get(0, out.data()) && "0 应被淘汰");
+    assert(cache.get(4, out.data()) && "4 应在");
 
     // 4) 命中 1(把它顶到头),再 put 5 → 应淘汰 2(此时 2 在尾)
     //    上一步状态:经过 cache.get(0)=miss / cache.get(4)=hit,
     //               LRU 是 (头) 4,3,2,1 (尾)。注:get(0) miss 不动账本。
     //    然后这一步 cache.get(1) hit → (头) 1,4,3,2 (尾)。
     //    put(5):2 是尾,被淘汰。
-    const std::byte* p1 = cache.get(1);
-    assert(p1 && check_block(p1, kBlockSize, 1));
+    assert(cache.get(1, out.data()));
+    assert(check_block(out.data(), kBlockSize, 1));
 
     fill_block(buf, 5);
     cache.put(5, buf.data());
-    assert(cache.get(2) == nullptr && "2 应被淘汰");
-    assert(cache.get(1) != nullptr);
-    assert(cache.get(3) != nullptr);
-    assert(cache.get(4) != nullptr);
-    assert(cache.get(5) != nullptr);
+    assert(!cache.get(2, out.data()) && "2 应被淘汰");
+    assert(cache.get(1, out.data()));
+    assert(cache.get(3, out.data()));
+    assert(cache.get(4, out.data()));
+    assert(cache.get(5, out.data()));
 
     // 5) 重复 put 同一 id 应走"覆盖"分支,不淘汰别人
     fill_block(buf, 5);   // 内容不变,但 put 行为要正确
     cache.put(5, buf.data());
     assert(cache.size() == 4);
-    assert(check_block(cache.get(5), kBlockSize, 5));
+    assert(cache.get(5, out.data()));
+    assert(check_block(out.data(), kBlockSize, 5));
 
     std::puts("smoke: OK");
     return 0;

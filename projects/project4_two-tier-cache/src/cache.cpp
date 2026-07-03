@@ -1,21 +1,22 @@
 #include "cache.hpp"
 
-#include <cstring>
-
 namespace p4 {
 
-const std::byte* Cache::get(BlockId id) {
-    std::byte* p = store_.get(id);
-    if (!p) return nullptr;
+bool Cache::get(BlockId id, std::byte* dst) {
+    if (!store_.read(id, dst)) return false;
+    // BlockStore::read 不更新热度(那是数据面的边界),这里显式通知策略。
     policy_.on_access(id);
-    return p;
+    return true;
 }
 
 void Cache::put(BlockId id, const std::byte* src) {
-    // 已存在 → 覆盖 + on_access。
-    // (BlockStore::get 不更新热度,所以这里要显式调 policy_。)
-    if (std::byte* existing = store_.get(id)) {
-        std::memcpy(existing, src, store_.block_size());
+    // 已存在 → 覆盖分支。
+    // 新接口下 store.write 假设 !contains(id),所以覆盖要走"evict 旧的 → write 新的"
+    // 两步。metadata 上是一次 map erase + 一次 map insert,可忽略。策略侧只需
+    // on_access(不算新插入,这个 id 在账本里从没离开过)。
+    if (store_.contains(id)) {
+        store_.evict(id);
+        store_.write(id, src);
         policy_.on_access(id);
         return;
     }
@@ -26,8 +27,7 @@ void Cache::put(BlockId id, const std::byte* src) {
         store_.evict(victim);
     }
 
-    std::byte* dst = store_.alloc(id);
-    std::memcpy(dst, src, store_.block_size());
+    store_.write(id, src);
     policy_.on_insert(id);
 }
 

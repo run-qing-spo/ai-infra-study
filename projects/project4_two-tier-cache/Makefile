@@ -12,21 +12,31 @@ LDFLAGS  :=
 BUILD    := build
 OBJDIR   := $(BUILD)/obj
 
-SRCS     := src/dram_block_store.cpp src/lru_policy.cpp src/cache.cpp
+SRCS     := src/dram_block_store.cpp src/ssd_block_store.cpp src/lru_policy.cpp src/cache.cpp
 OBJS     := $(SRCS:%.cpp=$(OBJDIR)/%.o)
 
 SMOKE    := bench/smoke.cpp
 SMOKE_O  := $(OBJDIR)/bench/smoke.o
 SMOKE_BIN := $(BUILD)/smoke
 
-.PHONY: all clean smoke
+SMOKE_SSD    := bench/smoke_ssd.cpp
+SMOKE_SSD_O  := $(OBJDIR)/bench/smoke_ssd.o
+SMOKE_SSD_BIN := $(BUILD)/smoke_ssd
 
-all: $(SMOKE_BIN)
+.PHONY: all clean smoke smoke_ssd
+
+all: $(SMOKE_BIN) $(SMOKE_SSD_BIN)
 
 smoke: $(SMOKE_BIN)
 	./$(SMOKE_BIN)
 
+smoke_ssd: $(SMOKE_SSD_BIN)
+	./$(SMOKE_SSD_BIN)
+
 $(SMOKE_BIN): $(OBJS) $(SMOKE_O)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+$(SMOKE_SSD_BIN): $(OBJS) $(SMOKE_SSD_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
 
 $(OBJDIR)/%.o: %.cpp
