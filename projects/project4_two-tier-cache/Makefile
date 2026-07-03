@@ -27,9 +27,13 @@ SMOKE_TIERED    := bench/smoke_tiered.cpp
 SMOKE_TIERED_O  := $(OBJDIR)/bench/smoke_tiered.o
 SMOKE_TIERED_BIN := $(BUILD)/smoke_tiered
 
-.PHONY: all clean smoke smoke_ssd smoke_tiered
+BENCH_SRC := bench/bench.cpp
+BENCH_O   := $(OBJDIR)/bench/bench.o
+BENCH_BIN := $(BUILD)/bench
 
-all: $(SMOKE_BIN) $(SMOKE_SSD_BIN) $(SMOKE_TIERED_BIN)
+.PHONY: all clean smoke smoke_ssd smoke_tiered bench
+
+all: $(SMOKE_BIN) $(SMOKE_SSD_BIN) $(SMOKE_TIERED_BIN) $(BENCH_BIN)
 
 smoke: $(SMOKE_BIN)
 	./$(SMOKE_BIN)
@@ -40,6 +44,9 @@ smoke_ssd: $(SMOKE_SSD_BIN)
 smoke_tiered: $(SMOKE_TIERED_BIN)
 	./$(SMOKE_TIERED_BIN)
 
+bench: $(BENCH_BIN)
+	./$(BENCH_BIN)
+
 $(SMOKE_BIN): $(OBJS) $(SMOKE_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
 
@@ -47,6 +54,9 @@ $(SMOKE_SSD_BIN): $(OBJS) $(SMOKE_SSD_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
 
 $(SMOKE_TIERED_BIN): $(OBJS) $(SMOKE_TIERED_O)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+$(BENCH_BIN): $(OBJS) $(BENCH_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
 
 $(OBJDIR)/%.o: %.cpp
