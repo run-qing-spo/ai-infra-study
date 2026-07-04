@@ -12,7 +12,7 @@ LDFLAGS  :=
 BUILD    := build
 OBJDIR   := $(BUILD)/obj
 
-SRCS     := src/dram_block_store.cpp src/ssd_block_store.cpp src/lru_policy.cpp src/cache.cpp src/tiered_cache.cpp
+SRCS     := src/dram_block_store.cpp src/ssd_block_store.cpp src/lru_policy.cpp src/cache.cpp src/tiered_cache.cpp src/locked_cache.cpp
 OBJS     := $(SRCS:%.cpp=$(OBJDIR)/%.o)
 
 SMOKE    := bench/smoke.cpp
@@ -31,9 +31,13 @@ BENCH_SRC := bench/bench.cpp
 BENCH_O   := $(OBJDIR)/bench/bench.o
 BENCH_BIN := $(BUILD)/bench
 
-.PHONY: all clean smoke smoke_ssd smoke_tiered bench
+BENCH_CC_SRC := bench/bench_concurrent.cpp
+BENCH_CC_O   := $(OBJDIR)/bench/bench_concurrent.o
+BENCH_CC_BIN := $(BUILD)/bench_concurrent
 
-all: $(SMOKE_BIN) $(SMOKE_SSD_BIN) $(SMOKE_TIERED_BIN) $(BENCH_BIN)
+.PHONY: all clean smoke smoke_ssd smoke_tiered bench bench_concurrent
+
+all: $(SMOKE_BIN) $(SMOKE_SSD_BIN) $(SMOKE_TIERED_BIN) $(BENCH_BIN) $(BENCH_CC_BIN)
 
 smoke: $(SMOKE_BIN)
 	./$(SMOKE_BIN)
@@ -47,6 +51,9 @@ smoke_tiered: $(SMOKE_TIERED_BIN)
 bench: $(BENCH_BIN)
 	./$(BENCH_BIN)
 
+bench_concurrent: $(BENCH_CC_BIN)
+	./$(BENCH_CC_BIN)
+
 $(SMOKE_BIN): $(OBJS) $(SMOKE_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
 
@@ -58,6 +65,11 @@ $(SMOKE_TIERED_BIN): $(OBJS) $(SMOKE_TIERED_O)
 
 $(BENCH_BIN): $(OBJS) $(BENCH_O)
 	$(CXX) $(LDFLAGS) -o $@ $^
+
+# bench_concurrent 需要 pthread —— std::thread + std::shared_mutex 的实现
+# 在 glibc 上翻译到 pthread_rwlock,链接期得显式挂 -lpthread。
+$(BENCH_CC_BIN): $(OBJS) $(BENCH_CC_O)
+	$(CXX) $(LDFLAGS) -o $@ $^ -lpthread
 
 $(OBJDIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
