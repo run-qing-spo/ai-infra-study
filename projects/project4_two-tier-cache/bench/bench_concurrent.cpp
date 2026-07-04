@@ -28,6 +28,7 @@
 
 #include "cache.hpp"
 #include "dram_block_store.hpp"
+#include "kv_trace_gen.hpp"
 #include "locked_cache.hpp"
 #include "lru_policy.hpp"
 
@@ -219,6 +220,114 @@ void print_row(const char* name, size_t threads, AggStats& a) {
                 a.percentile(0.99) / 1000.0);
 }
 
+// ————————————————— KV workload 版本的 worker / runner —————————————————
+//
+// 跟通用版并列,区别只有输入类型:通用版是 BlockId 序列(每 op 语义相同,都是
+// look-aside get),KV 版是 KVOp 序列(区分 kGet look-aside 和 kPut 无条件写)。
+// 之所以要分开写,不复用通用版:如果把 KVOp 塞到 BlockId 序列里,就丢掉了
+// "这一步是 prefill 段的 look-aside get / decode 段的 append put" 的区别,
+// 后面想加 "prefill vs decode 分段 hit 统计" 就没抓手了。
+
+template<typename GetFn, typename PutFn>
+void run_worker_kv_slice(const KVOp* ops, size_t n_ops, size_t block_size,
+                         GetFn get_fn, PutFn put_fn, ThreadStats* out) {
+    out->reserve(n_ops);
+    std::vector<std::byte> buf(block_size);
+    std::vector<std::byte> dst(block_size);
+    for (size_t i = 0; i < n_ops; ++i) {
+        const KVOp& op = ops[i];
+        auto t0 = clk::now();
+        if (op.kind == OpKind::kGet) {
+            // look-aside:miss 时 fill+put,让后续同 prefix 的 request 能命中
+            if (get_fn(op.id, dst.data())) {
+                ++out->hits;
+            } else {
+                ++out->misses;
+                fill_block(buf, op.id);
+                put_fn(op.id, buf.data());
+            }
+        } else {
+            // kPut(decode append):无条件写,没有 hit/miss 语义。
+            // 为了不让 hit_rate 统计跑偏,归到 misses(写路径成本跟 miss-then-put 一致)。
+            // 后续如果需要更细的分段统计,把 hits/misses 拆成 prefill/decode 四栏。
+            ++out->misses;
+            fill_block(buf, op.id);
+            put_fn(op.id, buf.data());
+        }
+        auto t1 = clk::now();
+        out->lat_ns.push_back(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    }
+}
+
+template<typename GetFn, typename PutFn>
+AggStats run_single_kv(const std::vector<KVOp>& ops, size_t block_size,
+                       GetFn get_fn, PutFn put_fn) {
+    ThreadStats ts;
+    auto t0 = clk::now();
+    run_worker_kv_slice(ops.data(), ops.size(), block_size, get_fn, put_fn, &ts);
+    auto t1 = clk::now();
+    AggStats a;
+    a.hits = ts.hits;
+    a.misses = ts.misses;
+    a.wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    a.lat_ns = std::move(ts.lat_ns);
+    return a;
+}
+
+// 多线程 KV:切片必须按 request 边界。把一整个 request 的 prefill+decode 交给
+// 同一线程,不然:
+//   - decode 段要读该 request 的历史 block,如果历史在别的线程上没落地,
+//     就变成假 miss,hit rate 数字失真。
+//   - prefill 的 look-aside put 和 decode 的 append 都在同线程,写路径的
+//     锁争抢才是真实的 —— 拆开等于人为放大 reader 比例。
+// 分片方式:按 request 连续段切(不 round-robin),同一批 request 里前缀重合
+// 的概率更高,保留 workload 本来的时间局部性。
+template<typename GetFn, typename PutFn>
+AggStats run_multi_kv(const std::vector<KVOp>& ops,
+                      const std::vector<size_t>& req_starts,
+                      size_t block_size, size_t num_threads,
+                      GetFn get_fn, PutFn put_fn) {
+    const size_t num_reqs = req_starts.size() - 1;   // 末尾是哨兵
+
+    std::vector<ThreadStats> per_thread(num_threads);
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    std::atomic<bool> go{false};
+
+    auto t_start = clk::now();
+    for (size_t t = 0; t < num_threads; ++t) {
+        const size_t r_lo = t       * num_reqs / num_threads;
+        const size_t r_hi = (t + 1) * num_reqs / num_threads;
+        const KVOp* p = ops.data() + req_starts[r_lo];
+        const size_t n = req_starts[r_hi] - req_starts[r_lo];
+        ThreadStats* out = &per_thread[t];
+        workers.emplace_back([&, p, n, out]() {
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            run_worker_kv_slice(p, n, block_size, get_fn, put_fn, out);
+        });
+    }
+    go.store(true, std::memory_order_release);
+
+    for (auto& w : workers) w.join();
+    auto t_end = clk::now();
+
+    AggStats a;
+    a.wall_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    size_t total_lat = 0;
+    for (auto& ts : per_thread) total_lat += ts.lat_ns.size();
+    a.lat_ns.reserve(total_lat);
+    for (auto& ts : per_thread) {
+        a.hits   += ts.hits;
+        a.misses += ts.misses;
+        a.lat_ns.insert(a.lat_ns.end(), ts.lat_ns.begin(), ts.lat_ns.end());
+    }
+    return a;
+}
+
 } // namespace
 
 // 跑一整套场景,共用 print_header 出的表格。
@@ -281,6 +390,48 @@ void run_scenario(const char* label, size_t block_size, size_t cap,
     }
 }
 
+// KV workload 版场景。跟 run_scenario 平行,不 warmup —— prefix cache 的
+// warmup 语义应该是 "先跑一遍 prefix pool 的 prefill 让 prefix 落地",
+// 直接沿用通用版的 "拿 trace 前段跑一遍" 会污染 hit 统计(拿了一批真实
+// request 去当 warmup,那这些请求的 prefix hit 就被算进 warmup 阶段了,
+// 主 bench 阶段的数字反而偏低)。这里的取舍:不 warmup,把第一批 request
+// 的 tail miss 也算进最终统计 —— 这跟真实冷启动服务的 hit rate 曲线一致,
+// 更诚实。
+void run_kv_scenario(const char* label, size_t block_size, size_t cap,
+                     const std::vector<KVOp>& ops,
+                     const std::vector<size_t>& req_starts) {
+    std::printf("\n=== %s (cap=%zu blocks) ===\n", label, cap);
+    print_header();
+
+    {
+        DramBlockStore store(block_size, cap);
+        LruPolicy      policy;
+        Cache          cache(store, policy);
+        AggStats a = run_single_kv(ops, block_size,
+            [&](BlockId id, std::byte* d) { return cache.get(id, d); },
+            [&](BlockId id, const std::byte* s) { cache.put(id, s); });
+        print_row("Cache (no lock)", 1, a);
+    }
+    {
+        DramBlockStore store(block_size, cap);
+        LruPolicy      policy;
+        LockedCache    cache(store, policy);
+        AggStats a = run_single_kv(ops, block_size,
+            [&](BlockId id, std::byte* d) { return cache.get(id, d); },
+            [&](BlockId id, const std::byte* s) { cache.put(id, s); });
+        print_row("LockedCache (shared_mutex)", 1, a);
+    }
+    for (size_t T : {2, 4, 8}) {
+        DramBlockStore store(block_size, cap);
+        LruPolicy      policy;
+        LockedCache    cache(store, policy);
+        AggStats a = run_multi_kv(ops, req_starts, block_size, T,
+            [&](BlockId id, std::byte* d) { return cache.get(id, d); },
+            [&](BlockId id, const std::byte* s) { cache.put(id, s); });
+        print_row("LockedCache (shared_mutex)", T, a);
+    }
+}
+
 int main() {
     // —— 通用配置 ————————————————————————————————
     constexpr size_t kBlockSize  = 4096;
@@ -316,6 +467,48 @@ int main() {
     run_scenario("B. Read-heavy (大 cache, hit 多, shared_lock 主导)",
                  kBlockSize, 500, trace);
 
+    // —————— KV cache workload 场景 ——————
+    // 不是通用 block cache 的独立 Zipf,是模拟 LLM inference 的 request 流:
+    //   - prefix pool 里选一个共享前缀(system prompt / few-shot 变种)
+    //   - prompt / output 长度按 log-normal 长尾抽
+    //   - prefill 段 look-aside get(前段命中 prefix、后段 tail miss)
+    //   - decode 段 append 新 block + sample 历史 block
+    // 参数选取:num_prefixes=16、prefix_theta=1.5(system prompt 强集中)、
+    //          prefix_blocks=16、num_requests=800、prompt~24 block(≈100KB)、
+    //          output~12 block。整个 prefix 池 = 16*16 = 256 block。
+    KVTraceConfig kv_cfg;
+    kv_cfg.num_prefixes         = 16;
+    kv_cfg.prefix_theta         = 1.5;
+    kv_cfg.prefix_blocks        = 16;
+    kv_cfg.num_requests         = 800;
+    kv_cfg.prompt_mean_blocks   = 24.0;
+    kv_cfg.prompt_sigma         = 0.6;
+    kv_cfg.output_mean_blocks   = 12.0;
+    kv_cfg.output_sigma         = 0.5;
+    kv_cfg.seed                 = kSeed;
+
+    KVTraceGen kv_gen(kv_cfg);
+    std::vector<KVOp> kv_ops = kv_gen.generate();
+    const auto& kv_starts = kv_gen.request_starts();
+
+    std::printf("\nKV workload: prefixes=%zu(theta=%.2f, %zu blk each), "
+                "requests=%zu, prompt~%.0f blk, output~%.0f blk, total_ops=%zu\n",
+                kv_cfg.num_prefixes, kv_cfg.prefix_theta, kv_cfg.prefix_blocks,
+                kv_cfg.num_requests, kv_cfg.prompt_mean_blocks,
+                kv_cfg.output_mean_blocks, kv_ops.size());
+
+    // 场景 C:cap 刚好装下整个 prefix 池 + 一点空间给 tail —— 检验 "hot prefix
+    //          全命中、cold tail 全 miss" 的分层是否兑现。
+    run_kv_scenario("C. KV workload (cap ≈ prefix pool + slack)",
+                    kBlockSize, kv_gen.prefix_pool_block_count() + 64, kv_ops, kv_starts);
+
+    // 场景 D:cap 小到装不下整个 prefix 池 —— prefix 之间自己开始互相踢,
+    //          即使热前缀理论上该命中,也会被 tail put 挤掉。观察 hit rate
+    //          崩塌的形状,对应真实 KV serving 里 "prefix cache 容量不够"
+    //          的病态区。
+    run_kv_scenario("D. KV workload (cap < prefix pool, 前缀互踢)",
+                    kBlockSize, kv_gen.prefix_pool_block_count() / 2, kv_ops, kv_starts);
+
     std::printf("\n观察要点:\n");
     std::printf("  · LockedCache hit%% 略低于 Cache 是预期:shared_lock 版 get 不调 on_access,\n");
     std::printf("    LRU 退化 → 淘汰序不再严格按热度。cap 越大差距越小(尾部误判无所谓)。\n");
@@ -327,5 +520,13 @@ int main() {
     std::printf("  · 面试点:'加个 shared_mutex 就能并发'是幻觉。什么时候真赚:\n");
     std::printf("      读写比 > 10:1、临界区里做的活比 shared_lock 本身开销大得多。\n");
     std::printf("      不满足就换 sharded lock(每片 mutex)或 lock-free 结构。\n");
+    std::printf("  · KV 场景 C vs D:cap 跨过 prefix 池大小是一道悬崖 —— C 段热\n");
+    std::printf("    前缀锁在 cache 里 hit rate 稳,D 段 cap 不够时前缀之间开始互踢,\n");
+    std::printf("    hit rate 直接崩。真实 vLLM/SGLang 的 preemption 策略就是在这条\n");
+    std::printf("    悬崖上做取舍(踢谁的 sequence、什么时候 swap 到 SSD)。\n");
+    std::printf("  · KV 场景多线程:比通用场景更容易看到 shared_lock 兑现读并行,\n");
+    std::printf("    因为 prefix hit 段是纯 shared_lock read;但 prefill/decode 的\n");
+    std::printf("    put burst 又会周期性地夹 unique_lock,吞吐曲线不会线性 —— 这是\n");
+    std::printf("    KV serving 里 continuous batching 存在的动机之一。\n");
     return 0;
 }
