@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kv-uring-tier"
+version = "0.1.0"
+description = "io_uring + O_DIRECT secondary KV tier for vLLM TieringOffloadingSpec"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+# vLLM 启动时对每个进程加载这个 entry point → SecondaryTierFactory 里
+# 出现 "uring" 类型。C++ 扩展 (_kvtier.so) 由 Makefile 编进包目录,
+# 这里不接管编译 —— 学习项目保持 Makefile 可见性。
+[project.entry-points."vllm.general_plugins"]
+kv_uring_tier = "kv_uring_tier:register"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+kv_uring_tier = ["*.so"]

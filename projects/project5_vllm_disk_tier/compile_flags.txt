@@ -1,0 +1,6 @@
+-std=c++20
+-I../project2_spsc/include
+-I../project3_async_IO/include
+-Icsrc
+-Wall
+-Wextra
