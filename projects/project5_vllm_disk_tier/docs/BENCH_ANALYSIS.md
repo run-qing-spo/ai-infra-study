@@ -140,9 +140,16 @@ MB/s 反而暴跌。原因是 NVMe controller 的**物理 queue depth** 通常�
 
 这个发现直接改产品默认参数:`queue_depth=512` 是错的,应该改成 32。
 
+**【§5 后记】**:结论 B 的现象成立(默认 QD=32 仍是对的),但当时的解释
+错了 —— 拖垮高 QD load 的不是 NVMe 物理队列深度(pool-slab 32 线程能打
+7500 MB/s,设备远没到顶),而是 io-wq 的 worker 伸缩在大批量入队时坍缩:
+QD=512 时全程只有 1 个 worker(iou_wrk 实测,见 §5)。结论 A 也只对了一
+半:提交/完成路径确实没串行,但 punt 之后的执行路径在 io-wq 里被按 inode
+串行 —— 串行恰恰在 io_uring 自己家里。
+
 ---
 
-## 3. 第三层诊断:iostat aqu-sz 定位到 fs 层串行
+## 3. 第三层诊断:iostat aqu-sz 看到设备端串行
 
 Store 侧 QD 从 8 到 512 几乎不动(1400 → 1600),说明写路径的瓶颈**根本不在
 io_uring 并发上**,在更底层。上 iostat 直接看 nvme 端的实际排队深度:
@@ -187,8 +194,12 @@ python3 bench/bench_engine.py --engines uring ...
 ```
 
 **几乎无差**。XFS extent conversion 不是根因,从怀疑名单删掉。剩下的嫌疑
-集中在 `inode i_rwsem` 或 md RAID 层对单 fd write 的排队 —— 但深入到内核
-锁层面对面试 ROI 一般,识别到这一步就够了。
+当时集中在 `inode i_rwsem` 或 md RAID 层对单 fd write 的排队。
+
+**【§5 后记,销案】**:两个嫌疑人都不是。pool-slab 同 fd 多线程能打出
+aqu-sz 15.5,这本身就证明 fs/md 层允许这个 inode 并发 write —— 串行只能
+在 uring 独有的路径里。真凶是 io-wq 的 per-inode hash,分片实验(同
+inode 多 ring 照样提速)把它钉死,见 §5。
 
 ---
 
@@ -230,32 +241,122 @@ pread/pwrite。它和 uring 引擎的唯一区别就是"io_uring vs pthread + �
 syscall",拿这个对比才 apples-to-apples。这一步没做,是当前叙事最大的
 未闭环。
 
----
-
-## 5. 现在的画像
-
-| 维度 | uring (QD=32) | pool-slab | vLLM 场景意义 |
-|-----|--------------|-----------|--------------|
-| syscall 数 | 少 30–200× | 基线 | CPU-constrained 时值钱 |
-| store MB/s | 输 2× (1650 vs 3344) | 基线 | store 是 fire-and-forget,不在关键路径 |
-| load MB/s | 赢 2× (4144 vs 2089) | 基线 | 但 2× 里 GIL 占不小,io_uring 净贡献未知 |
-| CPU 秒 load | 显著低 | 基线 | 部分来自 io_uring, 部分来自绕过 GIL |
-| CPU 秒 store | 略高 | 基线 | 部分是 bench 主线程忙 poll 污染 |
-
-对 vLLM 官方 fs tier(它就是 Python 线程池 + file-per-block)整体是赢的,
-因为它同时占 syscall、CPU、fs 元数据三个坑,我们把这三个都拆了。但**"我
-的引擎更快"** 这话不准 —— 准的说法是**"我在 vLLM tier 的三条成本轴上都
-赢:syscall 数、CPU 秒、read 吞吐(store 略输,已解释)"**。
+**【复测后记】**:后来带 iou_wrk 计数的复测里,"load 赢 2 倍"没有复现 ——
+pool-slab load 两次稳定打出 ~7500 MB/s(1.3 核),uring 反输 1.8×;当初
+2089 MB/s / 16.4 核那组疑似异常样本(pool-slab store 同配置也跑出过 3777
+vs 2500 的方差)。GIL 归因的方法论保留,但"read 反赢"这条叙事作废,新画
+像见 §6。
 
 ---
 
-## 6. 面试怎么讲
+## 5. 第四层诊断:100% punt —— io_uring 退化成隐形线程池
 
-主线一句话:**我用 SPSC + 单线程 io_uring 做 KV disk tier,通过微基准发现
-并修复了 gather 层退化 bug,sweep 出了 QD sweet spot,并用 iostat 定位到
-了单 fd O_DIRECT write 在 XFS+md 上的串行边界**。
+§3 停在"fs 层某处串行"。但 pool-slab 的数据本身就藏着反驳:它写的是
+**同一个大文件同一个 fd**,32 个 pthread 的 pwrite 能打出 aqu-sz 15.5 ——
+fs/md 层明明允许这个 inode 并发 write。串行不可能发生在两条路径共用的
+层,只能在 uring 独有的那段:io_uring 内部。
 
-拆成三个可追问点:
+### 机制假设:punt + per-inode hash
+
+io_uring 对每个 IO 先带 NOWAIT 标志尝试内联非阻塞下发;下面任何一层返回
+-EAGAIN,就把请求 punt 给 io-wq 内核线程池走同步阻塞路径。而 io-wq 有条
+规则:**regular file 的 write 按 inode hash,同一 inode 的 write 全部串到
+同一个 worker 上顺序执行**(内核防止 buffered write 在 i_rwsem 上互踩的
+设计);read 不 hash,可以摊到多个 worker 并行。
+
+触发条件的怀疑落在内核版本上:这台机器是 Ubuntu 22.04 / 5.15 内核,而
+**md 的 REQ_NOWAIT 支持 5.17 才进主线**。5.15 上带 NOWAIT 的 bio 打到
+md127 直接被弹 -EAGAIN → 内联提交必败 → 100% punt。如果成立,单文件
+write = 单 worker = aqu-sz ~0.5,全对上。
+
+### 观测:iou_wrk 计数器
+
+io-wq worker 不是别人的线程,是**本进程的线程**,`/proc/self/task/*/comm`
+里叫 `iou-wrk-*`。给 bench 的 poll loop 加 10ms 限频采样取峰值(iou_wrk
+列)。关键性质:**内联提交成功时这个数只能是 0** —— 非零就是 punt 的直接
+目击。
+
+| 配置 | store MB/s | store iou_wrk | load MB/s | load iou_wrk |
+|--------|-----------|---------------|-----------|--------------|
+| QD=512 | 1537 | 2 | 1788 | 1 |
+| QD=32  | 1541 | 5 | 4091 | 5 |
+
+三条信息:
+
+1. **全程非零 → 100% punt 坐实**,io_uring 的"异步提交"在这台机器上
+   名存实亡。
+2. store 吞吐对 QD 和 worker 数完全不敏感 → 有效写并发就是 1。(计数含
+   刚 spawn 和空闲待退的 worker;hash 只限制"同时在跑"的数量,所以 2、5
+   不推翻单列。)
+3. 意外收获:**QD=512 时 load 只有 1 个 worker、1788 MB/s** —— 高 QD 拖垮
+   load 的真凶是 io-wq worker 伸缩在大批量入队时的坍缩,不是 §2 猜的
+   NVMe 物理队列深度。
+
+### 干预:分片实验
+
+bench 加 `--shard-files N`(N 个引擎 = N 个 ring + N 个 worker 线程,各写
+各的文件)和 `--shard-same-file` 对照组(N 个 ring 写**同一个文件**,同
+inode)。QD=32:
+
+| 配置 | store MB/s | load MB/s | iou_wrk |
+|------|-----------|-----------|---------|
+| 1 引擎(基线) | 1399 | 4248 | 5 |
+| 4 引擎 × 4 文件 | 3206 | 5638 | 23 |
+| 4 引擎 × 同一文件 | 3546 | 5484 | 25 |
+
+两个结论:
+
+- **分片能修**:store 2.3×,逼近 pool 的 3714(≈盘在这个负载下的能力)。
+- **same-file 和 multi-file 一样快**:同一个 inode 被 4 个 ring 并发写照样
+  翻倍 → 串行**不在 fs/inode 层**,只在单个 io-wq 内部的 hash 链上(每个
+  ring 有自己的 io-wq,互不共享 hash 链)。§3 的嫌疑人正式销案。
+
+加上 `uname -r` = 5.15.0-94 实测,证据链闭环:**md 无 REQ_NOWAIT(<5.17)
+→ NOWAIT bio 被弹回 → 100% punt(iou_wrk 非零)→ io-wq per-inode hash 把
+write 串成单列(same-file 分片实验)**。
+
+### 残酷的部分:CPU 卖点在这个环境不成立
+
+shard4 load 打了 **12.7 核**,pool-slab 只要 1.35 核。punt 意味着每个 IO
+由一个内核线程同步阻塞执行 —— io_uring 在这台机器上就是一个**隐形线程
+池**:worker 数不受你控制,write 还被 hash 串行。syscall 少(64 vs 2048)
+的优势还在,但"少 syscall 省 CPU"的逻辑链断了:CPU 没有省,只是从用户态
+线程转移到了内核 worker 线程,总量还更大。
+
+io_uring 的价值前提是 **NOWAIT 内联提交成功**。满足它要么 (a) 不经过 md
+的设备,要么 (b) ≥5.17 内核。AutoDL 容器共享宿主内核,(b) 不可行 ——
+(a) 是下一步的翻身仗。
+
+---
+
+## 6. 现在的画像
+
+复测 + 分片后的完整画像(QD=32,run-to-run 方差见下):
+
+| 维度 | uring 单文件 | uring shard4 | pool-slab | 说明 |
+|-----|-------------|--------------|-----------|------|
+| syscall 数 | 64 | 64 | 2048 | 唯一稳赢的轴 |
+| store MB/s | 1400–1540 | 3206–3546 | 2500–3777 | 单文件输 ~2.4×;分片追平 |
+| load MB/s | 4090–4250 | 5480–5640 | ~7500 | 都输;"赢 2 倍"未复现 |
+| CPU(load) | 4.4–4.8 核 | 12.7 核 | 1.3 核 | punt 让 CPU 轴整体输 |
+
+对 vLLM 官方 fs tier(pool,file-per-block)仍有 syscall 和 fs 元数据两条
+赢面,但在 md + 5.15 的环境里,"单线程 io_uring 省 CPU"这条核心卖点不成
+立。准确的说法从"我的引擎更快"变成:**"我能说清楚它为什么慢、慢在哪一
+层、什么环境下会翻盘 —— 且观测(iou_wrk)和干预(分片)两组实验互相咬
+合"**。
+
+另:pool-slab store 同配置跑出过 3777 和 2500,这台机器 run-to-run 方差
+不小,单次数字都要打折,结论只建立在多次复现的形状上。
+
+---
+
+## 7. 面试怎么讲
+
+主线一句话:**我做了个 io_uring KV disk tier,微基准全面负优化;我用
+iou-wrk 线程计数和分片实验把根因钉死到"5.15 内核的 md 不支持 REQ_NOWAIT
+→ 100% punt 到 io-wq → write 被 per-inode hash 串成单列",由此识别出
+io_uring 的适用边界**。
 
 **追问 1:你的 syscall 是怎么减少的?**
 答:worker loop 的病理循环 —— 每 CQE 完成就补 1 SQE 立刻 submit,退化成
@@ -263,37 +364,53 @@ syscall",拿这个对比才 apples-to-apples。这一步没做,是当前叙事�
 debug 直接看到 batch 分布从 "1024 次 batch=1" 变成 "32 次 batch=32"。
 
 **追问 2:QD 越大越好吗?**
-答:不。sweep 显示 QD=32 是 sweet spot,超过就是净负优化。原因是 NVMe
-controller 物理 QD 上限就是 32–128,更多的 SQE 只是在 io_uring/blk layer
-排队,SQ/CQ 处理开销反而拖累吞吐。默认 QD=512 是错参数。
+答:不,QD=32 是 sweet spot。但注意解释:不是 NVMe 物理队列深度(那是我
+第一版的错误归因),是高 QD 大批量入队时 io-wq 只 spawn 出 1 个 worker,
+并行度坍缩在内核线程池的伸缩逻辑里 —— iou_wrk 计数直接看到 QD=512 时
+load 全程只有 1 个 worker。
 
-**追问 3:你的引擎在什么场景下会输?**
-答:pure write 吞吐场景。单 fd O_DIRECT write 在 XFS + md RAID0 上被内部
-串行,iostat aqu-sz 只有 0.49,而线程池 pwrite 能打到 15。fix 需要多 fd
-分片,但 vLLM 场景 store 是 fire-and-forget 不在关键路径,tradeoff 可以
-接受。
+**追问 3:你的引擎为什么输?**
+答:环境把 io_uring 的前提抽掉了。它的收益依赖 NOWAIT 内联提交成功;md
+在 5.17 之前不支持 REQ_NOWAIT,所有 IO 100% punt 到 io-wq,write 再被
+per-inode hash 串行。证据链三环:iou_wrk 全程非零(punt 目击)、store 吞
+吐对 QD/worker 数不敏感(单列)、同 inode 多 ring 分片照样提速(排除 fs
+层)。
 
-**追问 4(诚实版):你说 read 赢 2 倍,里面有多少是 io_uring 的功劳?**
-答:不好说,因为对照组是 Python 线程池,GIL 占了不小比例。要拆干净得加
-C++ 线程池对照,这一步我识别到了但还没跑完。
+**追问 4:怎么修?**
+答:≥5.17 内核(容器环境做不到)、绕开 md、或多文件/多 ring 分片(实测
+store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在关键
+路径,是否值得为它加分片复杂度要看端到端数据。
+
+**追问 5(诚实版):那 io_uring 在这个项目里还剩什么价值?**
+答:在这台机器上数据面价值基本归零 —— punt 让它退化成隐形线程池,CPU 反
+而更贵。剩下的是 syscall 轴和方法论:部署 io_uring 前要冒烟检查 iou-wrk
+线程数,非零说明拿到的不是异步 IO。翻身实验(非 md 单盘,预期
+iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
 
 ---
 
-## 7. 剩余工作
+## 8. 剩余工作
 
-1. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净。这是
-   当前叙事最大的未闭环点。
-2. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
-   要同步。
-3. **进入 §4 端到端**。vLLM 场景下 CPU 是 attention/decode 的稀缺资源,
-   syscall/CPU 那条轴的胜利要在 revisit TTFT 上直接显形。
-4. `bench_engine.py` 的主线程 `poll_finished` 忙轮询要修(空返回时
+1. **非 md 单盘复测** —— io_uring 的翻身仗。预测:iou_wrk=0、cpu_util 骤
+   降、store 追平 pool。先 `df -T / && lsblk` 找一块不走 md 的盘。
+2. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净(GIL
+   归因仍未闭环)。
+3. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
+   要同步;同时 gather threshold 要和 QD 联动 —— threshold=32 撞上 QD=32
+   会退化成"提交 32 → 等完 32"的 lockstep,改成 min(32, QD/2) 之类再
+   sweep 验证。
+4. 若要在 md 环境部署:**引擎内建多文件分片**(bench 层 N 引擎只是探针,
+   正式做应该是单引擎多 fd,或多 ring)。
+5. **进入 §4 端到端**。vLLM 场景下 CPU 是 attention/decode 的稀缺资源,
+   syscall 那条轴的胜利要在 revisit TTFT 上直接显形 —— 但 CPU 轴的故事
+   要按 §5 的结论重讲。
+6. `bench_engine.py` 的主线程 `poll_finished` 忙轮询要修(空返回时
    `time.sleep(0)`),否则 CPU 数字被主线程污染,cpu_util 不能干净反映
    worker 侧成本。
 
 ---
 
-## 8. 时间线
+## 9. 时间线
 
 用于自查这次调试花了多少时间在什么地方,下次能避免重复。
 
@@ -310,3 +427,7 @@ C++ 线程池对照,这一步我识别到了但还没跑完。
 | iostat | aqu-sz 0.49 vs 15.5 定位到 fs 串行 | 找到边界 |
 | dd 预写 | 排除 unwritten extent | 缩小怀疑范围 |
 | 归因反思 | 用户点出 GIL 混在里面 | 学到对照公平性 |
+| 复测主对比 | 带 iou_wrk 列重跑三引擎 | "load 赢 2 倍"未复现;发现 run-to-run 方差 |
+| iou_wrk 计数 | /proc/self/task 里数 iou-wrk 峰值 | punt 直接目击;QD512 load 仅 1 worker, 推翻 NVMe 归因 |
+| 分片实验 | --shard-files 4 ± --shard-same-file | same-file 一样快 → 销案 fs 层, 真凶 io-wq hash |
+| 内核版本 | uname -r = 5.15, md REQ_NOWAIT 5.17 才合入 | punt 触发条件钉死 |
