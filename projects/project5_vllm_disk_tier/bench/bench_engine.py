@@ -50,6 +50,21 @@ def cpu_time() -> float:
     return r.ru_utime + r.ru_stime
 
 
+def count_iou_workers() -> int:
+    # io-wq worker 是本进程的线程, 出现在 /proc/self/task 里, comm 叫 iou-wrk-*。
+    # 用来验证 punt+per-inode-hash 假设:store 期间恒 1 = write 被串到单 worker,
+    # load 期间几十 = read 不 hash 可并行。
+    n = 0
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as f:
+                if f.read().startswith("iou-wrk"):
+                    n += 1
+        except FileNotFoundError:
+            pass  # 线程刚退出, 忽略
+    return n
+
+
 # ---------------------------------------------------------------- uring ----
 
 def run_uring(mv, args, direction: str) -> dict:
@@ -67,8 +82,14 @@ def run_uring(mv, args, direction: str) -> dict:
         # slot == block_id:1:1 布局, bench 只量数据面, 不掺账本逻辑
         assert submit(job_id, ids, ids)
         job_id += 1
+    iou_peak, last_sample = 0, 0.0
     while done < job_id:
         done += len(eng.poll_finished())
+        # 限频 10ms 采一次:poll loop 是忙转, 每圈读 /proc 会污染 CPU 数字
+        now = time.perf_counter()
+        if now - last_sample >= 0.01:
+            iou_peak = max(iou_peak, count_iou_workers())
+            last_sample = now
     wall, cpu = time.perf_counter() - t0, cpu_time() - c0
 
     stats = eng.stats()
@@ -76,7 +97,7 @@ def run_uring(mv, args, direction: str) -> dict:
     if direction == "load":
         os.unlink(path)
     return dict(wall_s=wall, cpu_s=cpu, syscalls=stats["submit_calls"],
-                failed=stats["jobs_failed"])
+                failed=stats["jobs_failed"], iou_wrk=iou_peak)
 
 
 # ----------------------------------------------------------------- pool ----
@@ -214,7 +235,8 @@ def main():
                        MB_s=round(total_mb / r["wall_s"], 1),
                        iops=round(args.blocks / r["wall_s"], 1),
                        cpu_util=round(r["cpu_s"] / r["wall_s"], 3),
-                       syscalls=r["syscalls"], failed=r["failed"])
+                       syscalls=r["syscalls"], failed=r["failed"],
+                       iou_wrk=r.get("iou_wrk", "-"))
             results.append(row)
             if not args.json:
                 print("  ".join(f"{k}={v}" for k, v in row.items()))

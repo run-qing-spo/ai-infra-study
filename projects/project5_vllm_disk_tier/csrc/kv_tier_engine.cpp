@@ -175,6 +175,14 @@ void KvTierEngine::worker_loop() {
         //    (= 一次 io_uring_enter syscall) 送走 —— 对照 fs tier
         //    每 block 一次 pwrite syscall, 这里是 P3 学到的核心收益。
         size_t room = queue_depth_ - backend.in_flight();
+        // gather window: room 太小 + 还有活在飞 → 跳过这轮 submit,
+        //   让 ③ 阻塞收一批 CQE, 下轮 room 攒够才 submit。
+        //   issue_order 空时不 gather, 尾巴必须立刻 submit 不能 stall。
+        constexpr size_t kSubmitThreshold = 32;
+        bool skip_submit = (room < kSubmitThreshold)
+                           && (backend.in_flight() > 0)
+                           && !issue_order.empty();
+        if (skip_submit) room = 0;
         reqs.clear();
         while (room > 0 && !issue_order.empty()) {
             uint64_t seq = issue_order.front();
@@ -221,7 +229,14 @@ void KvTierEngine::worker_loop() {
         //    有活时非阻塞 peek —— worker 只在真没事时才让出 CPU。
         if (backend.in_flight() > 0) {
             bool more_to_issue = !issue_order.empty();
-            size_t min_complete = (made_progress || more_to_issue) ? 0 : 1;
+            size_t min_complete;
+            if (skip_submit) {
+                // 关键: cap 到 in_flight, 否则 QD < kSubmitThreshold 时死锁
+                min_complete = kSubmitThreshold < backend.in_flight()
+                               ? kSubmitThreshold : backend.in_flight();
+            } else {
+                min_complete = (made_progress || more_to_issue) ? 0 : 1;
+            }
             size_t n = backend.reap(comps.data(), kReapBatch, min_complete);
             for (size_t i = 0; i < n; ++i) {
                 uint64_t seq = comps[i].user_data;
