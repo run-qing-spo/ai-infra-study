@@ -70,21 +70,44 @@ def count_iou_workers() -> int:
 def run_uring(mv, args, direction: str) -> dict:
     from kv_uring_tier import _kvtier
 
-    path = os.path.join(args.dir, "bench_uring.bin")
-    eng = _kvtier.Engine(mv, path, args.blocks, args.block_bytes,
-                         args.queue_depth, not args.no_odirect)
-    submit = eng.submit_store if direction == "store" else eng.submit_load
+    bs = args.block_bytes
+    n_shard = args.shard_files
+    assert args.blocks % n_shard == 0, "--blocks 必须能被 --shard-files 整除"
+    chunk = args.blocks // n_shard
+
+    # 分片探针:N 个引擎(各自 ring + worker 线程)把负载拆到多文件/同一文件,
+    # 验证"单 fd O_DIRECT write 串行"发生在哪一层:
+    #   多文件提速 & 同文件也提速 → 串行在单 ring 的 io-wq(punt 后按 inode 排单列)
+    #   多文件提速 & 同文件不提速 → 串行真的在 fs/inode 层
+    # 注意 --shard-same-file 时 N 个引擎写同一段 offset, 数据互相覆盖,
+    # 纯性能探针, 不做正确性。
+    engines, paths = [], []
+    for k in range(n_shard):
+        if args.shard_same_file or n_shard == 1:
+            path = os.path.join(args.dir, "bench_uring.bin")
+        else:
+            path = os.path.join(args.dir, f"bench_uring.{k}.bin")
+        paths.append(path)
+        region = mv[k * chunk * bs : (k + 1) * chunk * bs]
+        engines.append(_kvtier.Engine(region, path, chunk, bs,
+                                      args.queue_depth, not args.no_odirect))
 
     t0, c0 = time.perf_counter(), cpu_time()
-    job_id, done = 0, 0
-    for start in range(0, args.blocks, args.job_blocks):
-        ids = list(range(start, min(start + args.job_blocks, args.blocks)))
-        # slot == block_id:1:1 布局, bench 只量数据面, 不掺账本逻辑
-        assert submit(job_id, ids, ids)
-        job_id += 1
+    total_jobs = 0
+    for eng in engines:
+        submit = eng.submit_store if direction == "store" else eng.submit_load
+        job_id = 0
+        for start in range(0, chunk, args.job_blocks):
+            ids = list(range(start, min(start + args.job_blocks, chunk)))
+            # slot == block_id:1:1 布局, bench 只量数据面, 不掺账本逻辑
+            assert submit(job_id, ids, ids)
+            job_id += 1
+        total_jobs += job_id
+    done = 0
     iou_peak, last_sample = 0, 0.0
-    while done < job_id:
-        done += len(eng.poll_finished())
+    while done < total_jobs:
+        for eng in engines:
+            done += len(eng.poll_finished())
         # 限频 10ms 采一次:poll loop 是忙转, 每圈读 /proc 会污染 CPU 数字
         now = time.perf_counter()
         if now - last_sample >= 0.01:
@@ -92,12 +115,17 @@ def run_uring(mv, args, direction: str) -> dict:
             last_sample = now
     wall, cpu = time.perf_counter() - t0, cpu_time() - c0
 
-    stats = eng.stats()
-    del eng
+    syscalls, failed = 0, 0
+    for eng in engines:
+        s = eng.stats()
+        syscalls += s["submit_calls"]
+        failed += s["jobs_failed"]
+    del engines
     if direction == "load":
-        os.unlink(path)
-    return dict(wall_s=wall, cpu_s=cpu, syscalls=stats["submit_calls"],
-                failed=stats["jobs_failed"], iou_wrk=iou_peak)
+        for p in set(paths):
+            os.unlink(p)
+    return dict(wall_s=wall, cpu_s=cpu, syscalls=syscalls,
+                failed=failed, iou_wrk=iou_peak)
 
 
 # ----------------------------------------------------------------- pool ----
@@ -202,6 +230,10 @@ def main():
     ap.add_argument("--job-blocks", type=int, default=32,
                     help="uring 引擎一个 job 里的 block 数(≈一次 preempt 的批量)")
     ap.add_argument("--queue-depth", type=int, default=512)
+    ap.add_argument("--shard-files", type=int, default=1,
+                    help="uring 分片探针: 拆成 N 个引擎+N 个文件(定位单 fd 串行层次)")
+    ap.add_argument("--shard-same-file", action="store_true",
+                    help="分片对照组: N 个引擎共用同一个文件(同 inode 多 ring)")
     ap.add_argument("--pool-threads", type=int, default=32)
     ap.add_argument("--no-odirect", action="store_true")
     ap.add_argument("--engines", default="uring,pool,pool-slab")
