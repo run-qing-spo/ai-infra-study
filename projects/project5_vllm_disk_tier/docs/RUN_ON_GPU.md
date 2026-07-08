@@ -27,7 +27,10 @@ O_DIRECT)降低 revisit TTFT 和 CPU 占用, 且不产生负优化。
 - 数据盘 `/root/autodl-tmp`:所有 backing 文件、模型缓存都放这里。
   先确认文件系统与剩余空间:`df -T /root/autodl-tmp`(ext4/xfs 都支持
   O_DIRECT;NFS 类网络盘不行,那就换 `--dir`)。
-- 内核 ≥ 5.15 即可(Ubuntu 22.04 默认满足):`uname -r`。
+- 内核:`uname -r`。**5.15 + md RAID 数据盘会让 io_uring 100% punt 到
+  io-wq**(md 的 REQ_NOWAIT 支持 5.17 才进主线),引擎退化成隐形线程池,
+  CPU 优势不成立 —— 详见 BENCH_ANALYSIS.md §5。在这种宿主上跑 e2e 依然
+  有效,但对 C2 的预期要按 §4.4 的修正版看。
 
 ## 1. 安装依赖
 
@@ -127,7 +130,10 @@ vllm serve $M --max-model-len 16384 --kv-transfer-config '{
     "cpu_bytes_to_use": 4294967296,
     "secondary_tiers": [{"type": "uring",
       "path": "/root/autodl-tmp/kv_tier.bin",
-      "disk_bytes_to_use": 21474836480}]}}'
+      "disk_bytes_to_use": 21474836480,
+      "queue_depth": 32}]}}'
+# queue_depth=32: 微基准 sweep 的 sweet spot, 默认 512 是错参数
+# (BENCH_ANALYSIS §2/§5)
 ```
 
 起服务后在日志里确认:`Created secondary tier #0 (uring)`(C2)/
@@ -158,6 +164,15 @@ A 组同负载的吞吐和 TTFT —— 差值就是"挂着 tier 但全 miss"的�
   (CPU tier 占用率、跳过的 store 数)
 - C2 组结束后引擎计数器:目前通过日志/调试接口,`engine_stats()` 暴露
   `submit_calls / sq_full_events / bytes_*`
+- **iou-wrk 采样**(punt 目击,C2 组):serve 是长进程,外部循环就行:
+  ```bash
+  PID=$(pgrep -f 'vllm serve' | head -1)
+  while sleep 1; do
+    echo "$(date +%T) $(grep -l '^iou-wrk' /proc/$PID/task/*/comm 2>/dev/null | wc -l)"
+  done >> iou_wrk_C2.log
+  ```
+  注意引擎在 vLLM 的 worker 子进程里,如果主 PID 采出来恒 0,换
+  `pgrep -f VLLM::Worker` 之类找真正持有 ring 的进程。
 
 ### 4.4 预期形状(用来判断实验是否跑对了)
 
@@ -167,6 +182,15 @@ A 组同负载的吞吐和 TTFT —— 差值就是"挂着 tier 但全 miss"的�
   **并发 revisit / 大批 promotion** 时(提交模型的差异要有并发才显形)
 - 若 C2 反而更差:先查是不是没走 O_DIRECT(日志里有降级 warning)、
   churn 是否真的把 CPU tier 挤爆(metrics 里看)、盘是不是网络盘
+
+**【§5 诊断后的修正版预期(md + 5.15 宿主)】**:微基准里 uring 的
+load 吞吐输 pool ~1.8×、CPU 反而更高(punt 退化成隐形线程池),照搬到
+e2e 的天真预期是 C2 ≥ C1 的 TTFT、CPU 也不占优。但 e2e 的变量组合完全
+不同:promotion 是一个前缀几百 MB 的突发 load(不是 2 GiB 持续流),
+瓶颈可能在 vLLM 调度而非盘;C1 的 Python 线程池在真实 serving 里要和
+调度线程抢 GIL(微基准里没有这个竞争);store 是 fire-and-forget 不进
+关键路径。所以 C2 vs C1 谁赢是**开放问题**,这正是跑 e2e 的价值 ——
+无论哪边赢,配合 iou_wrk 采样都能讲清楚为什么。
 
 ## 5. 结果落盘
 

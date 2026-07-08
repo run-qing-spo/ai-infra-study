@@ -392,7 +392,15 @@ iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
 ## 8. 剩余工作
 
 1. **非 md 单盘复测** —— io_uring 的翻身仗。预测:iou_wrk=0、cpu_util 骤
-   降、store 追平 pool。先 `df -T / && lsblk` 找一块不走 md 的盘。
+   降、store 追平 pool。这个实验**不需要 GPU**,路径按成本排:
+   - 当前机器先试系统盘(`lsblk` + `df -T /`,/ 是 overlayfs 的话看
+     O_DIRECT 能否穿透,引擎 open 会 fail fast);
+   - AutoDL 换宿主:镜像版本无关,内核跟宿主机走;用**无卡模式**
+     (~0.1 元/时)开机 → `uname -r` + `lsblk` 筛 ≥5.17 且数据盘非 md
+     的宿主,不合格就释放换地区/机型;CPU 型号与内核无关,只是越新
+     机型装机越晚、内核可能越新的弱启发;
+   - 或者几块钱的抢占式云主机(阿里/腾讯 spot、AWS i3/i4i),Ubuntu
+     24.04(6.8 内核)+ 本地 NVMe,最干净的对照。
 2. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净(GIL
    归因仍未闭环)。
 3. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
