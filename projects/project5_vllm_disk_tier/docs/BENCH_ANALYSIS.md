@@ -349,6 +349,11 @@ io_uring 的价值前提是 **NOWAIT 内联提交成功**。满足它要么 (a) 
 另:pool-slab store 同配置跑出过 3777 和 2500,这台机器 run-to-run 方差
 不小,单次数字都要打折,结论只建立在多次复现的形状上。
 
+**【§10.6 后记,口径警告】**本表 uring 的 MB/s 和 CPU 差距倍数含 bench
+自伤成分:uring 排引擎列表第一个,替全场付了缓冲区 first-touch 缺页税,
+且主线程忙轮询恒计 +1 核。punt/io-wq 的定性结论不受影响(iou_wrk 证据
+独立),但差距倍数被夸大,AutoDL 上欠一轮修复后复测。详见 §10.6。
+
 ---
 
 ## 7. 面试怎么讲
@@ -386,10 +391,11 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 而更贵。剩下的是 syscall 轴和方法论:部署 io_uring 前要冒烟检查 iou-wrk
 线程数,非零说明拿到的不是异步 IO。
 
-**【§10 后记】**翻身实验已跑:iou_wrk 如预期归零,但单 ring 吞吐**没有**
-翻身 —— 串行点从 io-wq 转移到单 worker 线程的内联提交 CPU(每 IO pin
-256 页),分片照样提速。完整故事见 §10。C++ pool 对照(拆 GIL 加成)仍
-欠着。
+**【§10 后记】**翻身实验已跑,一波三折:iou_wrk 如预期归零,但单 ring
+吞吐起初没翻身 —— 直到把 bench 的两处自伤(主线程忙轮询、first-touch
+缺页记在先跑引擎头上)修掉,单线程单 ring 打满盘,CPU 一半、syscall
+1%,三条轴全赢。完整故事见 §10(尤其 §10.6 的归因修正)。C++ pool 对照
+(拆 GIL 加成)仍欠着,但"io_uring 加成"本身已经干净显形。
 
 ---
 
@@ -407,9 +413,9 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
      24.04(6.8 内核)+ 本地 NVMe,最干净的对照。
 
    **【§10 后记,已完成】**在自有实体机(5.15 + LVM/dm-linear)上跑了:
-   iou_wrk=0 达成、io-wq 的 CPU 消失,但 store **没有**追平 pool ——
-   预测部分证伪,发现第二个串行点(单 worker 线程的内联提交 CPU),
-   见 §10。
+   iou_wrk=0 达成、io-wq 的 CPU 消失;store 起初没追平 pool,查出来是
+   bench 自伤(first-touch 缺页,§10.6),修掉之后单 ring 打满盘 ——
+   预测最终成立,且比预测更好(load 也赢了 CPU 轴)。见 §10。
 2. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净(GIL
    归因仍未闭环)。
 3. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
@@ -460,6 +466,8 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 | QD sweep(二次) | dm 机器 QD 64–256 吞吐平坦 | lockstep 嫌疑排除; syscall 32→5 继续降 |
 | 分片(二次) | shard4 ± same-file 提速且重合 | "无 punt 分片失效"预测证伪 → 第二串行点在单 worker 线程 |
 | perf 归因 | 按 tid 拆线程, GUP/缺页链贯穿 io_submit_sqes | 内联提交的 pin 页成本归提交线程; 处方 registered buffers |
+| 修复后复测 | pre-touch + 空轮真睡, 重跑三引擎 | 单 ring 打满盘、0.2 核; "稳态 pin 页"归因修正为 first-touch artifact + 引擎顺序不公平 |
+| 分片(三次) | shard4 与单 ring 完全重合 | 反常消失, 因果链闭环; registered buffers 降级为 CPU 微优化 |
 
 ---
 
@@ -544,6 +552,11 @@ hash,dm 上是给提交路径加核。处方也不同:punt 世界要绕开 md �
 的内存池本来就是一整块长期存活的 slab,天生适合一次性注册。其次才是
 多 ring 分片。
 
+**【§10.6 后记,归因修正一半】**"稳态成本是每 IO pin 256 页"被修复后的
+复测推翻了大半:pre-touch 之后单 ring 直接打满盘,只用 0.14–0.21 核。
+串行点确实在单 worker 线程,但被串行的主体是 first-touch 缺页这个
+artifact,不是稳态提交成本;registered buffers 的处方随之降级。见 §10.6。
+
 ### 10.4 bench 卫生修复(随本节提交)
 
 1. `make_region` 分配后整块 pre-touch,把 first-touch 缺页赶出计时窗口
@@ -551,7 +564,8 @@ hash,dm 上是给提交路径加核。处方也不同:punt 世界要绕开 md �
 2. `run_uring` 主线程 poll loop 空轮真睡 0.5ms(§8.6 旧账)。
 
 修复后 cpu_util 口径变了,前文所有 cpu_util 数字不能和修复后的新数字
-直接对表;修复后需在两台机器各复测一轮基线。
+直接对表;修复后需在两台机器各复测一轮基线。dm 机器的复测见 §10.6,
+AutoDL(md 机)的还欠着。
 
 ### 10.5 面试版一句话
 
@@ -560,3 +574,65 @@ hash,dm 上是给提交路径加核。处方也不同:punt 世界要绕开 md �
 perf 显示这次串行在单 worker 线程的内联提交路径(每 IO pin 256 页)。
 io_uring 不是免费的异步:punt 世界里你付 io-wq 的 CPU 税,内联世界里
 提交 CPU 归你自己,registered buffers 是后者的对症药。"
+
+**【§10.6 后记】**这版说法只对了一半("内联世界提交 CPU 归你自己"成
+立,但当时量出来的单核瓶颈主要是 bench artifact),修正版见 §10.7。
+
+### 10.6 修复后复测:真正的翻身,和第三次归因修正
+
+§10.4 的两处修复落地后,同机器同配置复测(QD=64,1024 × 1MB,预写):
+
+| engine | store MB/s | load MB/s | cpu_util (st/ld) | syscalls |
+|--------|-----------|-----------|------------------|----------|
+| uring 单 ring | **2288** | **3000** | **0.14 / 0.21** | 28 / 26 |
+| pool | 2229 | 3015 | 0.40 / 0.35 | 2048 |
+| pool-slab | 1850 | 2684 | 0.42 / 0.49 | 1024 |
+| uring shard4 | 2288 | 3016 | 0.16 / 0.21 | 28 |
+
+三个事实:
+
+1. **单 ring 打满盘**:store 2288 ≈ dd 写上限 2.2 GB/s,load 3000 ≈ 读
+   上限;MB/s 与 pool 打平(都是盘瓶颈),CPU 少 2–2.5×,syscall 少
+   ~75×。这是 RUN_ON_GPU.md 最初预期的形状,第一次真实出现 —— 单线程
+   0.2 个核喂满一块 NVMe,就是 io_uring 该有的样子。
+2. **分片不再提速**(与单 ring 完全重合)。§10.2 的反常随 artifact 一起
+   消失:当初分片"有效",只是把缺页账单分给 4 个线程去付。因果链至此
+   闭环。
+3. **§10.3 的归因修正一半**:串行点确实在单 worker 线程,但被串行的主体
+   是 first-touch 缺页,不是稳态 pin 页。每页的缺页路径(进 fault
+   handler、分配、清零 4K、建页表)是微秒级,GUP 一个已驻留的页只要百纳
+   秒级,差两个数量级。perf 采样显示缺页只占 worker ~25%,但干预实验
+   (pre-touch)给出的真实份额是"从 1700 到打满盘的全部差距" —— 采样
+   比例会骗人(成本摊在 percent-limit 之下的长尾符号里),观测只配提出
+   假设,份额要靠干预来定。
+
+还有一个藏得更深的对照不公平:make_region 每个方向只建一次缓冲区,三个
+引擎**共用**,而 uring 排在引擎列表第一个 —— 旧 bench 里 **uring 替所有
+引擎付了全部缺页税,pool 拿到的是摸热的缓冲区**。对照组共享可变状态时,
+运行顺序本身就是混杂变量。
+
+连带修正两条:
+
+- **registered buffers 降级**:它治"每 IO pin 页打满单核",现在单核只用
+  0.2,没有吞吐病可治。仍可作为 CPU 微优化(驻留页 GUP 的百纳秒也省掉,
+  对 vLLM 场景省 CPU 仍有意义),排到端到端之后。
+- **md 机器的旧数字要打折**:§0/§6 里 uring 输的幅度含同样的 artifact
+  (uring 先跑替全场缺页 + 忙轮询计入 CPU)。punt 的定性结论不受影响
+  (iou_wrk 证据独立),但差距倍数被夸大,AutoDL 上欠一轮修复后复测。
+
+至此,"uring 全面负优化"完整拆解成三层:**一层环境**(md 无 REQ_NOWAIT
+→ 100% punt → io-wq 串行),**两层 bench 自伤**(主线程忙轮询污染 CPU
+轴;first-touch 缺页 + 引擎顺序不公平污染 MB/s 轴)。三层全部剥掉之后,
+io_uring 在它的适用环境里兑现了全部承诺:同吞吐、一半 CPU、1% 的
+syscall。
+
+### 10.7 一句话(修正版)
+
+"我的 io_uring 引擎微基准输给线程池,我把'输'拆成了三层:一层环境 ——
+5.15 的 md 不透传 REQ_NOWAIT,100% punt 进 io-wq 被 per-inode hash 串行,
+iou_wrk 计数直接目击;两层 benchmark 自伤 —— 主线程忙轮询污染 CPU 数字,
+匿名页 first-touch 缺页全记在先跑的引擎头上(perf 在 io_submit_sqes 下面
+抓到 shmem_fault)。逐层剥掉后,单线程单 ring 用 0.2 个核打满 NVMe,CPU
+是线程池的一半、syscall 是 1%。这个过程我错归因过三次:NVMe 队列深度、
+fs 层串行、稳态 pin 页成本 —— 每次都是干预实验(分片/预写/pre-touch)把
+观测假设修正过来的,perf 采样比例骗过我一次。"
