@@ -38,6 +38,19 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
 def make_region(num_blocks: int, block_bytes: int) -> memoryview:
     # mmap 匿名映射:页对齐, 跟 SharedOffloadRegion 的对齐性质一致
     m = mmap.mmap(-1, num_blocks * block_bytes)
+    # pre-touch:匿名页懒分配, 不先摸一遍的话 first-touch 缺页会发生在引擎
+    # worker 的提交路径里(GUP pin 页时), 把"分配+清零整个缓冲区"记到引擎
+    # 头上 —— §10 翻身实验的 perf 在 io_submit_sqes 下面直接抓到
+    # shmem_fault/clear_page_erms。真实场景内存池长期存活, 这个一次性成本
+    # 不该进计时窗口。(只写 block 头 8 字节不够:1MB block 有 256 页,
+    # 只有第 1 页被摸到, 其余 255 页仍留给 worker 首触。)
+    zeros = b"\0" * (16 << 20)
+    left = num_blocks * block_bytes
+    while left > 0:
+        n = min(len(zeros), left)
+        m.write(zeros[:n])
+        left -= n
+    m.seek(0)
     mv = memoryview(m)
     # 填可校验的内容:每个 block 开头 8 字节写 block 序号
     for i in range(num_blocks):
@@ -106,13 +119,20 @@ def run_uring(mv, args, direction: str) -> dict:
     done = 0
     iou_peak, last_sample = 0, 0.0
     while done < total_jobs:
+        got = 0
         for eng in engines:
-            done += len(eng.poll_finished())
+            got += len(eng.poll_finished())
+        done += got
         # 限频 10ms 采一次:poll loop 是忙转, 每圈读 /proc 会污染 CPU 数字
         now = time.perf_counter()
         if now - last_sample >= 0.01:
             iou_peak = max(iou_peak, count_iou_workers())
             last_sample = now
+        if got == 0 and done < total_jobs:
+            # 空轮真睡:主线程忙轮询恒占 1 核, cpu_util 反映不了 worker 侧
+            # 成本(§8.6 旧账)。sleep(0) 只让出 GIL 不省 CPU, 要真睡;
+            # 0.5ms 粒度对秒级 wall 的影响可忽略。
+            time.sleep(0.0005)
     wall, cpu = time.perf_counter() - t0, cpu_time() - c0
 
     syscalls, failed = 0, 0
