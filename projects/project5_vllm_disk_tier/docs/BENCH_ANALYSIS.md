@@ -384,8 +384,12 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 **追问 5(诚实版):那 io_uring 在这个项目里还剩什么价值?**
 答:在这台机器上数据面价值基本归零 —— punt 让它退化成隐形线程池,CPU 反
 而更贵。剩下的是 syscall 轴和方法论:部署 io_uring 前要冒烟检查 iou-wrk
-线程数,非零说明拿到的不是异步 IO。翻身实验(非 md 单盘,预期
-iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
+线程数,非零说明拿到的不是异步 IO。
+
+**【§10 后记】**翻身实验已跑:iou_wrk 如预期归零,但单 ring 吞吐**没有**
+翻身 —— 串行点从 io-wq 转移到单 worker 线程的内联提交 CPU(每 IO pin
+256 页),分片照样提速。完整故事见 §10。C++ pool 对照(拆 GIL 加成)仍
+欠着。
 
 ---
 
@@ -401,12 +405,21 @@ iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
      机型装机越晚、内核可能越新的弱启发;
    - 或者几块钱的抢占式云主机(阿里/腾讯 spot、AWS i3/i4i),Ubuntu
      24.04(6.8 内核)+ 本地 NVMe,最干净的对照。
+
+   **【§10 后记,已完成】**在自有实体机(5.15 + LVM/dm-linear)上跑了:
+   iou_wrk=0 达成、io-wq 的 CPU 消失,但 store **没有**追平 pool ——
+   预测部分证伪,发现第二个串行点(单 worker 线程的内联提交 CPU),
+   见 §10。
 2. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净(GIL
    归因仍未闭环)。
 3. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
    要同步;同时 gather threshold 要和 QD 联动 —— threshold=32 撞上 QD=32
    会退化成"提交 32 → 等完 32"的 lockstep,改成 min(32, QD/2) 之类再
    sweep 验证。
+
+   **【§10 后记】**dm 机器上 QD 32→256 吞吐完全平坦,lockstep 在这台机器
+   上未显形(瓶颈在提交线程 CPU,轮不到队形问题出场)。联动修改仍值得做,
+   优先级降。
 4. 若要在 md 环境部署:**引擎内建多文件分片**(bench 层 N 引擎只是探针,
    正式做应该是单引擎多 fd,或多 ring)。
 5. **进入 §4 端到端**。vLLM 场景下 CPU 是 attention/decode 的稀缺资源,
@@ -415,6 +428,10 @@ iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
 6. `bench_engine.py` 的主线程 `poll_finished` 忙轮询要修(空返回时
    `time.sleep(0)`),否则 CPU 数字被主线程污染,cpu_util 不能干净反映
    worker 侧成本。
+
+   **【§10 后记,已修】**空轮改成真睡 0.5ms(sleep(0) 只让 GIL 不省
+   CPU);同时 make_region 加了整块 pre-touch(§10.3 发现 first-touch
+   缺页被记进 worker 的提交路径)。修复后老数字的 cpu_util 口径作废。
 
 ---
 
@@ -439,3 +456,107 @@ iou_wrk=0)还没跑,C++ pool 对照(拆 GIL 加成)也还欠着。
 | iou_wrk 计数 | /proc/self/task 里数 iou-wrk 峰值 | punt 直接目击;QD512 load 仅 1 worker, 推翻 NVMe 归因 |
 | 分片实验 | --shard-files 4 ± --shard-same-file | same-file 一样快 → 销案 fs 层, 真凶 io-wq hash |
 | 内核版本 | uname -r = 5.15, md REQ_NOWAIT 5.17 才合入 | punt 触发条件钉死 |
+| 翻身实验 | 自有机 5.15+dm-linear, 复用 iou_wrk 探针 | load iou_wrk=0, punt 消失; store 首写仍 punt → 钉死 fallocate unwritten extent 是 fs 层第二 punt 源 |
+| QD sweep(二次) | dm 机器 QD 64–256 吞吐平坦 | lockstep 嫌疑排除; syscall 32→5 继续降 |
+| 分片(二次) | shard4 ± same-file 提速且重合 | "无 punt 分片失效"预测证伪 → 第二串行点在单 worker 线程 |
+| perf 归因 | 按 tid 拆线程, GUP/缺页链贯穿 io_submit_sqes | 内联提交的 pin 页成本归提交线程; 处方 registered buffers |
+
+---
+
+## 10. 翻身实验:非 md 单盘 (5.15 + dm-linear)
+
+2026-07-09,自有实体机(无 GPU):Ubuntu 20.04 HWE 内核 **5.15.0-119**,
+单块消费级 NVMe 238G,ext4 on **LVM(dm-linear)**。关键性质:dm-linear
+自 5.9 起支持 REQ_NOWAIT 直通,md 要 5.17 —— 和 AutoDL 机器**同为
+5.15**,唯一变量就是 md vs dm,正好把"真凶是 md 缺 NOWAIT、不是内核版本
+本身"钉死。盘的物理上限:dd O_DIRECT 顺序写 2.2 GB/s,读 ~2.9–3.0 GB/s
+(由下面 shard4 load 摸到)。绝对 MB/s 与 AutoDL 的 RAID0 没有可比性,
+本节只看形状。
+
+### 10.1 punt 如预期消失,但冒出第二个 punt 源
+
+QD=32 三引擎主对比(1024 × 1MB):
+
+| engine | store MB/s | load MB/s | cpu_util(load) | iou_wrk |
+|--------|-----------|-----------|----------------|---------|
+| uring | 1585 | 1740 | 1.97 | store **6** / load **0** |
+| pool | 2197 | 2802 | 0.36 | - |
+| pool-slab | 1974 | 2674 | 0.47 | - |
+
+load iou_wrk=0:NOWAIT 内联提交成功,punt 目击消失。CPU 从 md 机器的
+4.4–4.8 核降到 1.97 核 —— 消失的 ~2.5 核就是 io-wq worker 的成本;剩下
+~2 核是 bench 自伤(主线程忙轮询 + worker 自旋,见 10.3/10.4)。
+
+store iou_wrk=6 是 **fs 层的第二个 punt 源**:引擎 posix_fallocate 预分
+配出的是 unwritten extent,首写要做 extent 转换,这一步 NOWAIT 路径做不
+了 → -EAGAIN → punt。dd 预写文件后复测,store iou_wrk 6→0 —— §3 时代
+dd 预写实验怀疑过的因素,这次拿到直接读数。注意 bench 在 load 后会
+unlink 文件,预写必须每次跑之前重做。
+
+### 10.2 预测证伪:没有 punt,分片照样提速
+
+预写后(iou_wrk 全程 0):
+
+| 配置 | store MB/s | load MB/s | 说明 |
+|-----|-----------|-----------|------|
+| 单 ring QD=32 | 1623 | 1750 | |
+| 单 ring QD=64/128/256 | 1663–1688 | 1742–1765 | QD 不敏感; syscall 32→5 |
+| shard4 多文件 QD=64 | 2279 | 2953 | 双向逼近盘上限 |
+| shard4 **同文件** QD=64 | 2294 | 2968 | 与多文件重合 |
+
+原预测"无 punt 环境分片失效"**被证伪**:分片仍提速 ~35–70%,load 直接
+摸到盘的读上限。iou_wrk=0 说明这次提速与 io-wq 无关 —— 存在第二个串行
+点。同文件与多文件重合 → 再次销案 fs/inode 层,串行点在 **per-engine
+的单 worker 线程**。QD 32→256 吞吐纹丝不动,顺带排除 §8.3 担心的
+lockstep 是 load 慢的原因。
+
+### 10.3 perf 归因:内联世界里,提交 CPU 归你自己
+
+perf record 整个 bench(blocks 加到 2048,wall ~1.2s/方向),按 tid 拆:
+
+- 主线程 58%:`_PyEval_EvalFrameDefault` 忙轮询,外加退出时 munmap 拆
+  2GB 页表占 15% —— 全是 bench 自伤;
+- store/load worker 各 ~20%,热点调用链一条贯穿:
+  `io_uring_enter → io_submit_sqes → ext4_dio_write_iter → iomap_dio →
+  bio_iov_iter_get_pages → get_user_pages_fast → 缺页 → shmem 页分配 +
+  clear_page_erms`。
+
+这条链同时证明两件事:提交是**内联**的(全程不见 io-wq,与 iou_wrk=0
+互相印证);pin 页的成本发生在 worker 线程自己身上。其中缺页+清零部分
+(约占 worker 的 20–25%)是 bench artifact —— make_region 只摸了每个
+1MB block 的第 1 页,其余 255 页留给 GUP 首触(已修,见 10.4);稳态
+成本是每 IO get_user_pages_fast pin 256 页 + bio 构造,摊在长尾里。
+
+两个世界的机制画像(与 §5 对称):
+
+- **punt 世界(md + 5.15)**:NOWAIT 被拒 → io-wq 接管。写被 per-inode
+  hash 串成单列(store 慢);读不做 hash,punt 反而**免费送了多 worker
+  并行提交**(md 机器单文件 load 有 4.1–4.3 GB/s 的真正原因)—— 代价
+  是 CPU 爆炸。
+- **内联世界(dm/单盘)**:NOWAIT 成功 → io-wq 成本归零,但 bio 构造、
+  pin 页、DMA 映射全部同步落在提交线程上,单 worker 单核把单 ring 卡在
+  ~1700 MB/s。
+
+同一个分片实验在两台机器上都提速,但机制完全不同 —— md 上是绕开 io-wq
+hash,dm 上是给提交路径加核。处方也不同:punt 世界要绕开 md 或升内核;
+内联世界的对症药是 **registered buffers**(`io_uring_register_buffers`
++ `READ_FIXED/WRITE_FIXED`,注册时 pin 一次,每 IO 免 GUP)—— KV tier
+的内存池本来就是一整块长期存活的 slab,天生适合一次性注册。其次才是
+多 ring 分片。
+
+### 10.4 bench 卫生修复(随本节提交)
+
+1. `make_region` 分配后整块 pre-touch,把 first-touch 缺页赶出计时窗口
+   (10.3 的 artifact);
+2. `run_uring` 主线程 poll loop 空轮真睡 0.5ms(§8.6 旧账)。
+
+修复后 cpu_util 口径变了,前文所有 cpu_util 数字不能和修复后的新数字
+直接对表;修复后需在两台机器各复测一轮基线。
+
+### 10.5 面试版一句话
+
+"我在同内核版本(5.15)的 md 和 dm 机器上做了对照:md 上 iou_wrk 非零、
+分片提速是因为绕开 io-wq hash;dm 上 iou_wrk 归零、分片**仍然**提速 ——
+perf 显示这次串行在单 worker 线程的内联提交路径(每 IO pin 256 页)。
+io_uring 不是免费的异步:punt 世界里你付 io-wq 的 CPU 税,内联世界里
+提交 CPU 归你自己,registered buffers 是后者的对症药。"
