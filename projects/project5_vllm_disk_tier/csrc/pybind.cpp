@@ -135,7 +135,10 @@ void bind_engine(py::module_& m, const char* py_name,
 PYBIND11_MODULE(_kvtier, m) {
     m.doc() = "io_uring + O_DIRECT KV tier engine (project2 SPSC + project3 uring + project4 slab)";
 
-    bind_engine<p5::KvTierEngine>(m, "Engine", "queue_depth", 512);
+    // 默认 QD=32:微基准 sweep 的 sweet spot(BENCH_ANALYSIS §2/§5);
+    // 512 在 md 机器上让 io-wq 坍缩到 1 worker, dm 机器上也无收益。
+    // gather threshold 在引擎内随 QD 联动(min(32, QD/2)), 低 QD 不会 lockstep。
+    bind_engine<p5::KvTierEngine>(m, "Engine", "queue_depth", 32);
     // C++ 线程池对照组:拆 "C++ 加成" 和 "io_uring 加成"(BENCH_ANALYSIS §4)
     bind_engine<p5::PoolTierEngine>(m, "PoolEngine", "num_threads", 32);
 }

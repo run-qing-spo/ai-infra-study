@@ -266,7 +266,7 @@ def main():
     ap.add_argument("--blocks", type=int, default=1024)
     ap.add_argument("--job-blocks", type=int, default=32,
                     help="uring 引擎一个 job 里的 block 数(≈一次 preempt 的批量)")
-    ap.add_argument("--queue-depth", type=int, default=512)
+    ap.add_argument("--queue-depth", type=int, default=32)
     ap.add_argument("--shard-files", type=int, default=1,
                     help="uring 分片探针: 拆成 N 个引擎+N 个文件(定位单 fd 串行层次)")
     ap.add_argument("--shard-same-file", action="store_true",

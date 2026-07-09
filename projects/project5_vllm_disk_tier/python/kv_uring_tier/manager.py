@@ -99,7 +99,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
             "type": "uring",
             "path": "/root/autodl-tmp/kv_tier.bin",
             "disk_bytes_to_use": 21474836480,
-            "queue_depth": 512,        # 可选
+            "queue_depth": 32,         # 可选;默认 = 微基准 sweet spot(BENCH_ANALYSIS §2)
             "use_odirect": true        # 可选;对齐不满足时自动降级并告警
         }
     """
@@ -111,7 +111,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
         tier_type: str,
         path: str,
         disk_bytes_to_use: int,
-        queue_depth: int = 512,
+        queue_depth: int = 32,
         use_odirect: bool = True,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)

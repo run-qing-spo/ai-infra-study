@@ -436,6 +436,13 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
    **【§10 后记】**dm 机器上 QD 32→256 吞吐完全平坦,lockstep 在这台机器
    上未显形(瓶颈在提交线程 CPU,轮不到队形问题出场)。联动修改仍值得做,
    优先级降。
+
+   **【已完成】**threshold 改为引擎内随 QD 联动 `max(1, min(32, QD/2))`
+   (kv_tier_engine.cpp worker_loop 开头);默认 `queue_depth` 512→32 同
+   步到 pybind / manager.py / bench `--queue-depth` / RUN_ON_GPU.md 四处。
+   联动后 QD=32 时等 16 补 16,任何时刻盘里至少半数 IO 在飞。验证:dm 机
+   QD=32(新默认)一轮,吞吐/CPU 应与 QD=64 一致(之前 QD=32 的旧数字带
+   lockstep,不可比)。
 4. 若要在 md 环境部署:**引擎内建多文件分片**(bench 层 N 引擎只是探针,
    正式做应该是单引擎多 fd,或多 ring)。
 5. **进入 §4 端到端**。vLLM 场景下 CPU 是 attention/decode 的稀缺资源,

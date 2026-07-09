@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -124,6 +125,16 @@ EngineStats KvTierEngine::stats() const {
 void KvTierEngine::worker_loop() {
     p3::UringBackend backend(queue_depth_);
 
+    // gather threshold 随 QD 联动:min(32, QD/2), 至少为 1(§8.3)。
+    // 写死 32 的坑:threshold == QD 时 gather 退化成 lockstep ——
+    // "提交 QD 个 → room=0 → 阻塞等全部完成 → 盘空 → 再提交下一批",
+    // 提交和执行完全串行, 每批头尾盘都在干等。QD/2 保证阻塞等待期间
+    // 任何时刻至少还有一半 IO 在盘里飞, 批量摊薄和流水线两头都保住。
+    // (dm 机器 QD 32→256 吞吐平坦, 联动主要是护住低 QD 默认配置,
+    // 不是治已观测到的病 —— 见 BENCH_ANALYSIS §8.3 后记。)
+    const size_t submit_threshold =
+        std::max<size_t>(1, std::min<size_t>(32, queue_depth_ / 2));
+
     // 活跃 job 表。unordered_map 节点地址稳定, JobState* 可以塞进 user_data
     // 关联表。key 用内部序号而不是 job_id:引擎不该假设上游 id 永不复用。
     struct JobState {
@@ -178,8 +189,7 @@ void KvTierEngine::worker_loop() {
         // gather window: room 太小 + 还有活在飞 → 跳过这轮 submit,
         //   让 ③ 阻塞收一批 CQE, 下轮 room 攒够才 submit。
         //   issue_order 空时不 gather, 尾巴必须立刻 submit 不能 stall。
-        constexpr size_t kSubmitThreshold = 32;
-        bool skip_submit = (room < kSubmitThreshold)
+        bool skip_submit = (room < submit_threshold)
                            && (backend.in_flight() > 0)
                            && !issue_order.empty();
         if (skip_submit) room = 0;
@@ -231,9 +241,11 @@ void KvTierEngine::worker_loop() {
             bool more_to_issue = !issue_order.empty();
             size_t min_complete;
             if (skip_submit) {
-                // 关键: cap 到 in_flight, 否则 QD < kSubmitThreshold 时死锁
-                min_complete = kSubmitThreshold < backend.in_flight()
-                               ? kSubmitThreshold : backend.in_flight();
+                // 关键: cap 到 in_flight, 否则等不齐 threshold 个 CQE 时死锁
+                // (联动后 threshold ≤ QD/2, 这个 cap 理论上不再触发,
+                //  但当初 QD=8 撞死锁的教训留着, 防御不删)
+                min_complete = submit_threshold < backend.in_flight()
+                               ? submit_threshold : backend.in_flight();
             } else {
                 min_complete = (made_progress || more_to_issue) ? 0 : 1;
             }

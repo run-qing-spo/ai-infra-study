@@ -132,8 +132,10 @@ vllm serve $M --max-model-len 16384 --kv-transfer-config '{
       "path": "/root/autodl-tmp/kv_tier.bin",
       "disk_bytes_to_use": 21474836480,
       "queue_depth": 32}]}}'
-# queue_depth=32: 微基准 sweep 的 sweet spot, 默认 512 是错参数
-# (BENCH_ANALYSIS §2/§5)
+# queue_depth=32: 微基准 sweep 的 sweet spot (BENCH_ANALYSIS §2/§5)。
+# 现在也是引擎默认值(旧默认 512 是错参数, 已改), 显式写出是为了实验
+# 配置自文档化。gather threshold 在引擎内随 QD 联动 min(32, QD/2),
+# 低 QD 不会 lockstep(BENCH_ANALYSIS §8.3)。
 ```
 
 起服务后在日志里确认:`Created secondary tier #0 (uring)`(C2)/
