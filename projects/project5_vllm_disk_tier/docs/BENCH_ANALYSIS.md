@@ -241,6 +241,10 @@ pread/pwrite。它和 uring 引擎的唯一区别就是"io_uring vs pthread + �
 syscall",拿这个对比才 apples-to-apples。这一步没做,是当前叙事最大的
 未闭环。
 
+**【§11 后记,已闭环】**cpp-pool 引擎(csrc/pool_tier_engine)在 dm 机
+器上跑了两轮:GIL 税 ≈ 0(cpp-pool 和 Python 池 CPU 同档),uring 的
+CPU 优势干净归因到提交模型本身。见 §11。
+
 **【复测后记】**:后来带 iou_wrk 计数的复测里,"load 赢 2 倍"没有复现 ——
 pool-slab load 两次稳定打出 ~7500 MB/s(1.3 核),uring 反输 1.8×;当初
 2089 MB/s / 16.4 核那组疑似异常样本(pool-slab store 同配置也跑出过 3777
@@ -396,6 +400,7 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 缺页记在先跑引擎头上)修掉,单线程单 ring 打满盘,CPU 一半、syscall
 1%,三条轴全赢。完整故事见 §10(尤其 §10.6 的归因修正)。C++ pool 对照
 (拆 GIL 加成)仍欠着,但"io_uring 加成"本身已经干净显形。
+(→ 后来也补上了:§11,GIL 税 ≈ 0。)
 
 ---
 
@@ -418,6 +423,11 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
    预测最终成立,且比预测更好(load 也赢了 CPU 轴)。见 §10。
 2. **加 C++ pool 对照引擎**,把 "C++ 加成"和"io_uring 加成"拆干净(GIL
    归因仍未闭环)。
+
+   **【§11 后记,已完成】**cpp-pool 引擎落地,两轮复跑:GIL 税 ≈ 0,
+   uring 的 CPU/syscall 优势归提交模型。另:AutoDL(md 机)修复后复测
+   **决定不做**(md+5.15 宿主难找;punt 定性结论有 iou_wrk 独立证据,
+   只需不再引用 §0/§6 的旧差距倍数)。
 3. **把默认 `queue_depth` 改成 32**,`RUN_ON_GPU.md` 里对应的示例配置也
    要同步;同时 gather threshold 要和 QD 联动 —— threshold=32 撞上 QD=32
    会退化成"提交 32 → 等完 32"的 lockstep,改成 min(32, QD/2) 之类再
@@ -468,6 +478,7 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 | perf 归因 | 按 tid 拆线程, GUP/缺页链贯穿 io_submit_sqes | 内联提交的 pin 页成本归提交线程; 处方 registered buffers |
 | 修复后复测 | pre-touch + 空轮真睡, 重跑三引擎 | 单 ring 打满盘、0.2 核; "稳态 pin 页"归因修正为 first-touch artifact + 引擎顺序不公平 |
 | 分片(三次) | shard4 与单 ring 完全重合 | 反常消失, 因果链闭环; registered buffers 降级为 CPU 微优化 |
+| C++ pool 对照 | csrc/pool_tier_engine + bench cpp-pool, 两轮复跑 | GIL 税≈0; uring 的 CPU/syscall 优势干净归因到提交模型(§4 最后一环闭合) |
 
 ---
 
@@ -636,3 +647,58 @@ iou_wrk 计数直接目击;两层 benchmark 自伤 —— 主线程忙轮询污�
 是线程池的一半、syscall 是 1%。这个过程我错归因过三次:NVMe 队列深度、
 fs 层串行、稳态 pin 页成本 —— 每次都是干预实验(分片/预写/pre-touch)把
 观测假设修正过来的,perf 采样比例骗过我一次。"
+
+---
+
+## 11. C++ pool 对照:GIL 税 ≈ 0,uring 的赢面归提交模型
+
+§4 留下的最后一环:pool/pool-slab 是 Python 实现,uring 赢的 CPU 轴里
+可能混着"绕开 GIL"的语言加成。2026-07-09 补上 cpp-pool 对照引擎
+(csrc/pool_tier_engine):和 KvTierEngine 共用同一套 JobDesc/JobResult/
+stats、同样单大文件 + fallocate + O_DIRECT、bench 侧走同一条 submit/poll
+代码路径,唯一差异是 worker 侧换成 32 个 `std::thread` 各自同步
+pread/pwrite。对照关系:pool-slab vs cpp-pool 的差 = GIL/Python;
+cpp-pool vs uring 的差 = 提交模型,这才是 apples-to-apples。
+
+dm 机器(§10 同一台),QD=64 / 32 线程,1024 × 1MB,预写,跑两轮取区间:
+
+| engine | store MB/s | load MB/s | cpu_util st/ld(两轮区间) | syscalls |
+|--------|-----------|-----------|---------------------------|----------|
+| uring 单 ring | 2285–2288 | 3004–3005 | 0.11–0.13 / 0.21 | 27–29 |
+| cpp-pool | 2284–2289 | 2893–2929 | 0.26–0.44 / 0.46–0.67 | 1024(真实计数) |
+| pool | 2224–2238 | 2984–3025 | 0.37–0.40 / 0.36–0.39 | 2048(估算) |
+| pool-slab | 1703–1899 | 2673–2677 | 0.43 / 0.38–0.57 | 1024(估算) |
+
+三条结论:
+
+1. **GIL 税 ≈ 0**:cpp-pool 和两个 Python 池挤在同一档(0.3–0.5 核),
+   把线程池从 Python 换成 C++ 根本不省 CPU。原因:1MB 块下每个任务就是
+   一次立刻释放 GIL 的大 syscall,解释器侧工作量(一次函数调用 + 一个
+   memoryview 切片)相对每 IO 几百微秒的内核路径可忽略。第一轮看到
+   cpp-pool load CPU 比 pool 高还愣了一下 —— "去 GIL 必有收益"这个默认
+   本身就是错的:线程池的 CPU 大头是内核侧每 IO 的提交+睡眠+唤醒+上下文
+   切换,语言换了这些一分不少。
+2. **uring 的 2–3× CPU、37× syscall 优势因此干净归因到提交模型**:
+   uring 0.11–0.21 核 vs cpp-pool 0.26–0.67 核,同为 C++、同文件布局、
+   同 O_DIRECT,唯一变量就是"单线程批量 io_uring vs 每线程同步 syscall"。
+   §4 的担心("read 赢 2 倍可能全靠 GIL")正式解除。
+3. **线程池之间分不出稳定高下,别过度解读**:pool-slab load CPU 两轮
+   0.57 → 0.38,单轮数字噪音就有 50%;cpp-pool load 略高于 pool 的部分
+   有已知的 bench 侧不对称(cpp-pool 走 uring 的 poll loop:0.5ms 轮询
+   + 每 10ms 扫 /proc 数 iou-wrk,约 0.05 核;pool 的主线程在 executor
+   里睡死),残余在方差内,按"小差距不追、份额靠干预定"的原则封存。
+   另:pool-slab store 稳定偏低(1700–1900),嫌疑是 ftruncate 稀疏文件
+   每轮重付 extent 分配 —— 未验证,不追。
+
+MB/s 全员顶在盘上限附近(store ~2.2 GB/s、load ~2.9–3.0 GB/s),无区分
+度 —— 盘瓶颈下 CPU 和 syscall 才是有信息量的轴,这正是 vLLM 场景想要的
+形状:同样喂满盘,谁给 attention/decode 留的 CPU 多。
+
+### 面试版一句话
+
+"有人质疑我的 uring 引擎赢线程池是 C++ vs Python 的语言差,我就补了一个
+同构的 C++ 线程池对照:结果 C++ 化根本不省 CPU —— 1MB 块的负载下每个任
+务就是一次立刻放 GIL 的大 syscall,GIL 收不到税,线程池的 CPU 账单其实
+是内核侧每 IO 的提交和唤醒路径。io_uring 的 2–3 倍 CPU、37 倍 syscall
+优势因此干净归因到提交模型本身。顺带学到:'去 GIL 必有收益'是个想当然
+的默认,对照实验做出来才知道税基根本不在那里。"
