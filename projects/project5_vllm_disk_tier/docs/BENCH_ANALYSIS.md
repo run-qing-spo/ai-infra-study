@@ -486,6 +486,7 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 | 修复后复测 | pre-touch + 空轮真睡, 重跑三引擎 | 单 ring 打满盘、0.2 核; "稳态 pin 页"归因修正为 first-touch artifact + 引擎顺序不公平 |
 | 分片(三次) | shard4 与单 ring 完全重合 | 反常消失, 因果链闭环; registered buffers 降级为 CPU 微优化 |
 | C++ pool 对照 | csrc/pool_tier_engine + bench cpp-pool, 两轮复跑 | GIL 税≈0; uring 的 CPU/syscall 优势干净归因到提交模型(§4 最后一环闭合) |
+| md 复测(白捡) | 筛 e2e 宿主撞上 md RAID1+企业盘, 修复后 bench 四引擎 | punt 仍在(iou_wrk 5/6)但三轴全赢; "iou_wrk 非零=不可用"判据被推翻, 警报≠判决 |
 
 ---
 
@@ -709,3 +710,57 @@ MB/s 全员顶在盘上限附近(store ~2.2 GB/s、load ~2.9–3.0 GB/s),无区�
 是内核侧每 IO 的提交和唤醒路径。io_uring 的 2–3 倍 CPU、37 倍 syscall
 优势因此干净归因到提交模型本身。顺带学到:'去 GIL 必有收益'是个想当然
 的默认,对照实验做出来才知道税基根本不在那里。"
+
+---
+
+## 12. md 复测白捡:punt 还在,伤害没了
+
+2026-07-09/10,给 §4 端到端筛 AutoDL 宿主时撞上另一台 md 机:5.15.0-97,
+XFS on **md0 = RAID1 × 两块 7TB 企业级 NVMe**(老机器是 RAID0 × 两块
+小盘)。按 §5 的判据这又是 punt 世界 —— 本来只想用 iou_wrk 确认一下就
+释放换机,结果顺手跑的四引擎对比(修复后 bench + cpp-pool + QD=32 新
+默认/threshold=16 联动首跑)把 §10.6 欠的"md 修复后复测"白捡了回来,
+还推翻了一个判据:
+
+| engine | store MB/s | load MB/s | cpu_util st/ld | syscalls | iou_wrk |
+|--------|-----------|-----------|----------------|----------|---------|
+| uring QD=32 | **3617** | 7270 | **0.38 / 0.65** | 63 | **5 / 6** |
+| cpp-pool | 3422 | 7545 | 0.63 / 1.01 | 1024 | 0 |
+| pool | 3534 | 6988 | 1.29 / 1.45 | 2048 | - |
+| pool-slab | 3589 | 6973 | 0.93 / 1.26 | 1024 | - |
+
+**punt 确认在发生(iou_wrk 5/6 全程非零),但 uring 三轴全赢**:store
+全场最快、load 与 cpp-pool 持平、CPU 全场最低(池组的 1.6–2.2×)、
+syscall 1/16。§0 的"CPU 5–8 倍、吞吐一半"在这台 md 机上完全没有重演。
+
+两层含义:
+
+1. **§10.6 欠的"旧数字要打折"拿到实测**:修掉两层 bench 自伤后,md 机
+   上的 uring 不再是负优化。注意硬件不同(RAID1+企业盘 vs RAID0+小盘),
+   老机器 store 串行卡 1.5 GB/s 有 iostat aqu-sz 铁证,是真伤 —— 所以
+   两台机器的数据都对,错的是"md ⇒ 惨"这个推广。
+2. **punt 是机制不是判决,iou_wrk 非零只是警报**。punt 的实际伤害是两
+   笔账:(a) write 的 per-inode hash 串行 —— 伤害取决于盘的单 IO 延
+   迟,企业盘 1MB 写 ~0.3ms 量级(掉电保护写缓存),串行单列也能打出
+   3.5+ GB/s 顶到阵列上限(四引擎 store 全挤在 3.4–3.6,盘瓶颈);
+   (b) io-wq 的 CPU 税 —— 5–6 个 kernel worker 远比 32 个用户线程便
+   宜,punt 路径反而全场 CPU 最低。§5 末尾"CPU 卖点在 punt 环境不成
+   立"要收窄成:在**那台** RAID0 机器上不成立;punt 本身的固定成本没
+   那么大,组合拳(punt × 高延迟盘)才致命。
+
+未钉死的尾巴(对决策不关键,记录备查):这台机器上 store 是否仍被
+hash 串到单 worker 没有直接证据 —— 3617 高于 dd 单线程的 2.4 GB/s,
+但 dd 计时含 fsync 不可比;要钉死得上 iostat aqu-sz 或 shard 对照。
+另 QD=32 + threshold=16 联动的 syscall 从旧版的 ~32 变 63(batch 16),
+换掉 lockstep,可接受。
+
+**结论:这台机器直接可用于 §4 端到端**,C2 预期按正常剧本看(同吞吐、
+更低 CPU、syscall 1/16),不必再抽卡换宿主。
+
+### 面试版一句话
+
+"我本来把 iou_wrk 非零当'不可部署'的判据,复测教育了我:punt 是机制,
+不是判决。同样 100% punt,RAID0+小盘上 write 串行卡一半吞吐、io-wq 吃
+数倍 CPU;RAID1+低延迟企业盘上串行单列照样打满阵列,5 个 kernel worker
+比 32 个用户线程还省 CPU。部署判据从'看 punt 与否'改成'看 punt 之后
+的对照数字'——警报和判决是两回事。"

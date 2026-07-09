@@ -31,6 +31,10 @@ O_DIRECT)降低 revisit TTFT 和 CPU 占用, 且不产生负优化。
   io-wq**(md 的 REQ_NOWAIT 支持 5.17 才进主线),引擎退化成隐形线程池,
   CPU 优势不成立 —— 详见 BENCH_ANALYSIS.md §5。在这种宿主上跑 e2e 依然
   有效,但对 C2 的预期要按 §4.4 的修正版看。
+  **【§12 修正】**punt 是警报不是判决:一台 md RAID1 + 企业盘宿主实测
+  iou_wrk 非零但 uring 三轴全赢(串行单列也够打满低延迟阵列, io-wq 税
+  低于线程池)。筛机流程改成:iou_wrk 非零 → 先跑四引擎微基准, 用对照
+  数字下判决, 不直接释放。
 - **conda libstdc++ 冲突**(两台 AutoDL 都踩过):`make` 用系统 g++,
   产物要 `GLIBCXX_3.4.30`,conda Python 却优先加载 miniconda 自带的旧
   libstdc++ → import 时报 `GLIBCXX_3.4.30 not found`。修法任选:
