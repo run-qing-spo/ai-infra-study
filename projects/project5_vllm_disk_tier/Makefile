@@ -21,6 +21,7 @@ INCLUDES := -Icsrc \
 
 SRCS := csrc/pybind.cpp \
         csrc/kv_tier_engine.cpp \
+        csrc/pool_tier_engine.cpp \
         ../project3_async_IO/src/uring_backend.cpp
 
 .PHONY: all clean check
@@ -32,7 +33,7 @@ ifneq ($(UNAME_S),Linux)
 	$(error "io_uring 引擎只能在 Linux 上编;Mac 上跑 make test 用 FakeEngine")
 endif
 
-$(MODULE): $(SRCS) csrc/kv_tier_engine.hpp
+$(MODULE): $(SRCS) csrc/kv_tier_engine.hpp csrc/pool_tier_engine.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -shared $(SRCS) -o $@ -luring
 
 # 单测跑的是策略层(manager 账本逻辑), 用 FakeEngine, 任何平台可跑

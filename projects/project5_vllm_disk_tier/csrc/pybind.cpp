@@ -6,6 +6,10 @@
 //   - slot/block_id → 字节偏移的换算在这里做(× block_bytes), Python 层
 //     只讲"第几个 slot / 第几个 block", 不碰字节 —— 和 P4 的账本层一致。
 //   - submit_* 返回 False = 引擎入口环满, Python 层按 job 失败处理。
+//
+// PoolEngine(C++ 线程池对照组, BENCH_ANALYSIS §4)接口与 Engine 完全同构,
+// 包装逻辑用模板共享 —— bench 侧换个类名就能跑同一条代码路径, 保证对照里
+// 唯一变量是引擎内部的提交模型。
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -15,24 +19,28 @@
 #include <vector>
 
 #include "kv_tier_engine.hpp"
+#include "pool_tier_engine.hpp"
 
 namespace py = pybind11;
 
 namespace {
 
+template <class EngineT>
 class PyEngine {
 public:
+    // depth 的语义随引擎走:KvTierEngine 是 queue_depth(io_uring SQ/CQ 深度),
+    // PoolTierEngine 是 num_threads(线程池大小)。绑定处给不同的参数名。
     PyEngine(py::buffer primary_view, const std::string& path,
              uint64_t num_slots, uint64_t block_bytes,
-             size_t queue_depth, bool use_odirect)
+             size_t depth, bool use_odirect)
         : keepalive_(primary_view) {
         py::buffer_info info = primary_view.request(/*writable=*/true);
         size_t mem_bytes = static_cast<size_t>(info.size) * info.itemsize;
         block_bytes_ = block_bytes;
         num_slots_   = num_slots;
-        engine_ = std::make_unique<p5::KvTierEngine>(
+        engine_ = std::make_unique<EngineT>(
             path, num_slots * block_bytes, info.ptr, mem_bytes,
-            static_cast<uint32_t>(block_bytes), queue_depth, use_odirect);
+            static_cast<uint32_t>(block_bytes), depth, use_odirect);
         mem_bytes_ = mem_bytes;
     }
 
@@ -86,38 +94,48 @@ public:
 
 private:
     py::object keepalive_;   // 防 primary view 先死
-    std::unique_ptr<p5::KvTierEngine> engine_;
+    std::unique_ptr<EngineT> engine_;
     uint64_t block_bytes_ = 0;
     uint64_t num_slots_   = 0;
     size_t   mem_bytes_   = 0;
 };
 
-} // namespace
-
-PYBIND11_MODULE(_kvtier, m) {
-    m.doc() = "io_uring + O_DIRECT KV tier engine (project2 SPSC + project3 uring + project4 slab)";
-
-    py::class_<PyEngine>(m, "Engine")
+// 两个引擎绑定同一套方法, 只有类名和 depth 参数的名字/默认值不同
+template <class EngineT>
+void bind_engine(py::module_& m, const char* py_name,
+                 const char* depth_arg, size_t depth_default) {
+    using E = PyEngine<EngineT>;
+    py::class_<E>(m, py_name)
         .def(py::init<py::buffer, const std::string&, uint64_t, uint64_t, size_t, bool>(),
              py::arg("primary_view"), py::arg("path"),
              py::arg("num_slots"), py::arg("block_bytes"),
-             py::arg("queue_depth") = 512, py::arg("use_odirect") = true)
+             py::arg(depth_arg) = depth_default, py::arg("use_odirect") = true)
         .def("submit_store",
-             [](PyEngine& e, uint64_t job_id,
+             [](E& e, uint64_t job_id,
                 const std::vector<uint64_t>& slots,
                 const std::vector<uint64_t>& bids) {
                  return e.submit(job_id, /*is_write=*/true, slots, bids);
              },
              py::arg("job_id"), py::arg("disk_slots"), py::arg("mem_block_ids"))
         .def("submit_load",
-             [](PyEngine& e, uint64_t job_id,
+             [](E& e, uint64_t job_id,
                 const std::vector<uint64_t>& slots,
                 const std::vector<uint64_t>& bids) {
                  return e.submit(job_id, /*is_write=*/false, slots, bids);
              },
              py::arg("job_id"), py::arg("disk_slots"), py::arg("mem_block_ids"))
-        .def("poll_finished", &PyEngine::poll_finished, py::arg("max_n") = 1024)
+        .def("poll_finished", &E::poll_finished, py::arg("max_n") = 1024)
         // drain 会长时间阻塞, 必须放 GIL, 否则把整个 scheduler 进程卡死
-        .def("drain", &PyEngine::drain, py::call_guard<py::gil_scoped_release>())
-        .def("stats", &PyEngine::stats);
+        .def("drain", &E::drain, py::call_guard<py::gil_scoped_release>())
+        .def("stats", &E::stats);
+}
+
+} // namespace
+
+PYBIND11_MODULE(_kvtier, m) {
+    m.doc() = "io_uring + O_DIRECT KV tier engine (project2 SPSC + project3 uring + project4 slab)";
+
+    bind_engine<p5::KvTierEngine>(m, "Engine", "queue_depth", 512);
+    // C++ 线程池对照组:拆 "C++ 加成" 和 "io_uring 加成"(BENCH_ANALYSIS §4)
+    bind_engine<p5::PoolTierEngine>(m, "PoolEngine", "num_threads", 32);
 }

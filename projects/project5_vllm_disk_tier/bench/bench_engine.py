@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-# 微基准:同一份 block 搬运负载, 三种磁盘引擎对打(不涉及 vLLM, 纯 IO 层):
+# 微基准:同一份 block 搬运负载, 四种磁盘引擎对打(不涉及 vLLM, 纯 IO 层):
 #
 #   uring : 本项目引擎 —— SPSC → 单线程 io_uring 批量提交, O_DIRECT, 单大文件
+#   cpp-pool : C++ 对照组(BENCH_ANALYSIS §4) —— std::thread 线程池 + 同步
+#           pread/pwrite, 其余(单大文件/O_DIRECT/submit-poll 接口)与 uring
+#           引擎一字不差。uring vs cpp-pool 的差 = 提交模型本身, 不掺 GIL。
 #   pool  : 复刻 vLLM fs tier 的语义 —— 线程池, 每 block 一个文件,
 #           O_DIRECT, 写 tmp + os.replace(照抄 tiering/fs/io.py 的做法)
 #   pool-slab : 消融组 —— 同样线程池, 但去掉 file-per-block, 写同一个大文件。
 #           用来把 "文件元数据开销" 和 "提交模型开销" 两个变量拆开:
-#           pool vs pool-slab 的差 = 元数据;pool-slab vs uring 的差 = 提交模型。
+#           pool vs pool-slab 的差 = 元数据;pool-slab vs cpp-pool 的差 =
+#           GIL/Python;cpp-pool vs uring 的差 = 提交模型。
 #
 # 量什么(stdout 一行一个场景, 也可 --json):
 #   wall_s      总墙钟
@@ -80,8 +84,17 @@ def count_iou_workers() -> int:
 
 # ---------------------------------------------------------------- uring ----
 
-def run_uring(mv, args, direction: str) -> dict:
+def run_uring(mv, args, direction: str, cpp_pool: bool = False) -> dict:
     from kv_uring_tier import _kvtier
+
+    # cpp-pool 对照组走的就是这条函数:submit/poll/drain 的 bench 侧代码
+    # 零差异, 只换引擎类 —— 对照里唯一变量是引擎内部的提交模型
+    # (io_uring 批量 vs 线程池同步 syscall)。depth 参数语义随引擎走:
+    # uring 是 queue_depth, cpp-pool 是线程数(取 --pool-threads, 和
+    # Python pool 组同宽, 三方可比)。
+    eng_cls = _kvtier.PoolEngine if cpp_pool else _kvtier.Engine
+    depth = args.pool_threads if cpp_pool else args.queue_depth
+    fname = "bench_cpppool" if cpp_pool else "bench_uring"
 
     bs = args.block_bytes
     n_shard = args.shard_files
@@ -97,13 +110,13 @@ def run_uring(mv, args, direction: str) -> dict:
     engines, paths = [], []
     for k in range(n_shard):
         if args.shard_same_file or n_shard == 1:
-            path = os.path.join(args.dir, "bench_uring.bin")
+            path = os.path.join(args.dir, f"{fname}.bin")
         else:
-            path = os.path.join(args.dir, f"bench_uring.{k}.bin")
+            path = os.path.join(args.dir, f"{fname}.{k}.bin")
         paths.append(path)
         region = mv[k * chunk * bs : (k + 1) * chunk * bs]
-        engines.append(_kvtier.Engine(region, path, chunk, bs,
-                                      args.queue_depth, not args.no_odirect))
+        engines.append(eng_cls(region, path, chunk, bs,
+                               depth, not args.no_odirect))
 
     t0, c0 = time.perf_counter(), cpu_time()
     total_jobs = 0
@@ -212,33 +225,37 @@ def run_pool(mv, args, direction: str, slab: bool) -> dict:
 # ---------------------------------------------------------------- smoke ----
 
 def smoke(args):
-    """写 → 清内存 → 读回 → 校验, 验证引擎数据面正确性。"""
+    """写 → 清内存 → 读回 → 校验, 验证引擎数据面正确性(两个 C++ 引擎都过)。"""
     from kv_uring_tier import _kvtier
 
     n, bs = 64, args.block_bytes
-    mv = make_region(n, bs)
-    path = os.path.join(args.dir, "smoke.bin")
-    eng = _kvtier.Engine(mv, path, n, bs, 64, not args.no_odirect)
+    for name, eng_cls in (("uring", _kvtier.Engine),
+                          ("cpp-pool", _kvtier.PoolEngine)):
+        mv = make_region(n, bs)
+        path = os.path.join(args.dir, f"smoke_{name}.bin")
+        # 第 5 个参数对 Engine 是 queue_depth, 对 PoolEngine 是 num_threads,
+        # 冒烟不看性能, 都给 64 就行
+        eng = eng_cls(mv, path, n, bs, 64, not args.no_odirect)
 
-    assert eng.submit_store(1, list(range(n)), list(range(n)))
-    eng.drain()
-    (jid, ok), = eng.poll_finished()
-    assert jid == 1 and ok, "store failed"
+        assert eng.submit_store(1, list(range(n)), list(range(n)))
+        eng.drain()
+        (jid, ok), = eng.poll_finished()
+        assert jid == 1 and ok, f"{name}: store failed"
 
-    for i in range(n):  # 抹掉内存里的标记
-        mv[i * bs : i * bs + 8] = b"\xff" * 8
-    assert eng.submit_load(2, list(range(n)), list(range(n)))
-    eng.drain()
-    (jid, ok), = eng.poll_finished()
-    assert jid == 2 and ok, "load failed"
+        for i in range(n):  # 抹掉内存里的标记
+            mv[i * bs : i * bs + 8] = b"\xff" * 8
+        assert eng.submit_load(2, list(range(n)), list(range(n)))
+        eng.drain()
+        (jid, ok), = eng.poll_finished()
+        assert jid == 2 and ok, f"{name}: load failed"
 
-    for i in range(n):
-        got = int.from_bytes(mv[i * bs : i * bs + 8], "little")
-        assert got == i, f"block {i}: got {got}"
-    del eng
-    os.unlink(path)
-    print(f"SMOKE OK: {n} blocks x {bs} B round-trip verified "
-          f"(odirect={not args.no_odirect})")
+        for i in range(n):
+            got = int.from_bytes(mv[i * bs : i * bs + 8], "little")
+            assert got == i, f"{name}: block {i}: got {got}"
+        del eng
+        os.unlink(path)
+        print(f"SMOKE OK [{name}]: {n} blocks x {bs} B round-trip verified "
+              f"(odirect={not args.no_odirect})")
 
 
 def main():
@@ -256,7 +273,7 @@ def main():
                     help="分片对照组: N 个引擎共用同一个文件(同 inode 多 ring)")
     ap.add_argument("--pool-threads", type=int, default=32)
     ap.add_argument("--no-odirect", action="store_true")
-    ap.add_argument("--engines", default="uring,pool,pool-slab")
+    ap.add_argument("--engines", default="uring,cpp-pool,pool,pool-slab")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
@@ -274,6 +291,8 @@ def main():
         for name in args.engines.split(","):
             if name == "uring":
                 r = run_uring(mv, args, direction)
+            elif name == "cpp-pool":
+                r = run_uring(mv, args, direction, cpp_pool=True)
             elif name == "pool":
                 # load 之前得先有文件:pool 的 load 依赖同组 store 留下的文件,
                 # 所以按 store→load 顺序跑同一个引擎即可
