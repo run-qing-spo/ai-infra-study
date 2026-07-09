@@ -31,6 +31,14 @@ O_DIRECT)降低 revisit TTFT 和 CPU 占用, 且不产生负优化。
   io-wq**(md 的 REQ_NOWAIT 支持 5.17 才进主线),引擎退化成隐形线程池,
   CPU 优势不成立 —— 详见 BENCH_ANALYSIS.md §5。在这种宿主上跑 e2e 依然
   有效,但对 C2 的预期要按 §4.4 的修正版看。
+- **conda libstdc++ 冲突**(两台 AutoDL 都踩过):`make` 用系统 g++,
+  产物要 `GLIBCXX_3.4.30`,conda Python 却优先加载 miniconda 自带的旧
+  libstdc++ → import 时报 `GLIBCXX_3.4.30 not found`。修法任选:
+  ```bash
+  export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6   # 临时, 每 shell
+  ln -sf /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+        /root/miniconda3/lib/libstdc++.so.6                    # 一劳永逸
+  ```
 
 ## 1. 安装依赖
 
