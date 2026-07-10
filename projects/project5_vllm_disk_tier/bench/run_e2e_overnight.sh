@@ -27,6 +27,12 @@ BENCH_TIMEOUT=5400      # 单组负载上限
 GPU_CLEAR_MB=1024       # 显存低于此值视为已清空
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-0}"
 
+# HF 下载三件套(2026-07-10 组 A 踩坑: 模型没缓存, xet 后端直连 CAS 服务 401):
+# 端点走国内镜像; 关 xet 退回普通 HTTP(镜像不支持 xet); 缓存放数据盘保系统盘
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET=1
+export HF_HOME="${HF_HOME:-$DATA/hf}"
+
 CFG_B='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"CPUOffloadingSpec","cpu_bytes_to_use":4294967296}}'
 CFG_C1='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"fs","root_dir":"'$DATA'/kv_fs"}]}}'
 CFG_C2='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"uring","path":"'$DATA'/kv_tier.bin","disk_bytes_to_use":21474836480,"queue_depth":32}]}}'
@@ -202,6 +208,18 @@ command -v pidstat >/dev/null || log "警告: 没有 pidstat(sysstat), CPU 监�
 avail_gb=$(df -BG --output=avail "$DATA" 2>/dev/null | tail -1 | tr -dc 0-9)
 [ -n "$avail_gb" ] && (( avail_gb < 40 )) && log "警告: $DATA 只剩 ${avail_gb}G, C 组要 20G+ 备份文件, 可能不够"
 (( fail )) && { log "预检失败, 退出"; exit 1; }
+
+# 模型预下载: 已缓存则秒过; 没缓存就先下完再开组, 免得下载吃掉 serve 就绪超时
+log "预下载模型 $M (进度见 $RES/download.log)..."
+if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$M')" \
+        > "$RES/download.log" 2>&1; then
+    log "模型就绪"
+else
+    log "模型下载失败, 退出; download.log 尾部:"
+    tail -5 "$RES/download.log" | tee -a "$SUMMARY"
+    exit 1
+fi
+
 log "预检通过, 结果目录 $RES/, 开始四组"
 
 t0=$(date +%s)
