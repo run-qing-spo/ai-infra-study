@@ -30,31 +30,30 @@ from typing import TYPE_CHECKING, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from vllm.v1.kv_offload.base import (
-        LookupResult,
-        OffloadKey,
-        ReqContext,
-        RequestOffloadingContext,
-    )
-    from vllm.v1.kv_offload.tiering.base import (
-        JobMetadata,
-        JobResult,
-        SecondaryTierManager,
-    )
+    import vllm  # noqa: F401
 
     _HAS_VLLM = True
 except ImportError:
-    # 无 vLLM 环境(Mac 单测 / 独立 bench)用形状对齐的最小替身。
-    # 只复刻本文件用到的字段, 不是完整 mock —— 上真机永远走上面的分支。
-    import enum
-    from dataclasses import dataclass, field
-
     _HAS_VLLM = False
 
-    class LookupResult(enum.Enum):  # type: ignore[no-redef]
-        HIT = enum.auto()
-        MISS = enum.auto()
-        RETRY = enum.auto()
+if _HAS_VLLM:
+    # vLLM 在场时名字对不上必须当场炸在 import(= serve 启动阶段), 不许
+    # 静默滑进下面的替身分支 —— 2026-07-10 踩坑: vLLM 删掉 LookupResult
+    # (lookup 改返回 bool|None)后, 旧的整块 try/except 把 ImportError 吞
+    # 成替身, RequestOffloadingContext 变空壳, 直到第一个请求进来才炸
+    # AttributeError, 定位绕了一大圈。
+    from vllm.v1.kv_offload.tiering.base import (
+        JobMetadata,
+        JobResult,
+        OffloadKey,
+        ReqContext,
+        RequestOffloadingContext,
+        SecondaryTierManager,
+    )
+else:
+    # 无 vLLM 环境(Mac 单测 / 独立 bench)用形状对齐的最小替身。
+    # 只复刻本文件用到的字段, 不是完整 mock —— 上真机永远走上面的分支。
+    from dataclasses import dataclass, field
 
     OffloadKey = bytes  # type: ignore[misc,assignment]
 
@@ -64,7 +63,9 @@ except ImportError:
 
     @dataclass
     class RequestOffloadingContext:  # type: ignore[no-redef]
-        pass
+        # 真身的 policy 是 OffloadPolicy 枚举(默认 BLOCK_LEVEL);替身只
+        # 对齐"有这个字段", 值不参与单测断言
+        policy: Any = None
 
     @dataclass
     class JobMetadata:  # type: ignore[no-redef]
@@ -182,13 +183,14 @@ class UringSecondaryTierManager(SecondaryTierManager):
     # SecondaryTierManager 接口
     # ------------------------------------------------------------------ #
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+    # 返回值合同(tiering/base.py): True=在盘上, False=不在, None=在途稍后再问
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         if key in self._present:
-            return LookupResult.HIT
+            return True
         if key in self._storing:
             # 正在落盘:数据此刻还在 primary(框架 pin 着), 让框架稍后再问
-            return LookupResult.RETRY
-        return LookupResult.MISS
+            return None
+        return False
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         for k in keys:

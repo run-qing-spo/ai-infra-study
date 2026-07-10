@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
 from kv_uring_tier.manager import (  # noqa: E402
     JobMetadata,
-    LookupResult,
     UringSecondaryTierManager,
 )
 
@@ -94,14 +93,14 @@ def finish(mgr, ok=True):
 
 
 def test_store_then_hit(mgr):
-    assert mgr.lookup(b"k1", None) == LookupResult.MISS
+    assert mgr.lookup(b"k1", None) is False
     store(mgr, 1, [b"k1", b"k2"], [0, 1])
-    # 在途:RETRY, 完成事件还没上报
-    assert mgr.lookup(b"k1", None) == LookupResult.RETRY
+    # 在途:None(=稍后再问), 完成事件还没上报
+    assert mgr.lookup(b"k1", None) is None
     assert mgr.has_pending_work()
     results = finish(mgr)
     assert results == {1: True}
-    assert mgr.lookup(b"k1", None) == LookupResult.HIT
+    assert mgr.lookup(b"k1", None) is True
     assert not mgr.has_pending_work()
 
 
@@ -122,9 +121,9 @@ def test_lru_eviction_when_full(mgr):
     mgr.touch([b"k0"], None)  # k0 变最新, 最老的变成 k1
     store(mgr, 100, [b"new"], [0])
     finish(mgr)
-    assert mgr.lookup(b"k1", None) == LookupResult.MISS   # 被逐出
-    assert mgr.lookup(b"k0", None) == LookupResult.HIT    # touch 保住了
-    assert mgr.lookup(b"new", None) == LookupResult.HIT
+    assert mgr.lookup(b"k1", None) is False   # 被逐出
+    assert mgr.lookup(b"k0", None) is True    # touch 保住了
+    assert mgr.lookup(b"new", None) is True
 
 
 def test_load_pins_slot_against_eviction(mgr):
@@ -134,8 +133,8 @@ def test_load_pins_slot_against_eviction(mgr):
     load(mgr, 50, [b"k0"], [0])           # k0 有在途 load, pin 住
     store(mgr, 100, [b"new"], [1])        # 满 → 需要逐出, 但必须跳过 k0
     finish(mgr)
-    assert mgr.lookup(b"k0", None) == LookupResult.HIT
-    assert mgr.lookup(b"new", None) == LookupResult.HIT
+    assert mgr.lookup(b"k0", None) is True
+    assert mgr.lookup(b"new", None) is True
 
 
 def test_store_fails_when_nothing_evictable(mgr):
@@ -161,7 +160,7 @@ def test_failed_store_returns_slots(mgr):
     store(mgr, 1, [b"k1"], [0])
     results = finish(mgr, ok=False)
     assert results == {1: False}
-    assert mgr.lookup(b"k1", None) == LookupResult.MISS
+    assert mgr.lookup(b"k1", None) is False
     assert len(mgr._free) == NUM_SLOTS   # slot 全回来了
 
 
@@ -171,8 +170,8 @@ def test_failed_load_evicts_suspect_data(mgr):
     load(mgr, 2, [b"k1"], [0])
     results = finish(mgr, ok=False)
     assert results == {2: False}
-    # 读失败 → 盘上数据可疑, 逐出, 下次 MISS → recompute
-    assert mgr.lookup(b"k1", None) == LookupResult.MISS
+    # 读失败 → 盘上数据可疑, 逐出, 下次 MISS(False) → recompute
+    assert mgr.lookup(b"k1", None) is False
 
 
 def test_engine_ring_full_rolls_back(mgr):

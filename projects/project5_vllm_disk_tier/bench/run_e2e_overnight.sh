@@ -201,6 +201,10 @@ fail=0
 command -v nvidia-smi >/dev/null || { log "缺 nvidia-smi"; fail=1; }
 command -v vllm       >/dev/null || { log "缺 vllm"; fail=1; }
 python3 -c "import openai" 2>/dev/null || { log "缺 python openai 包"; fail=1; }
+# C2 的两个启动期死因都在这里提前暴露(2026-07-10 各踩一次):
+#   .so 没编(新机器忘了 make) / manager 的 vLLM 接口合同变了(import 即炸)
+python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
+    || { log "C2 依赖检查失败: 先 make 编 .so;还不行就看上面 import 报错(vLLM 接口合同可能变了)"; fail=1; }
 [ -f bench/long_context_ttft.py ]    || { log "找不到 bench/long_context_ttft.py (要在项目根跑)"; fail=1; }
 [ -d "$DATA" ]                       || { log "数据盘 $DATA 不存在"; fail=1; }
 pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉再来"; fail=1; }
