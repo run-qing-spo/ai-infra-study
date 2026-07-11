@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
-# 无人值守跑完 A / B / C1 / C2 四组端到端 TTFT 对比(docs/RUN_ON_GPU.md 阶段 2)。
+# 无人值守跑一个实验矩阵的端到端 TTFT 对比(COMPARE_PLAN 第 2 步)。
 # 设计目标:起脚本 → 断开 ssh → 第二天看 results_e2e_*/SUMMARY.txt。
 #
 # 用法(远端 GPU 机, 在项目根目录):
 #   tmux new -s e2e
-#   bash bench/run_e2e_overnight.sh          # Ctrl-B D 断开
-#   # 或者不用 tmux: nohup bash bench/run_e2e_overnight.sh > overnight.log 2>&1 &
+#   bash bench/run_e2e_overnight.sh e1        # Ctrl-B D 断开
+#   bash bench/run_e2e_overnight.sh legacy    # 旧 A/B/C1/C2 四组
+#   # 或者不用 tmux: nohup bash bench/run_e2e_overnight.sh e1 > overnight.log 2>&1 &
+#
+# 第一个参数选实验矩阵(默认 e1)。"冷"组的构造是自适应的:serve 就绪后
+# 起 ram_ballast 把 cgroup 配额里留给 page cache 的余量压到
+# CACHE_ROOM_GIB(默认 4G, 小于 16 会话约 7G 的工作集)以下, 不需要预估
+# serve 占多少内存(2026-07-12 摸底: 容器配额 120G, 宿主 free 显示 1TB
+# 不可信, 判据必须对着 cgroup 记账算)。
 #
 # 产物(全部落在 results_e2e_<时间戳>/ 下):
 #   SUMMARY.txt        每组的关键事件 + tier 日志行 + revisit/prime 比值, 先看这个
-#   group_{A,B,C1,C2}.json   bench 原始样本
+#   group_<组名>.json  bench 原始样本
 #   serve_*.log bench_*.log  serve / 负载的完整输出
-#   pidstat_* iostat_* iou_wrk_*  C1/C2 期间的 CPU 论点监控
+#   pidstat_* iostat_* iou_wrk_*  CPU 论点监控
+#   meminfo_*          Cached/Dirty/MemAvailable 采样(E1 的 Cached 曲线、E2 的 Dirty 水位)
+#   ballast_*.log      冷组压舱进程的输出
 #
 # AUTO_SHUTDOWN=1 bash bench/... 可在全部跑完后自动关机停计费(默认不关,
 # 任何一组失败也不关, 留现场诊断)。
@@ -26,6 +35,8 @@ READY_TIMEOUT=3600      # 等 serve 就绪的上限(首组可能含模型下载)
 BENCH_TIMEOUT=5400      # 单组负载上限
 GPU_CLEAR_MB=1024       # 显存低于此值视为已清空
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-0}"
+EXPERIMENT="${1:-e1}"                   # 实验矩阵: e1 / legacy
+CACHE_ROOM_GIB="${CACHE_ROOM_GIB:-4}"   # 冷组给 page cache 留的余量上限(GiB)
 
 # HF 下载三件套(2026-07-10 组 A 踩坑: 模型没缓存, xet 后端直连 CAS 服务 401):
 # 端点走国内镜像; 关 xet 退回普通 HTTP(镜像不支持 xet); 缓存放数据盘保系统盘
@@ -34,8 +45,39 @@ export HF_HUB_DISABLE_XET=1
 export HF_HOME="${HF_HOME:-$DATA/hf}"
 
 CFG_B='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"CPUOffloadingSpec","cpu_bytes_to_use":4294967296}}'
-CFG_C1='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"fs","root_dir":"'$DATA'/kv_fs"}]}}'
-CFG_C2='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"uring","path":"'$DATA'/kv_tier.bin","disk_bytes_to_use":21474836480,"queue_depth":32}]}}'
+CFG_FS='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"fs","root_dir":"'$DATA'/kv_fs"}]}}'
+CFG_URING='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"uring","path":"'$DATA'/kv_tier.bin","disk_bytes_to_use":21474836480,"queue_depth":32}]}}'
+
+# ── 实验矩阵: 每行一个实验 ──────────────────────────────────────────────
+# 字段: 组名|kv-transfer-config|期望tier日志|监控:0/1|额外env|冷组cache余量GiB|bench额外参数
+# ("-" = 无;余量 0 = 热组不压舱)。加实验 = 加一行, run_group 骨架和监控全复用。
+case "$EXPERIMENT" in
+e1)
+    # E1 工作集 vs page cache(COMPARE_PLAN E1): fs/uring × 热/冷 四次 serve。
+    # 负载沿用默认串行 prime→churn→revisit;判据三层: revisit TTFT 对比 +
+    # iostat 的 revisit 期间 r/s(fs 热组应约等于零)+ cgroup 的 cache 曲线
+    # (fs 组上涨 = KV 在 CPU tier 和 page cache 存两份, uring 组应是平的)。
+    SPECS=(
+        "E1_fs_hot|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|-"
+        "E1_fs_cold|$CFG_FS|fs|1|PYTHONHASHSEED=0|$CACHE_ROOM_GIB|-"
+        "E1_uring_hot|$CFG_URING|uring|1|-|0|-"
+        "E1_uring_cold|$CFG_URING|uring|1|-|$CACHE_ROOM_GIB|-"
+    )
+    ;;
+legacy)
+    # 旧 A/B/C1/C2 四组(docs/RUN_ON_GPU.md 阶段 2), 保留可复跑
+    SPECS=(
+        "A|-|-|0|-|0|-"
+        "B|$CFG_B|-|0|-|0|-"
+        "C1|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|-"
+        "C2|$CFG_URING|uring|1|-|0|-"
+    )
+    ;;
+*)
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / legacy)" >&2
+    exit 1
+    ;;
+esac
 
 cd "$(dirname "$0")/.."
 RES="results_e2e_$(date +%Y%m%d_%H%M)"
@@ -46,10 +88,12 @@ log() { echo "[$(date '+%F %T')] $*" | tee -a "$SUMMARY"; }
 
 SERVE_PID=""
 MON_PIDS=()
+BALLAST_PID=""
 
 cleanup() {
-    # 脚本被杀 / 出错退出时别留孤儿: 掐掉监控和 serve 进程组
+    # 脚本被杀 / 出错退出时别留孤儿: 掐掉监控、压舱和 serve 进程组
     ((${#MON_PIDS[@]})) && kill "${MON_PIDS[@]}" 2>/dev/null
+    [ -n "$BALLAST_PID" ] && kill "$BALLAST_PID" 2>/dev/null
     [ -n "$SERVE_PID" ] && kill -TERM -- -"$SERVE_PID" 2>/dev/null
 }
 trap cleanup EXIT
@@ -100,7 +144,7 @@ stop_serve() {
     return 1
 }
 
-# ── 监控(C1/C2): serve 全家的 CPU + 盘 + iou-wrk 线程数 ────────────────
+# ── 监控(tier 组): serve 全家的 CPU + 盘 + iou-wrk 线程数 + 内存 ───────
 start_monitors() {
     local group=$1 pids
     # 注意别用裸 "vllm" 匹配: 项目路径里就带 vllm 字样, 会把本脚本自己算进去
@@ -110,13 +154,29 @@ start_monitors() {
         MON_PIDS+=($!)
     fi
     if command -v iostat >/dev/null; then
-        iostat -x 5 > "$RES/iostat_$group.log" 2>&1 &
+        # -t 给每次采样打时间戳, E1/E2 要拿它和 bench 的 phase 时刻对齐
+        iostat -x -t 5 > "$RES/iostat_$group.log" 2>&1 &
         MON_PIDS+=($!)
     fi
     # iou-wrk 是内核线程, 全系统数一遍即可(独占机器, 没别的 uring 用户)
     ( while sleep 1; do
           echo "$(date +%T) $(ps -eLo comm= 2>/dev/null | grep -c '^iou-wrk')"
       done > "$RES/iou_wrk_$group.log" ) &
+    MON_PIDS+=($!)
+    # 内存采样, 5 秒一采: cache 是 E1 的第三层判据(fs 组一路涨 = 同一份
+    # KV 在 CPU tier 和 page cache 存两份), dirty 是 E2 的 writeback 归因,
+    # anon 验证冷组压舱全程没漏气。共享宿主上 /proc/meminfo 混着别的租户,
+    # 主数据看本容器 cgroup 的记账(page cache 谁读记谁账), meminfo 只留
+    # 一列宿主侧参考
+    ( CG=/sys/fs/cgroup/memory/memory.stat; PAT='^total_(cache|rss|shmem|dirty|writeback)$'
+      if [ ! -f "$CG" ]; then
+          CG=/sys/fs/cgroup/memory.stat; PAT='^(anon|file|shmem|file_dirty|file_writeback)$'
+      fi
+      while sleep 5; do
+          echo "$(date +%T) $(awk -v pat="$PAT" '$1 ~ pat \
+              {printf "%s=%dMB ", $1, $2/1048576}' "$CG") | host: $(awk \
+              '$1 ~ /^(MemAvailable|Cached|Dirty):$/ {printf "%s%dMB ", $1, $2/1024}' /proc/meminfo)"
+      done > "$RES/meminfo_$group.log" ) &
     MON_PIDS+=($!)
 }
 
@@ -125,10 +185,36 @@ stop_monitors() {
     MON_PIDS=()
 }
 
-# ── 一组的完整节奏: 起 serve → 等就绪 → 验 tier → 负载 → 收尾 ──────────
-# run_group <组名> <kv-transfer-config|-> <期望tier日志|-> <monitor:0/1> <env|->
+# ── 冷组压舱: 起 ballast 占住内存, 等到 READY 才算生效 ─────────────────
+# 自适应模式: 填到 cgroup 配额里留给 page cache 的余量 ≤ room_gib。
+# 要填 ~100G 且逼着内核一路回收 cache, 慢是预期的, 上限给到 10 分钟
+start_ballast() {
+    local room_gib=$1 group=$2 blog="$RES/ballast_$group.log"
+    python3 bench/ram_ballast.py --cache-room-gib "$room_gib" > "$blog" 2>&1 &
+    BALLAST_PID=$!
+    local i
+    for i in $(seq 1 600); do
+        if grep -q "BALLAST READY" "$blog" 2>/dev/null; then
+            log "  $(grep 'BALLAST READY' "$blog")"
+            return 0
+        fi
+        kill -0 "$BALLAST_PID" 2>/dev/null || break
+        sleep 1
+    done
+    log "  !! ballast 没就绪(死了或 600s 超时), 日志尾部:"
+    tail -3 "$blog" 2>/dev/null | tee -a "$SUMMARY"
+    return 1
+}
+
+stop_ballast() {
+    [ -n "$BALLAST_PID" ] && kill "$BALLAST_PID" 2>/dev/null
+    BALLAST_PID=""
+}
+
+# ── 一组的完整节奏: 起 serve → 等就绪 → 验 tier → 压舱 → 负载 → 收尾 ──
+# run_group <组名> <kv-transfer-config|-> <期望tier日志|-> <monitor:0/1> <env|-> <冷组cache余量GiB> <bench额外参数|->
 run_group() {
-    local group=$1 cfg=$2 expect=$3 mon=$4 env0=$5
+    local group=$1 cfg=$2 expect=$3 mon=$4 env0=$5 ballast=$6 bench_args=$7
     local slog="$RES/serve_$group.log"
 
     log "════ 组 $group 开始 (显存基线 $(gpu_used_mb) MiB) ════"
@@ -164,16 +250,32 @@ run_group() {
             while IFS= read -r l; do log "  serve 日志警报: $l"; done
     fi
 
+    # 压舱放在 serve 就绪之后、负载之前: 自适应填充是拿 cgroup 配额减去
+    # 已就位的匿名内存(serve 的 CPU tier pinned 等)算余量, serve 没起来
+    # 之前算不准;也避免和模型加载抢内存。压不住就跳过这组 ——
+    # "假冷"数据混进结论比缺一组更糟
+    if [ "$ballast" != 0 ]; then
+        if ! start_ballast "$ballast" "$group"; then
+            GROUP_STATUS[$group]="FAIL(ballast)"
+            stop_ballast
+            stop_serve || return 2
+            return 1
+        fi
+    fi
+
     [ "$mon" = 1 ] && start_monitors "$group"
     sleep 5
 
     log "  跑负载..."
+    local extra=()
+    [ "$bench_args" != "-" ] && read -ra extra <<< "$bench_args"
     timeout "$BENCH_TIMEOUT" python3 bench/long_context_ttft.py \
-        --model "$M" --json "$RES/group_$group.json" \
+        --model "$M" --json "$RES/group_$group.json" "${extra[@]}" \
         > "$RES/bench_$group.log" 2>&1
     local rc=$?
 
     [ "$mon" = 1 ] && stop_monitors
+    stop_ballast
 
     if [ $rc -eq 0 ]; then
         # 把三行 phase 汇总和比值直接抄进 SUMMARY, 明早一眼能看
@@ -184,6 +286,19 @@ run_group() {
         log "  组 $group 负载失败 rc=$rc, bench 日志尾部:"
         tail -5 "$RES/bench_$group.log" | tee -a "$SUMMARY"
         GROUP_STATUS[$group]="FAIL(bench rc=$rc)"
+    fi
+
+    # tier 落盘统计 + 清理(原"C1 跑完删 kv_fs"的一般化): fs tier 没有容量
+    # 上限配置, 35G 的盘必须盯着, 删之前先把占用记进 SUMMARY 当数据;
+    # 删文件顺带把它的 page cache 一起释放, 组间缓存状态互相隔离
+    if [ "$expect" = fs ] && [ -d "$DATA/kv_fs" ]; then
+        local nfiles mib
+        nfiles=$(find "$DATA/kv_fs" -type f | wc -l | tr -d ' ')
+        mib=$(du -sm "$DATA/kv_fs" | cut -f1)
+        log "  kv_fs 落盘: ${nfiles} 个文件, ${mib} MiB, 删掉腾磁盘"
+        rm -rf "$DATA/kv_fs"
+    elif [ "$expect" = uring ]; then
+        rm -f "$DATA/kv_tier.bin"   # 下一组 serve 会重新 fallocate + prewarm
     fi
 
     if ! stop_serve; then
@@ -201,17 +316,24 @@ fail=0
 command -v nvidia-smi >/dev/null || { log "缺 nvidia-smi"; fail=1; }
 command -v vllm       >/dev/null || { log "缺 vllm"; fail=1; }
 python3 -c "import openai" 2>/dev/null || { log "缺 python openai 包"; fail=1; }
-# C2 的两个启动期死因都在这里提前暴露(2026-07-10 各踩一次):
+# uring 组的两个启动期死因都在这里提前暴露(2026-07-10 各踩一次):
 #   .so 没编(新机器忘了 make) / manager 的 vLLM 接口合同变了(import 即炸)
 python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
-    || { log "C2 依赖检查失败: 先 make 编 .so;还不行就看上面 import 报错(vLLM 接口合同可能变了)"; fail=1; }
+    || { log "uring 依赖检查失败: 先 make 编 .so;还不行就看上面 import 报错(vLLM 接口合同可能变了)"; fail=1; }
 [ -f bench/long_context_ttft.py ]    || { log "找不到 bench/long_context_ttft.py (要在项目根跑)"; fail=1; }
+[ -f bench/ram_ballast.py ]          || { log "找不到 bench/ram_ballast.py"; fail=1; }
 [ -d "$DATA" ]                       || { log "数据盘 $DATA 不存在"; fail=1; }
 pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉再来"; fail=1; }
 command -v pidstat >/dev/null || log "警告: 没有 pidstat(sysstat), CPU 监控会缺失, 不阻塞"
 avail_gb=$(df -BG --output=avail "$DATA" 2>/dev/null | tail -1 | tr -dc 0-9)
-[ -n "$avail_gb" ] && (( avail_gb < 40 )) && log "警告: $DATA 只剩 ${avail_gb}G, C 组要 20G+ 备份文件, 可能不够"
+[ -n "$avail_gb" ] && (( avail_gb < 40 )) && log "警告: $DATA 只剩 ${avail_gb}G, uring 组要 20G 备份文件 + fs 目录无上限, 可能不够"
 (( fail )) && { log "预检失败, 退出"; exit 1; }
+# 内存基线看 cgroup 不看 free: 共享宿主上 free 显示的是宿主 1TB, 没意义
+if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    log "cgroup 内存基线: limit=$(( $(cat /sys/fs/cgroup/memory/memory.limit_in_bytes) >> 30 ))G current=$(( $(cat /sys/fs/cgroup/memory/memory.usage_in_bytes) >> 30 ))G"
+elif [ -f /sys/fs/cgroup/memory.max ]; then
+    log "cgroup 内存基线: limit=$(cat /sys/fs/cgroup/memory.max) current=$(( $(cat /sys/fs/cgroup/memory.current) >> 30 ))G"
+fi
 
 # 模型预下载: 已缓存则秒过; 没缓存就先下完再开组, 免得下载吃掉 serve 就绪超时
 log "预下载模型 $M (进度见 $RES/download.log)..."
@@ -224,30 +346,31 @@ else
     exit 1
 fi
 
-log "预检通过, 结果目录 $RES/, 开始四组"
+log "预检通过, 结果目录 $RES/, 实验矩阵 $EXPERIMENT 共 ${#SPECS[@]} 组"
 
 t0=$(date +%s)
 
-# 组名|kv-transfer-config|期望tier日志|要不要监控|额外env ("-" = 无)
-for spec in \
-    "A|-|-|0|-" \
-    "B|$CFG_B|-|0|-" \
-    "C1|$CFG_C1|fs|1|PYTHONHASHSEED=0" \
-    "C2|$CFG_C2|uring|1|-"
-do
-    IFS='|' read -r g cfg expect mon env0 <<< "$spec"
-    run_group "$g" "$cfg" "$expect" "$mon" "$env0"
+# 先把组名收齐, 收尾报告要把没跑到的组也列成"未跑"
+# (不能叫 GROUPS: 那是 bash 内建只读数组——当前用户的属组 gid, 赋值被静默忽略)
+GROUP_ORDER=()
+for spec in "${SPECS[@]}"; do
+    IFS='|' read -r g _ <<< "$spec"
+    GROUP_ORDER+=("$g")
+done
+
+for spec in "${SPECS[@]}"; do
+    IFS='|' read -r g cfg expect mon env0 ballast bargs <<< "$spec"
+    run_group "$g" "$cfg" "$expect" "$mon" "$env0" "$ballast" "$bargs"
     if [ $? -eq 2 ]; then
         log "!! GPU 状态没恢复, 中止剩余组"
         break
     fi
-    [ "$g" = C1 ] && rm -rf "$DATA/kv_fs"    # 给 C2 腾磁盘
 done
 
 # ── 收尾 ───────────────────────────────────────────────────────────────
 log "════ 全部结束, 总耗时 $(( ($(date +%s) - t0) / 60 )) 分钟 ════"
 all_ok=1
-for g in A B C1 C2; do
+for g in "${GROUP_ORDER[@]}"; do
     s="${GROUP_STATUS[$g]:-未跑}"
     log "  组 $g: $s"
     [ "$s" = "OK" ] || all_ok=0
@@ -255,7 +378,7 @@ done
 log "原始数据: $RES/group_*.json + pidstat/iostat/iou_wrk 日志, 明早把整个 $RES/ 拉回来"
 
 if [ "$AUTO_SHUTDOWN" = 1 ] && [ "$all_ok" = 1 ]; then
-    log "四组全 OK, AUTO_SHUTDOWN=1, 60 秒后关机停计费"
+    log "全部组 OK, AUTO_SHUTDOWN=1, 60 秒后关机停计费"
     sleep 60
     shutdown -h now
 fi

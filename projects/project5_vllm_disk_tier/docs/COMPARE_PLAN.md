@@ -14,6 +14,8 @@
 
 最后验证内存挤压手段。E1 需要把空闲内存压到小于工作集,但 AutoDL 是容器,`drop_caches` 和 cgroup 大概率没有权限,所以预案是 ballast 进程:写一个 `bench/ram_ballast.py`,mmap 并写满 N GiB 匿名内存抱住不放,跑起来后用 `free -g` 确认 available 真的降到了目标值。如果容器本身内存给得小(比如不到 32G),"冷"条件可能天然成立,反而是"热"条件要靠减少 sessions 缩小工作集来构造——这就是为什么 `free -g` 要放在第 0 步。
 
+**第 0 步的答案(2026-07-12 摸底)。** 内存:`free` 显示宿主 1TB,不可信;容器是 cgroup v1,配额 120GiB(`memory.limit_in_bytes`),page cache 记账在自己 cgroup 头上(谁读的文件算谁的),所以冷热判据全部对 cgroup 算。冷条件的构造由此改成自适应:ballast 在 serve 就绪后启动,按 `配额 − 匿名内存 − shmem ≤ CACHE_ROOM_GIB(默认 4G,小于约 7G 工作集)` 填充,不需要预估 serve 常驻——固定压舱量的原方案作废。盘:`/root/autodl-tmp` 是 xfs,删掉上一轮遗留的 20G backing 文件后约 35G 可用,与本计划的假设一致。punt 风险:落实了——内核 5.15.0-97,数据盘是 md0(双 NVMe RAID1),5.15 的 md 不支持 NOWAIT(5.17 才加),所以 uring tier 的所有 O_DIRECT IO 全程被 punt 到 io-wq,prewarm 消不掉它、也不需要消(extent 转换的元数据成本照样省)。解读框架相应调整:iou-wrk 非零是这台宿主的常态基线,不再是 extent punt 警报;本轮测出的 uring 是"退化成内核侧线程池"的下界,微基准复测已证这个下界照样赢 pool 引擎。prewarm 冒烟通过:256MiB 构造 0.07s,filefrag 确认 unwritten 标志全消,文件全零,首笔 store 成功。待办两项:读 fs backend 源码(本节开头三个问题)还没做;`kv_bytes_per_offloaded_block` 要等第一次 serve 起来从 /metrics 读。
+
 ## 第 1 步:bench 工具改造
 
 工具改造在 Mac 上就能写完,上 GPU 机只做验证。`bench/long_context_ttft.py` 加五个能力,全部走新参数、不动现有默认行为。第一,`--revisit-concurrency N`,revisit 阶段用线程池并发发请求,这是 E3 的核心开关(prime 和 churn 不需要并发)。第二,`--phases`,允许指定跑哪些 phase、允许 churn→revisit 循环多轮——E3 扫并发档时靠它在同一个 serve 里复用:prime 一次,之后每档并发前重新 churn 把前缀挤回盘,省掉每档 70 秒的 serve 重启。第三,每个样本记录绝对时间戳(现在 JSON 里只有 ttft 时长),E2 的时间序列图要和 iostat/pidstat 按时间对齐,全靠它。第四,`--mixed`,churn 流量持续不断、期间按固定间隔插入 revisit 请求,两类样本分开统计,这是 E4 的负载形状。第五,`--churn-rate R`,churn 阶段改为开环发压:每隔 1/R 秒发出一条、不等前一条返回,这是 E2 的速率控制(理由见 E2 节);不给该参数时保持现有闭环行为。
