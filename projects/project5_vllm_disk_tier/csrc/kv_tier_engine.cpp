@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <stdexcept>
@@ -26,10 +27,37 @@ constexpr size_t   kRingCap   = 1024;   // in_q_/out_q_ 容量(2 的幂)。一�
 constexpr unsigned kReapBatch = 256;    // 一次 reap 最多收的 CQE 数
 } // namespace
 
+// 语义与成本见 hpp 注释。4MiB 块:够摊薄 syscall, 又不占多少内存;
+// file_bytes = num_slots × block_bytes 且 block_bytes 是 4K 倍数,
+// 所以每次 pwrite 的 size/offset 天然满足 O_DIRECT 对齐, 尾块也不例外。
+void prewarm_file(int fd, uint64_t file_bytes) {
+    constexpr size_t kChunk = 4u << 20;
+    void* buf = nullptr;
+    if (::posix_memalign(&buf, kAlign, kChunk) != 0) {
+        throw std::bad_alloc();
+    }
+    std::memset(buf, 0, kChunk);
+    uint64_t off = 0;
+    while (off < file_bytes) {
+        size_t want = static_cast<size_t>(
+            std::min<uint64_t>(kChunk, file_bytes - off));
+        ssize_t n = ::pwrite(fd, buf, want, static_cast<off_t>(off));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            ::free(buf);
+            throw std::runtime_error(
+                std::string("prewarm pwrite failed: ") + std::strerror(e));
+        }
+        off += static_cast<uint64_t>(n);
+    }
+    ::free(buf);
+}
+
 KvTierEngine::KvTierEngine(const std::string& path, uint64_t file_bytes,
                            void* mem_base, size_t mem_bytes,
                            uint32_t block_bytes, size_t queue_depth,
-                           bool use_odirect)
+                           bool use_odirect, bool prewarm)
     : mem_base_(static_cast<std::byte*>(mem_base)),
       mem_bytes_(mem_bytes),
       block_bytes_(block_bytes),
@@ -64,6 +92,16 @@ KvTierEngine::KvTierEngine(const std::string& path, uint64_t file_bytes,
             int e = errno;
             ::close(fd_);
             throw std::runtime_error(std::string("preallocate failed: ") + std::strerror(e));
+        }
+    }
+    if (prewarm) {
+        // 放在 worker 启动前, 引擎就绪即 extent 全部 written,
+        // 首写 punt 的噪声不会混进 E2/E3 的时间序列(dd 预写的代码内化)。
+        try {
+            prewarm_file(fd_, file_bytes);
+        } catch (...) {
+            ::close(fd_);
+            throw;
         }
     }
 

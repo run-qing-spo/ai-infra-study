@@ -101,7 +101,12 @@ class UringSecondaryTierManager(SecondaryTierManager):
             "path": "/root/autodl-tmp/kv_tier.bin",
             "disk_bytes_to_use": 21474836480,
             "queue_depth": 32,         # 可选;默认 = 微基准 sweet spot(BENCH_ANALYSIS §2)
-            "use_odirect": true        # 可选;对齐不满足时自动降级并告警
+            "use_odirect": true,       # 可选;对齐不满足时自动降级并告警
+            "prewarm": true            # 可选;启动时预写整个 backing 文件, 把
+                                       # fallocate 的 unwritten extent 全部翻成
+                                       # written, 消除首写 NOWAIT 失败 → io-wq
+                                       # punt(BENCH_ANALYSIS §3 dd 预写的内化)。
+                                       # 代价是启动多花 文件大小/盘写带宽 的时间
         }
     """
 
@@ -114,6 +119,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
         disk_bytes_to_use: int,
         queue_depth: int = 32,
         use_odirect: bool = True,
+        prewarm: bool = True,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -129,6 +135,9 @@ class UringSecondaryTierManager(SecondaryTierManager):
                 f"({self._block_size} bytes)"
             )
         self._path = path
+        # 走实例属性而不是加参数:_create_engine 的签名被单测的 FakeEngine
+        # 覆写钉住了, 别为一个开关破坏那个接缝
+        self._prewarm = prewarm
 
         self._engine = self._create_engine(
             primary_kv_view, path, queue_depth, use_odirect
@@ -148,11 +157,13 @@ class UringSecondaryTierManager(SecondaryTierManager):
         self._local_results: list[JobResult] = []
 
         logger.info(
-            "UringSecondaryTierManager: %d slots x %d bytes at %s (odirect=%s)",
+            "UringSecondaryTierManager: %d slots x %d bytes at %s "
+            "(odirect=%s, prewarm=%s)",
             self._num_slots,
             self._block_size,
             path,
             use_odirect,
+            prewarm,
         )
 
     # 拆出来是为了单测能换 FakeEngine(见 test/test_manager.py)
@@ -163,7 +174,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
         try:
             return _kvtier.Engine(
                 view, path, self._num_slots, self._block_size,
-                queue_depth, use_odirect,
+                queue_depth, use_odirect, self._prewarm,
             )
         except ValueError:
             if not use_odirect:
@@ -176,7 +187,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
             )
             return _kvtier.Engine(
                 view, path, self._num_slots, self._block_size,
-                queue_depth, False,
+                queue_depth, False, self._prewarm,
             )
 
     # ------------------------------------------------------------------ #

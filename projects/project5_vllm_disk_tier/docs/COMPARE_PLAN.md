@@ -16,7 +16,9 @@
 
 ## 第 1 步:bench 工具改造
 
-工具改造在 Mac 上就能写完,上 GPU 机只做验证。`bench/long_context_ttft.py` 加四个能力,全部走新参数、不动现有默认行为。第一,`--revisit-concurrency N`,revisit 阶段用线程池并发发请求,这是 E3 的核心开关(prime 和 churn 不需要并发)。第二,`--phases`,允许指定跑哪些 phase、允许 churn→revisit 循环多轮——E3 扫并发档时靠它在同一个 serve 里复用:prime 一次,之后每档并发前重新 churn 把前缀挤回盘,省掉每档 70 秒的 serve 重启。第三,每个样本记录绝对时间戳(现在 JSON 里只有 ttft 时长),E2 的时间序列图要和 iostat/pidstat 按时间对齐,全靠它。第四,`--mixed`,churn 流量持续不断、期间按固定间隔插入 revisit 请求,两类样本分开统计,这是 E4 的负载形状。第五,`--churn-rate R`,churn 阶段改为开环发压:每隔 1/R 秒发出一条、不等前一条返回,这是 E2 的速率控制(理由见 E2 节);不给该参数时保持现有闭环行为。
+工具改造在 Mac 上就能写完,上 GPU 机只做验证。`bench/long_context_ttft.py` 加五个能力,全部走新参数、不动现有默认行为。第一,`--revisit-concurrency N`,revisit 阶段用线程池并发发请求,这是 E3 的核心开关(prime 和 churn 不需要并发)。第二,`--phases`,允许指定跑哪些 phase、允许 churn→revisit 循环多轮——E3 扫并发档时靠它在同一个 serve 里复用:prime 一次,之后每档并发前重新 churn 把前缀挤回盘,省掉每档 70 秒的 serve 重启。第三,每个样本记录绝对时间戳(现在 JSON 里只有 ttft 时长),E2 的时间序列图要和 iostat/pidstat 按时间对齐,全靠它。第四,`--mixed`,churn 流量持续不断、期间按固定间隔插入 revisit 请求,两类样本分开统计,这是 E4 的负载形状。第五,`--churn-rate R`,churn 阶段改为开环发压:每隔 1/R 秒发出一条、不等前一条返回,这是 E2 的速率控制(理由见 E2 节);不给该参数时保持现有闭环行为。
+
+引擎侧另有一项(已做):uring 引擎和 pool 对照引擎的构造加 `prewarm` 开关,启动时把 backing 文件真写一遍零,把 fallocate 的 unwritten extent 全部翻成 written——这是 BENCH_ANALYSIS §3 那次 dd 预写诊断实验的代码内化。不做的话,serve 起来后 prime/churn 对 slab 的首写全部撞 extent 转换被 punt,E2 的时间序列前段会混进一层与 writeback 无关的噪声,E3 的 iou-wrk 哨兵也会误报。manager 侧默认开(约 9 秒启动开销),pybind/引擎默认关,微基准的既有预写协议不变。上 GPU 机后需要重新编译 .so 才生效。
 
 `bench/run_e2e_overnight.sh` 相应改三处:把写死的 A/B/C1/C2 四组参数化成实验矩阵(tier 类型 × ballast 大小 × bench 参数),每个实验一行 spec,复用现有的 run_group 骨架和监控;监控加一路 `/proc/meminfo` 采样(Cached、Dirty、Available,5 秒一次),E1 看 page cache 增长、E2 看 Dirty 水位都靠它;C1 跑完删 `kv_fs` 之前,先统计它占的磁盘字节数和文件数——fs tier 没有容量上限配置,35G 的盘必须盯着。
 

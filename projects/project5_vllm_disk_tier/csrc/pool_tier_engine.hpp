@@ -39,9 +39,11 @@ class PoolTierEngine {
 public:
     // 参数语义与 KvTierEngine 一致, 只把 queue_depth 换成 num_threads:
     // 线程池的"并发深度"就是线程数(每线程同一时刻一个同步 IO 在飞)。
+    // prewarm 同 KvTierEngine —— 对照组必须吃同样的 extent 状态。
     PoolTierEngine(const std::string& path, uint64_t file_bytes,
                    void* mem_base, size_t mem_bytes,
-                   uint32_t block_bytes, size_t num_threads, bool use_odirect);
+                   uint32_t block_bytes, size_t num_threads, bool use_odirect,
+                   bool prewarm = false);
     ~PoolTierEngine();
 
     PoolTierEngine(const PoolTierEngine&) = delete;

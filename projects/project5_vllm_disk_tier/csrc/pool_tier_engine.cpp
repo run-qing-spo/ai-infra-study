@@ -20,7 +20,7 @@ constexpr size_t kAlign = 4096;   // O_DIRECT 对齐要求(同 KvTierEngine)
 PoolTierEngine::PoolTierEngine(const std::string& path, uint64_t file_bytes,
                                void* mem_base, size_t mem_bytes,
                                uint32_t block_bytes, size_t num_threads,
-                               bool use_odirect)
+                               bool use_odirect, bool prewarm)
     : mem_base_(static_cast<std::byte*>(mem_base)),
       mem_bytes_(mem_bytes),
       block_bytes_(block_bytes) {
@@ -47,11 +47,21 @@ PoolTierEngine::PoolTierEngine(const std::string& path, uint64_t file_bytes,
     // 预分配策略与 KvTierEngine 一字不差:fallocate 优先, 不支持则退化
     // ftruncate。unwritten extent 首写转换的成本两个引擎同样要付
     // (BENCH_ANALYSIS §10.1), 预写与否由 bench 协议统一控制。
+    // (后加的 prewarm 开关不改变这一点:bench 默认关, 协议行为不变;
+    //  e2e 由 manager 打开, 两个引擎吃到同样的 extent 状态, 对照仍公平。)
     if (::posix_fallocate(fd_, 0, static_cast<off_t>(file_bytes)) != 0) {
         if (::ftruncate(fd_, static_cast<off_t>(file_bytes)) != 0) {
             int e = errno;
             ::close(fd_);
             throw std::runtime_error(std::string("preallocate failed: ") + std::strerror(e));
+        }
+    }
+    if (prewarm) {
+        try {
+            prewarm_file(fd_, file_bytes);   // 实现与注释见 kv_tier_engine
+        } catch (...) {
+            ::close(fd_);
+            throw;
         }
     }
 

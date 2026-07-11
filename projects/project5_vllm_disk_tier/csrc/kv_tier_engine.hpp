@@ -64,6 +64,16 @@ struct JobResult {
     bool     success;               // 任一 block 短读/短写/errno 即 false
 };
 
+// fallocate 预留出来的 extent 是 unwritten 状态, 首写要做状态转换(元数据
+// 变更), 文件系统层 NOWAIT 会失败 → IO 被 punt 给 io-wq(BENCH_ANALYSIS
+// §3 的 dd 预写实验:预写后 store iou_wrk 6→0)。本函数把整个文件真写一遍
+// 零, 把 extent 全部翻成 written —— 当年 dd 预写的代码内等价物。注意
+// posix_fallocate / FALLOC_FL_ZERO_RANGE 造出来的都还是 unwritten, 绕不
+// 过去, 必须真写。成本 = 文件大小 / 盘顺序写带宽(20G 按 dd 标定的
+// 2.2GB/s 约 9s), 一次性启动开销, 顺带兼当"盘真的能写"的启动自检。
+// 同步 pwrite、不走 ring:不污染 EngineStats 的 bench 记账。
+void prewarm_file(int fd, uint64_t file_bytes);
+
 // 全部单调递增, 调度线程读个近似值做观测就够了
 struct EngineStats {
     uint64_t jobs_submitted = 0;
@@ -84,9 +94,13 @@ public:
     // queue_depth: io_uring SQ/CQ 深度, 也是 in-flight block IO 上限
     // use_odirect: 要求对齐契约成立, 否则构造抛 std::invalid_argument,
     //              调用方可以降级 use_odirect=false 重试(走 page cache)
+    // prewarm    : 构造时把整个文件预写一遍零(见 prewarm_file 注释)。
+    //              默认 false 保持微基准的既有协议(预写与否由 bench 控制);
+    //              e2e 场景由 Python manager 默认打开。
     KvTierEngine(const std::string& path, uint64_t file_bytes,
                  void* mem_base, size_t mem_bytes,
-                 uint32_t block_bytes, size_t queue_depth, bool use_odirect);
+                 uint32_t block_bytes, size_t queue_depth, bool use_odirect,
+                 bool prewarm = false);
     ~KvTierEngine();
 
     KvTierEngine(const KvTierEngine&) = delete;

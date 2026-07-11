@@ -32,15 +32,21 @@ public:
     // PoolTierEngine 是 num_threads(线程池大小)。绑定处给不同的参数名。
     PyEngine(py::buffer primary_view, const std::string& path,
              uint64_t num_slots, uint64_t block_bytes,
-             size_t depth, bool use_odirect)
+             size_t depth, bool use_odirect, bool prewarm)
         : keepalive_(primary_view) {
         py::buffer_info info = primary_view.request(/*writable=*/true);
         size_t mem_bytes = static_cast<size_t>(info.size) * info.itemsize;
         block_bytes_ = block_bytes;
         num_slots_   = num_slots;
-        engine_ = std::make_unique<EngineT>(
-            path, num_slots * block_bytes, info.ptr, mem_bytes,
-            static_cast<uint32_t>(block_bytes), depth, use_odirect);
+        {
+            // prewarm=true 时构造要真写整个文件(20G 约 9s), 期间放掉 GIL,
+            // 别让其他 Python 线程陪着等一次磁盘预写。
+            py::gil_scoped_release nogil;
+            engine_ = std::make_unique<EngineT>(
+                path, num_slots * block_bytes, info.ptr, mem_bytes,
+                static_cast<uint32_t>(block_bytes), depth, use_odirect,
+                prewarm);
+        }
         mem_bytes_ = mem_bytes;
     }
 
@@ -106,10 +112,13 @@ void bind_engine(py::module_& m, const char* py_name,
                  const char* depth_arg, size_t depth_default) {
     using E = PyEngine<EngineT>;
     py::class_<E>(m, py_name)
-        .def(py::init<py::buffer, const std::string&, uint64_t, uint64_t, size_t, bool>(),
+        .def(py::init<py::buffer, const std::string&, uint64_t, uint64_t, size_t, bool, bool>(),
              py::arg("primary_view"), py::arg("path"),
              py::arg("num_slots"), py::arg("block_bytes"),
-             py::arg(depth_arg) = depth_default, py::arg("use_odirect") = true)
+             py::arg(depth_arg) = depth_default, py::arg("use_odirect") = true,
+             // 默认 false:微基准的预写协议不变(dd 或不预写都由 bench 定);
+             // e2e 的 manager 侧默认 true(首写 punt 别混进实验数据)
+             py::arg("prewarm") = false)
         .def("submit_store",
              [](E& e, uint64_t job_id,
                 const std::vector<uint64_t>& slots,
