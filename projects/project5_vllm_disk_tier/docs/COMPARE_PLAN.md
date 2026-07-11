@@ -66,7 +66,7 @@ fs 每个 block 要过一次内核缓冲区拷贝,烧的是和 EngineCore 同一
 
 ## 第 3 步:产出
 
-每个轴一张图:E1 交叉条形、E2 时间序列、E3 并发曲线、E4 劣化对比、E5 CPU/ITL 对照,汇成 BENCH_ANALYSIS.md 的新章节或独立的 COMPARE_RESULTS.md。最终给一张结论矩阵:行是轴,列是 fs 赢、打平、uring 赢的条件区间。fs 赢的区间(热 page cache 加低并发)要诚实写进去——一份有对手赢面的报告比全赢的报告可信,而且"那份内存不如显式给 CPU tier"的反驳本身就是报告的一部分。
+每个轴一张图:E1 交叉条形、E2 时间序列、E3 并发曲线、E4 劣化对比、E5 CPU/ITL 对照,汇成 BENCH_ANALYSIS.md 的新章节或独立的 COMPARE_RESULTS.md。主指标为什么是 TTFT 而不是 TBT/吞吐/goodput、判据的三层结构(主指标/归因/哨兵),完整推导见 METRICS.md。最终给一张结论矩阵:行是轴,列是 fs 赢、打平、uring 赢的条件区间。fs 赢的区间(热 page cache 加低并发)要诚实写进去——一份有对手赢面的报告比全赢的报告可信,而且"那份内存不如显式给 CPU tier"的反驳本身就是报告的一部分。
 
 ## 风险与执行顺序
 
