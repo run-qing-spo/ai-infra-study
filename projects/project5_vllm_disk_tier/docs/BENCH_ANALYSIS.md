@@ -448,6 +448,10 @@ store 2.3×,逼近盘上限)。但 vLLM 场景 store 是 fire-and-forget 不在�
 5. **进入 §4 端到端**。vLLM 场景下 CPU 是 attention/decode 的稀缺资源,
    syscall 那条轴的胜利要在 revisit TTFT 上直接显形 —— 但 CPU 轴的故事
    要按 §5 的结论重讲。
+
+   **【§13 后记,已完成】**2026-07-10/11 在 §12 同宿主上四组全绿:
+   revisit TTFT 650ms → 123ms(5.3×),uring 对官方 fs tier mean -11% /
+   p99 -8%,且 CPU 记账位置的差异在 pidstat 里直接显形。见 §13。
 6. `bench_engine.py` 的主线程 `poll_finished` 忙轮询要修(空返回时
    `time.sleep(0)`),否则 CPU 数字被主线程污染,cpu_util 不能干净反映
    worker 侧成本。
@@ -764,3 +768,89 @@ hash 串到单 worker 没有直接证据 —— 3617 高于 dd 单线程的 2.4 
 数倍 CPU;RAID1+低延迟企业盘上串行单列照样打满阵列,5 个 kernel worker
 比 32 个用户线程还省 CPU。部署判据从'看 punt 与否'改成'看 punt 之后
 的对照数字'——警报和判决是两回事。"
+
+---
+
+## 13. 端到端闭环:三层缓存的 TTFT 直接显形
+
+2026-07-10/11,§12 同宿主(4090 / 5.15.0-97 / XFS on md0 = RAID1 × 两块
+7TB 企业级 NVMe),vLLM 0.24.0 + Qwen2.5-7B-Instruct bf16,
+`--max-model-len 16384`。负载 = `bench/long_context_ttft.py`:16 会话
+× 6000 词前缀 prime → 24 个一次性请求 churn(把前缀从 GPU/CPU 逐级挤
+出去)→ 16 会话 revisit。CPU tier 故意只给 4 GiB:这个模型每 token 的
+KV ≈ 56 KB(28 层 × K/V × 4 kv-head × 128 dim × bf16),一个 8k 前缀
+≈ 440 MB,16 个会话 ≈ 7 GB,必然溢出到盘 —— 踩不到盘的配置量出来全是
+安慰剂(§4.1 的设计初衷)。四组由 `bench/run_e2e_overnight.sh` 一次跑
+完,全程 9 分钟;原始数据 `results_e2e_20260711_0058/`。
+
+| 组 | 配置 | revisit mean | p50 | p99 | revisit/prime |
+|----|------|-------------|-----|-----|---------------|
+| A  | 无 offload | 648.6ms | 648.4 | 654.9 | 0.98 |
+| B  | CPU 4 GiB | 649.7ms | 650.1 | 654.9 | 0.96 |
+| C1 | CPU + 官方 fs tier | 139.3ms | 139.5 | 151.1 | 0.20 |
+| C2 | CPU + **uring tier** | **123.3ms** | **121.4** | **139.4** | **0.18** |
+
+前夜的独立复跑(0710,C2 因接口坑手动补跑):C1 147.0ms/0.21、
+C2 128.0ms/0.19 —— 两次运行方向与幅度一致,不是噪音。
+
+三个读数:
+
+1. **B≈A 不是失败,是容量论证**:4 GiB 装不下 7 GB 的 prime 工作集,
+   churn 再灌 11 GB 把残存的也冲光 —— "多一层内存"在容量不够时等于
+   零,这正是磁盘层的入场理由,也是 RUN_ON_GPU §4.1"容量故意压小"
+   要买的东西。
+2. **磁盘层的价值**:C1 把 revisit 从全量 prefill 的 650ms 打到
+   139ms(4.7×)——盘上读 440 MB 回 CPU 再上 GPU,比重算 8k token 的
+   prefill 便宜得多。
+3. **uring 对 fs 的赢面**:mean -11%,p99 -8%(151→139ms),且 C2 的
+   revisit 分布明显更窄(p50 121 / p99 139 vs 140/151)。
+
+### CPU 账:fs 把 IO 记在引擎进程头上,uring 把它挪出去
+
+负载全程 pidstat(5s 粒度)+ iou-wrk 每秒计数:
+
+|            | EngineCore %CPU | 其中 %system | io-wq 线程 |
+|------------|-----------------|--------------|-----------|
+| C1 (fs)    | 110–121%        | 12–20%       | 全程 0    |
+| C2 (uring) | 97–101%         | 2–3.5%       | 稳定 8    |
+
+C1 的 fs tier 在引擎进程内用线程做同步文件 IO,系统调用和数据拷贝全部
+记在 EngineCore 账上 —— 比无盘基线(~100%,busy loop)多付约 15 个点,
+且几乎全是内核态。C2 的 EngineCore 和无盘基线几乎无差:提交线程只花
+2–3 个点,搬运挪给了 8 个 io-wq kernel worker。诚实账:io-wq 是内核线
+程,pidstat 不记它们,单看这张表不能下"总 CPU 更低"的结论 —— 但 §12
+同盘微基准里 punt 路径的总 CPU(cpu_util 含 worker)全场最低,两笔证据
+互补。延迟敏感的 scheduler 线程不被 IO 内核态打扰,大概率也是 C2 p99
+更紧的原因。
+
+盘的余量:iostat 里 revisit 阶段读峰 ~270 MB/s、`%util` ≤ 10% ——
+这场赢在路径效率,不在带宽;工作集和并发还有一个数量级的加压空间,
+CPU 记账的差距会随之放大(fs 的 15 个点是按 IO 量走的,uring 的 2–3
+个点近乎常数)。
+
+### 同盘微基准复测 + prewrite 探针:§12 结论稳定,归因再收一层
+
+四引擎复测(blocks=2048 × 1 MiB,QD=32,`micro.json`)和 §12
+(blocks=1024)形状完全一致:uring store 3819 MB/s / cpu 0.41 /
+syscalls 127,cpp-pool 3799 / 0.66 / 2048,pool 3676 / 1.34 / 4096,
+pool-slab 3777 / 0.91 / 2048;load 侧 uring 7401 / 0.60 对 cpp-pool
+7341 / 1.03。吞吐全挤在阵列上限,uring 的赢面全在 CPU 和 syscall 轴。
+job-blocks sweep(1→128)吞吐与 syscalls 全平 —— gather window 已把
+提交批量托管,job 粒度不再影响提交模型(§8.3 联动修改的预期行为)。
+
+prewrite 探针(同文件连写两遍,pass1 全首写 unwritten extent,pass2
+全覆盖写 written):wall 0.283s vs 0.278s,iou_wrk 峰值 7 vs 5 ——
+punt 不随 extent 状态变化。归因分层:**块设备层(md < 5.17 无
+REQ_NOWAIT)先于文件系统层把 NOWAIT 拦死**,fs 层的 unwritten 假设在
+md 宿主上根本不可检验(与 §3 当年 dd 预写实验同结论,这次是引擎原生
+路径的复证)。"初始化预写消 punt"仍是裸盘 + ext4 宿主上值得做的实验,
+归入 §8 的裸盘复测项。
+
+### 面试版一句话
+
+"端到端里我的 uring tier 对官方 fs tier 的赢面是两笔:TTFT p99 -8%
+是表,CPU 记账位置是里 —— fs tier 把同步 IO 的 ~15 个点 CPU 记在 vLLM
+调度进程头上且全是内核态,我的引擎把搬运挪给 8 个 io-wq worker,推理
+进程和无盘基线一样干净。盘只用了 10%,这份差距会随负载放大。三层缓存
+的容量论证也齐了:CPU 层装不下工作集时 revisit 等于全量重算(B≈A),
+磁盘层一进场就是 5×(650→123ms)。"

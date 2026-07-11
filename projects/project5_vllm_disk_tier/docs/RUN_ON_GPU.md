@@ -43,6 +43,31 @@ O_DIRECT)降低 revisit TTFT 和 CPU 占用, 且不产生负优化。
   ln -sf /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
         /root/miniconda3/lib/libstdc++.so.6                    # 一劳永逸
   ```
+- **HF 模型下载三件套**(2026-07-10 组 A 两次死在这才定位):国内直连
+  官方 hub 时 xet 后端(HF 新的分块存储)去 `cas-server.xethub.hf.co`
+  拿数据会 401;学术加速代理又会让镜像的 TLS 握手超时。稳定组合:
+  ```bash
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+  export HF_ENDPOINT=https://hf-mirror.com   # 国内镜像, 直连
+  export HF_HUB_DISABLE_XET=1                # 镜像不含 xet 凭证, 退回普通 HTTP
+  export HF_HOME=/root/autodl-tmp/hf         # 缓存放数据盘, 保 30G 系统盘
+  ```
+  三个 export 已进 `run_e2e_overnight.sh`;代理是 shell 环境的事,起
+  脚本前自查 `env | grep -i proxy`。断点续传按**文件**粒度(下完的
+  blob 直接跳过,半截的走 Range 续传),中断重跑不亏 —— 进度条的
+  "Fetching 0/14"和字节数是本次会话的计数,不代表缓存状态。
+- **新机器三查再跑长任务**(缺一个就浪费一晚):`make` 编 .so、
+  `python3 -c "import kv_uring_tier.manager"` 验接口、`tmux` 装了没。
+  前两条 `run_e2e_overnight.sh` 预检已代查。
+- **vLLM 内部接口没有稳定性承诺**(2026-07-10 实战踩雷):0.24 删了
+  `LookupResult` 枚举(`lookup()` 改返回 `bool | None`),而 manager
+  旧代码把"vLLM 在不在"和"名字对不对"混在同一个 `try/except
+  ImportError` 里 —— 枚举一缺,整块 import 静默滑进 Mac 单测用的替身
+  分支,`RequestOffloadingContext` 变成没有 `policy` 字段的空壳,serve
+  启动一切正常,**第一个请求进 scheduler 才炸** AttributeError。教训:
+  环境探测和接口校验必须分开,宿主上 import 失败要炸在启动阶段(修复
+  ae0763f8,manager.py 已改两段式)。每次升 vLLM 后先跑
+  `python3 -c "import kv_uring_tier.manager"` 对合同。
 
 ## 1. 安装依赖
 
@@ -205,6 +230,13 @@ e2e 的天真预期是 C2 ≥ C1 的 TTFT、CPU 也不占优。但 e2e 的变量
 调度线程抢 GIL(微基准里没有这个竞争);store 是 fire-and-forget 不进
 关键路径。所以 C2 vs C1 谁赢是**开放问题**,这正是跑 e2e 的价值 ——
 无论哪边赢,配合 iou_wrk 采样都能讲清楚为什么。
+
+**【2026-07-11 实测,开放问题关闭】**:两次独立运行 C2 均优于 C1
+(revisit mean -11%、p99 -8%),且 pidstat 显形了 CPU 记账位置的差异
+(fs 把 ~15 个点内核态 IO 记在 EngineCore,uring 挪给 io-wq)。四组
+数字、CPU 账和同盘微基准复测全在 BENCH_ANALYSIS.md **§13**;原始数据
+`results_e2e_20260711_0058/`。上面第 3 条预期里"差距要并发才显形"
+估计保守了 —— 串行 revisit 就已可测,并发加压是 §8 的后续。
 
 ## 5. 结果落盘
 
