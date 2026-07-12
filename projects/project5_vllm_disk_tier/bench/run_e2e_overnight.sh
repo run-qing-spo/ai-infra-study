@@ -92,6 +92,29 @@ e4)
         "E4_uring|$CFG_URING|uring|1|-|0|--phases prime,churn,mixed@8"
     )
     ;;
+gil)
+    # churn +10ms 悬案的证伪探针(COMPARE_PLAN E3 冻结段): 假说是 fs 的 store
+    # 任务在 EngineCore 进程里以 Python 线程跑 open/write/replace, 每块 IO
+    # 前后的字节码持 GIL, 和引擎调度热循环抢锁(project4 微基准的"GIL 税≈0"
+    # 是独立进程, 不覆盖这种同进程共锁)。把 store 线程 16→2, 抢锁者少 8 倍:
+    # churn TTFT 若 -10ms 同向收窄 → GIL/派发线程数坐实; 不动 → 悬案继续。
+    # 效应量(~10ms)低于跨 serve 噪声底(15-20ms), 单组对比不算数 ——
+    # w16/w2 交替各两个 serve, 判据用批间同向性(26 批全同向的老办法),
+    # 不看均值差。w2 的写带宽不构成混淆: 2 线程 O_DIRECT 顺序写 ≫ churn
+    # 期实测 ~85MB/s 的 store 流量。phases 沿用 E3 全谱, 顺带观测 store
+    # 排空变慢对 revisit 有无反作用
+    GIL_PHASES="prime"
+    for c in 1 4 8 16; do
+        for _ in 1 2 3; do GIL_PHASES+=",churn,revisit@$c"; done
+    done
+    CFG_FS_W2="${CFG_FS/\"root_dir\"/\"n_write_threads\":2,\"root_dir\"}"
+    SPECS=(
+        "GIL_w16_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
+        "GIL_w2_a|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
+        "GIL_w16_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
+        "GIL_w2_b|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
+    )
+    ;;
 legacy)
     # 旧 A/B/C1/C2 四组(docs/RUN_ON_GPU.md 阶段 2), 保留可复跑
     SPECS=(
@@ -102,7 +125,7 @@ legacy)
     )
     ;;
 *)
-    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / legacy)" >&2
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / gil / legacy)" >&2
     exit 1
     ;;
 esac
