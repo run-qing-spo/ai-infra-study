@@ -23,6 +23,7 @@ import argparse
 import json
 import random
 import statistics
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,12 +40,14 @@ def make_text(rng: random.Random, n_words: int) -> str:
     return " ".join(rng.choice(WORDS) for _ in range(n_words))
 
 
-def one_request(client, model: str, prompt: str, max_tokens: int) -> dict:
+def one_request(client, model: str, prompt: str, max_tokens: int,
+                keep_chunk_times: bool = False) -> dict:
     """流式发一次补全, 掐第一个 token 的表。"""
     t_wall = time.time()      # 绝对时间戳:事后把样本对到 iostat/meminfo 的时间轴上
     t0 = time.perf_counter()
     ttft = None
     n_chunks = 0
+    chunk_t = [] if keep_chunk_times else None   # 逐 token 绝对到达时刻(ITL 探针用)
     stream = client.completions.create(
         model=model, prompt=prompt, max_tokens=max_tokens,
         temperature=0.0, stream=True,
@@ -54,8 +57,13 @@ def one_request(client, model: str, prompt: str, max_tokens: int) -> dict:
             if ttft is None:
                 ttft = time.perf_counter() - t0
             n_chunks += 1
-    return dict(ttft=ttft, total=time.perf_counter() - t0, chunks=n_chunks,
-                t_wall=t_wall)
+            if chunk_t is not None:
+                chunk_t.append(time.time())
+    d = dict(ttft=ttft, total=time.perf_counter() - t0, chunks=n_chunks,
+             t_wall=t_wall)
+    if chunk_t is not None:
+        d["chunk_t"] = chunk_t
+    return d
 
 
 def pct(xs, p):
@@ -93,14 +101,27 @@ def main():
     ap.add_argument("--phases", default="prime,churn,revisit",
                     help="逗号分隔的 phase 序列, 可重复出现构成循环, 例如 E3 的 "
                          "prime,churn,revisit@1,churn,revisit@4,...;"
-                         "revisit@N 覆盖该轮的并发数。默认与旧行为一致")
+                         "revisit@N 覆盖该轮的并发数。默认与旧行为一致。"
+                         "mixed@N 是 E4 的读写混战阶段:churn 流不停, 按固定节拍"
+                         "插 revisit 波(见 --mixed-*), 期间可选常驻 decode 探针量 ITL")
+    ap.add_argument("--mixed-interval", type=float, default=20.0,
+                    help="mixed 阶段两个 revisit 波的起点间隔秒数。间隔内 churn 流"
+                         "持续把上一波拉回来的前缀重新挤下盘;默认 20s ≈ E3 一轮"
+                         "完整 churn(24 条)的挤出量, 短了下一波会命中 GPU/CPU tier")
+    ap.add_argument("--mixed-waves", type=int, default=6,
+                    help="mixed 阶段插入的 revisit 波数, 每波 = 全部会话 @ 并发 c"
+                         "(与 E3 的 revisit@c 同形状, 劣化对比才同基线)")
+    ap.add_argument("--probe-tokens", type=int, default=256,
+                    help="mixed 阶段常驻 decode 探针每请求生成的 token 数, 0 关探针。"
+                         "探针量的是 ITL 在 IO 高峰被压高多少(E5 的端到端证据)")
     args = ap.parse_args()
 
     # 提前把 --phases 校验完, 别跑了半宿在中途炸
     phases = [t.strip() for t in args.phases.split(",") if t.strip()]
     for t in phases:
         base, _, conc = t.partition("@")
-        if base not in ("prime", "churn", "revisit") or (conc and base != "revisit"):
+        if base not in ("prime", "churn", "revisit", "mixed") \
+                or (conc and base not in ("revisit", "mixed")):
             ap.error(f"--phases 里不认识的 token: {t}")
         if conc and not conc.isdigit():
             ap.error(f"--phases 并发数不是整数: {t}")
@@ -148,7 +169,7 @@ def main():
                 for _ in range(args.churn)
             ])
 
-        else:  # revisit
+        elif base == "revisit":
             c = int(conc) if conc else args.revisit_concurrency
             q_idx += 1
             print(f"phase {step}: revisit sessions @ concurrency {c} "
@@ -168,6 +189,106 @@ def main():
                     samples = list(ex.map(go, enumerate(prefixes)))
             run_and_report(tok, rnd, samples)
 
+        else:  # mixed(E4): churn 流 + 按节拍插 revisit 波 + 常驻 decode 探针
+            c = int(conc) if conc else args.revisit_concurrency
+            print(f"phase {step}: mixed — churn flow + {args.mixed_waves} revisit "
+                  f"waves @ concurrency {c}, interval {args.mixed_interval:.0f}s"
+                  + (f", probe {args.probe_tokens} tok/req"
+                     if args.probe_tokens > 0 else ""))
+            stop = threading.Event()
+            dead = []   # 后台流的死因;干扰源中途消失的话整个阶段作废, 必须显式暴露
+
+            # churn 流和探针各用独立 rng:random.Random 不是线程安全的,
+            # 且独立播种保证三个流的文本互不重复(重复文本命中 prefix cache)
+            churn_rng = random.Random(args.seed + 1000 * rnd)
+            churn_samples = []
+
+            def churn_flow():
+                # 闭环发压, 节奏与独立 churn phase 相同, 唯一区别是不停
+                try:
+                    while not stop.is_set():
+                        churn_samples.append(one_request(
+                            client, args.model,
+                            make_text(churn_rng, args.churn_words)
+                            + "\n\nSummarize. Answer:",
+                            args.gen_tokens))
+                except Exception as e:
+                    dead.append(f"churn 流死于: {e!r}")
+
+            probe_rng = random.Random(args.seed + 2000 * rnd)
+            probe_samples = []
+
+            def probe_flow():
+                # 常驻长 decode:逐 token 记绝对时刻, 事后对 iostat 看 IO 高峰
+                # 把 ITL 压高多少。前缀短(200 词)且每请求全新 —— prefill 干扰
+                # 小, 也不碰任何缓存层
+                try:
+                    while not stop.is_set():
+                        probe_samples.append(one_request(
+                            client, args.model,
+                            make_text(probe_rng, 200)
+                            + "\n\nWrite a long story. Answer:",
+                            args.probe_tokens, keep_chunk_times=True))
+                except Exception as e:
+                    dead.append(f"decode 探针死于: {e!r}")
+
+            flows = [threading.Thread(target=churn_flow, daemon=True)]
+            if args.probe_tokens > 0:
+                flows.append(threading.Thread(target=probe_flow, daemon=True))
+            for th in flows:
+                th.start()
+
+            wave_samples = []
+            t_phase = time.monotonic()
+            for wave in range(1, args.mixed_waves + 1):
+                # 波按固定节拍开环插入:睡到时间点而不是睡固定时长, 波本身的
+                # 耗时不挤占下一波前的 churn 窗口;第一波前也先让 churn 跑满
+                # 一个间隔, 保证 prime/上一波拉回来的前缀已被挤下盘
+                time.sleep(max(0.0,
+                               t_phase + wave * args.mixed_interval
+                               - time.monotonic()))
+                q_idx += 1
+
+                def go_wave(i_p, q=q_idx):
+                    i, p = i_p
+                    return one_request(
+                        client, args.model,
+                        p + f"\n\nQuestion {q}: now count keyword #{i}. Answer:",
+                        args.gen_tokens)
+
+                with ThreadPoolExecutor(max_workers=c) as ex:
+                    ws = list(ex.map(go_wave, enumerate(prefixes)))
+                # 波编号跨多个 mixed token 连续, 语义与 revisit 的 round 一致
+                for s in ws:
+                    s["round"] = (rnd - 1) * args.mixed_waves + wave
+                wave_samples.extend(ws)
+                report(f" wave {wave}", ws)
+
+            stop.set()
+            for th in flows:
+                th.join(timeout=60)   # 只等在飞的最后一条请求收尾
+            for msg in dead:
+                print(f"警告: {msg} —— 干扰源不完整, 本 mixed 阶段作废")
+
+            out.setdefault(f"mixed_revisit@{c}", []).extend(wave_samples)
+            report(f"mixed_revisit@{c}", wave_samples)
+            for s in churn_samples:
+                s["round"] = rnd
+            out.setdefault("mixed_churn", []).extend(churn_samples)
+            report("mixed_churn", churn_samples)
+            if probe_samples:
+                for s in probe_samples:
+                    s["round"] = rnd
+                out.setdefault("probe", []).extend(probe_samples)
+                # ITL = 相邻 chunk 到达时刻之差, 各请求内部取差后合并
+                itls = [b - a for s in probe_samples
+                        for a, b in zip(s["chunk_t"], s["chunk_t"][1:])]
+                if itls:
+                    print(f"probe ITL   n={len(itls)}  "
+                          f"mean={statistics.mean(itls)*1000:6.2f}ms  "
+                          f"p50={pct(itls, 50)*1000:6.2f}ms  "
+                          f"p99={pct(itls, 99)*1000:6.2f}ms")
+
     # 多轮合并后的汇总(单轮的 key 逐轮打印时已完整报过, 不重复打印)
     merged = [k for k, v in out.items() if len({s["round"] for s in v}) > 1]
     if merged:
@@ -180,7 +301,7 @@ def main():
     if "prime" in out:
         prime_m = statistics.mean(s["ttft"] for s in out["prime"])
         for k in out:
-            if k.startswith("revisit"):
+            if "revisit" in k:
                 rev_m = statistics.mean(s["ttft"] for s in out[k])
                 print(f"\n{k}/prime TTFT ratio: {rev_m / prime_m:.2f} "
                       f"(越低越好;1 附近说明前缀基本没保住)")

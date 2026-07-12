@@ -6,6 +6,7 @@
 #   tmux new -s e2e
 #   bash bench/run_e2e_overnight.sh e1        # Ctrl-B D 断开
 #   bash bench/run_e2e_overnight.sh e3        # 并发轴: fs/uring 各一次 serve, 扫 c∈{1,4,8,16}×3轮
+#   bash bench/run_e2e_overnight.sh e4        # 读写混战: churn 流不停 + revisit 波 @c8 + ITL 探针
 #   bash bench/run_e2e_overnight.sh legacy    # 旧 A/B/C1/C2 四组
 #   # 或者不用 tmux: nohup bash bench/run_e2e_overnight.sh e1 > overnight.log 2>&1 &
 #
@@ -79,6 +80,18 @@ e3)
         "E3_uring|$CFG_URING|uring|1|-|0|--phases $E3_PHASES"
     )
     ;;
+e4)
+    # E4 读写混战(COMPARE_PLAN E4): mixed@8 —— churn 流持续闭环发压,
+    # 每 20s 插一波 revisit(全部 16 会话 @ c=8, 与 E3 的 revisit@8 同形状),
+    # 常驻 decode 探针逐 token 记时间戳(E5 的 ITL 证据)。判据: mixed_revisit@8
+    # 相对 E3 revisit@8 "安静盘"基线(fs 369ms / uring 304ms)劣化多少。
+    # 定档 c=8 的理由见 COMPARE_PLAN E4 节(保守留一档余量)。不压舱。
+    # 盘预算: 6 波×20s 的 churn 流 ≈ 180 条 ≈ 21G fs 落盘 + prime 7G, 35G 内放得下
+    SPECS=(
+        "E4_fs|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases prime,churn,mixed@8"
+        "E4_uring|$CFG_URING|uring|1|-|0|--phases prime,churn,mixed@8"
+    )
+    ;;
 legacy)
     # 旧 A/B/C1/C2 四组(docs/RUN_ON_GPU.md 阶段 2), 保留可复跑
     SPECS=(
@@ -89,7 +102,7 @@ legacy)
     )
     ;;
 *)
-    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / legacy)" >&2
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / legacy)" >&2
     exit 1
     ;;
 esac
@@ -175,8 +188,11 @@ start_monitors() {
         MON_PIDS+=($!)
     fi
     if command -v iostat >/dev/null; then
-        # -t 给每次采样打时间戳, E1/E2 要拿它和 bench 的 phase 时刻对齐
-        iostat -x -t 5 > "$RES/iostat_$group.log" 2>&1 &
+        # -t 给每次采样打时间戳, 要拿它和 bench 的 phase 时刻对齐。
+        # 1 秒粒度(原 5 秒): E3 复盘两次栽在 5 秒稀释上——高并发 revisit
+        # 窗口只有 1~3 秒, 5 秒均值把突发峰值稀释一半, 差点把 1089MB/s
+        # 误判成设备封顶;fs 慢的那截在每请求流水线延迟里, 5 秒粒度看不见
+        iostat -x -t 1 > "$RES/iostat_$group.log" 2>&1 &
         MON_PIDS+=($!)
     fi
     # iou-wrk 是内核线程, 全系统数一遍即可(独占机器, 没别的 uring 用户)
