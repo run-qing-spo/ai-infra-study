@@ -147,6 +147,10 @@ stop_serve() {
     pkill -9 -f "vllm serve" 2>/dev/null
     pkill -9 -f "EngineCore" 2>/dev/null
     SERVE_PID=""
+    # SIGKILL 之下 vLLM 清不掉自己的 /dev/shm offload mmap(每次 serve 4.3G),
+    # 攒几组就把 tmpfs 填满, 下一组 SharedOffloadRegion 的 MADV_POPULATE_WRITE
+    # 吃 EFAULT 死在引擎初始化(2026-07-12 E3_uring 踩坑, 攒到第 5 次 serve 才炸)
+    rm -f /dev/shm/vllm_offload_*.mmap
     for i in $(seq 1 60); do
         local used; used=$(gpu_used_mb)
         [ -n "$used" ] && (( used < GPU_CLEAR_MB )) && {
@@ -349,6 +353,9 @@ python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
 [ -f bench/ram_ballast.py ]          || { log "找不到 bench/ram_ballast.py"; fail=1; }
 [ -d "$DATA" ]                       || { log "数据盘 $DATA 不存在"; fail=1; }
 pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉再来"; fail=1; }
+# 上一轮(或上一次脚本)被 -9 杀掉留下的 shm 存货, 起跑前清一次
+# (上面已确认没有 vllm serve 在跑, 删了不影响活进程)
+(( fail )) || rm -f /dev/shm/vllm_offload_*.mmap
 command -v pidstat >/dev/null || log "警告: 没有 pidstat(sysstat), CPU 监控会缺失, 不阻塞"
 avail_gb=$(df -BG --output=avail "$DATA" 2>/dev/null | tail -1 | tr -dc 0-9)
 [ -n "$avail_gb" ] && (( avail_gb < 40 )) && log "警告: $DATA 只剩 ${avail_gb}G, uring 组要 20G 备份文件 + fs 目录无上限, 可能不够"
