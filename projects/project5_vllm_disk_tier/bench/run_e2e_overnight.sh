@@ -168,13 +168,20 @@ start_monitors() {
     # anon 验证冷组压舱全程没漏气。共享宿主上 /proc/meminfo 混着别的租户,
     # 主数据看本容器 cgroup 的记账(page cache 谁读记谁账), meminfo 只留
     # 一列宿主侧参考
-    ( CG=/sys/fs/cgroup/memory/memory.stat; PAT='^total_(cache|rss|shmem|dirty|writeback)$'
+    # 解读要点(E1 复盘): 真正的 page cache = file − shmem。ballast 的
+    # mmap(-1) 是 MAP_SHARED, 记进 shmem;file 把 shmem 也包含在内,
+    # 所以单看 file 会把压舱误读成缓存暴涨。这里直接算好 pagecache 列
+    ( CG=/sys/fs/cgroup/memory/memory.stat
+      PAT='^total_(cache|rss|shmem|dirty|writeback)$'; FKEY=total_cache; SKEY=total_shmem
       if [ ! -f "$CG" ]; then
-          CG=/sys/fs/cgroup/memory.stat; PAT='^(anon|file|shmem|file_dirty|file_writeback)$'
+          CG=/sys/fs/cgroup/memory.stat
+          PAT='^(anon|file|shmem|file_dirty|file_writeback)$'; FKEY=file; SKEY=shmem
       fi
       while sleep 5; do
-          echo "$(date +%T) $(awk -v pat="$PAT" '$1 ~ pat \
-              {printf "%s=%dMB ", $1, $2/1048576}' "$CG") | host: $(awk \
+          echo "$(date +%T) $(awk -v pat="$PAT" -v fk="$FKEY" -v sk="$SKEY" \
+              '$1 ~ pat {printf "%s=%dMB ", $1, $2/1048576}
+               $1 == fk {f=$2} $1 == sk {s=$2}
+               END {printf "pagecache=%dMB ", (f-s)/1048576}' "$CG") | host: $(awk \
               '$1 ~ /^(MemAvailable|Cached|Dirty):$/ {printf "%s%dMB ", $1, $2/1024}' /proc/meminfo)"
       done > "$RES/meminfo_$group.log" ) &
     MON_PIDS+=($!)

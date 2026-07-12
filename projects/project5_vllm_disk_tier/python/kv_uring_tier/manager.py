@@ -27,7 +27,16 @@ from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, Any
 
-logger = logging.getLogger(__name__)
+# 必须挂进 vLLM 的日志体系: EngineCore 子进程里 root logger 是默认的
+# WARNING + 无 handler, 裸 getLogger 的 INFO/WARNING 全被吞 —— E1 那轮
+# serve 日志里看不到 prewarm 行、更糟的是 O_DIRECT 降级警报也不可见,
+# 就是这个原因。vllm.logger.init_logger 返回挂在 "vllm" 层级下的 logger,
+# 跟着它的 handler/级别配置走;裸跑单测时没有 vllm, 退回标准 logging。
+try:
+    from vllm.logger import init_logger
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 try:
     import vllm  # noqa: F401

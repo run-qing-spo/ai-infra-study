@@ -6,11 +6,16 @@
 生存空间压到小于工作集, buffered 读才被逼回真实设备。AutoDL 是容器,
 drop_caches 和 cgroup 都没权限, 占内存是唯一可用的挤压手段。
 
-原理:匿名脏页没有 backing file, 容器里通常又没 swap, 内核回收内存时
+原理:这块内存没有磁盘 backing, 容器里通常又没 swap, 内核回收内存时
 动不了它, 只能拿 page cache 开刀 —— ballast 占多少, page cache 的生存
-空间就少多少。有 swap 的机器上匿名页可能被换出去"漏气", 所以填完后
+空间就少多少。有 swap 的机器上它可能被换出去"漏气", 所以填完后
 尽力 mlock 一把;锁不上(RLIMIT_MEMLOCK 不够)只告警不退出, 靠
 /proc/swaps 的检查提示人工确认。
+
+记账细节(E1 那轮实测踩过的坑): Python 的 mmap(-1, ...) 默认是
+MAP_SHARED, 在 cgroup memory.stat 里记进 shmem 而不是 anon —— 看曲线
+时别在 anon 里找 ballast。自适应模式的余量公式 limit − anon − shmem
+把两项都减掉了, 所以记在哪边都不影响收敛的正确性。
 
 两种用法:
 
