@@ -5,6 +5,7 @@
 # 用法(远端 GPU 机, 在项目根目录):
 #   tmux new -s e2e
 #   bash bench/run_e2e_overnight.sh e1        # Ctrl-B D 断开
+#   bash bench/run_e2e_overnight.sh e3        # 并发轴: fs/uring 各一次 serve, 扫 c∈{1,4,8,16}×3轮
 #   bash bench/run_e2e_overnight.sh legacy    # 旧 A/B/C1/C2 四组
 #   # 或者不用 tmux: nohup bash bench/run_e2e_overnight.sh e1 > overnight.log 2>&1 &
 #
@@ -62,6 +63,20 @@ e1)
         "E1_fs_cold|$CFG_FS|fs|1|PYTHONHASHSEED=0|$CACHE_ROOM_GIB|-"
         "E1_uring_hot|$CFG_URING|uring|1|-|0|-"
         "E1_uring_cold|$CFG_URING|uring|1|-|$CACHE_ROOM_GIB|-"
+    )
+    ;;
+e3)
+    # E3 并发 load 深度(COMPARE_PLAN E3): 同一 serve 内 prime 一次, 每个并发
+    # 档 c 前重新 churn 把前缀挤回盘, 每档 3 轮取合并样本。不压舱 ——
+    # 并发轴不和内存压力轴混跑。判据: revisit@c 的 p50/p99 随 c 的曲线;
+    # 作废条件靠样本 t_wall 对 iostat 读流量事后核对
+    E3_PHASES="prime"
+    for c in 1 4 8 16; do
+        for _ in 1 2 3; do E3_PHASES+=",churn,revisit@$c"; done
+    done
+    SPECS=(
+        "E3_fs|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $E3_PHASES"
+        "E3_uring|$CFG_URING|uring|1|-|0|--phases $E3_PHASES"
     )
     ;;
 legacy)
@@ -150,7 +165,9 @@ start_monitors() {
     # 注意别用裸 "vllm" 匹配: 项目路径里就带 vllm 字样, 会把本脚本自己算进去
     pids=$(pgrep -d, -f "vllm serve|EngineCore") || pids=""
     if command -v pidstat >/dev/null && [ -n "$pids" ]; then
-        pidstat -u -p "$pids" 5 > "$RES/pidstat_$group.log" 2>&1 &
+        # -t 拆到线程级: E5 要对比 fs 的 32 条池线程 vs uring 的单提交线程
+        # + io-wq worker(PF_IO_WORKER 是进程的线程, -t 才看得见)
+        pidstat -u -t -p "$pids" 5 > "$RES/pidstat_$group.log" 2>&1 &
         MON_PIDS+=($!)
     fi
     if command -v iostat >/dev/null; then
@@ -285,8 +302,9 @@ run_group() {
     stop_ballast
 
     if [ $rc -eq 0 ]; then
-        # 把三行 phase 汇总和比值直接抄进 SUMMARY, 明早一眼能看
-        grep -E "^(prime|churn|revisit) |revisit/prime" "$RES/bench_$group.log" | \
+        # 把 phase 汇总和比值直接抄进 SUMMARY, 明早一眼能看
+        # (revisit@N 带并发后缀, 模式不能再要求 revisit 后面紧跟空格)
+        grep -E "^(prime|churn|revisit)|/prime TTFT ratio" "$RES/bench_$group.log" | \
             while IFS= read -r l; do log "  $l"; done
         [ -z "${GROUP_STATUS[$group]:-}" ] && GROUP_STATUS[$group]="OK"
     else
