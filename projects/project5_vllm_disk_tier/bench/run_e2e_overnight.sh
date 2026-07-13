@@ -49,7 +49,15 @@ export HF_HOME="${HF_HOME:-$DATA/hf}"
 # uring 的磁盘容量上限。fs tier 没有对应配置项(无上限), 所以这个数同时是
 # "对照是否干净"的判据: 负载的盘上唯一块总量一旦超过它, uring 就得 LRU 逐出
 # 重写而 fs 不用, 两边不再是同一场比赛(E3 实测 2.9× 写放大的根因)。
-URING_CAP_MIB=20480
+#
+# 2026-07-14 上调 20G→30G: 第一次跑 e4 时 20G 不够, 唯一块实测 28357MiB 撞上限,
+# 三个 uring 组全被判 WARN(capacity)。教训是"每条 churn 往盘上留多少唯一块"
+# 不是负载常数 —— 一条 churn 产出 ~488 块 KV, 能落盘多少取决于 store 路径吸收
+# 得过来多少, E3 只吸收了 23%、E4 吸收了 75%(同样的请求节奏, 机制待查, 见
+# COMPARE_PLAN E4 节的悬案)。所以容量不按"预期落盘量"给, 按**最坏情况上界**给:
+# 上界 = prime 8000 块 + churn 条数 × 488 块, 全按 100% 落盘算, 与吸收率无关,
+# 只由 prompt 大小和请求条数决定 —— 算得准, 也就兜得住。
+URING_CAP_MIB=30720
 URING_CAP_BYTES=$(( URING_CAP_MIB * 1024 * 1024 ))
 
 CFG_B='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"CPUOffloadingSpec","cpu_bytes_to_use":4294967296}}'
@@ -93,13 +101,25 @@ e4)
     # 相对 E3 revisit@8 "安静盘"基线(fs 369.3ms 均值 / uring 303.5ms)劣化多少。
     # 定档 c=8 的理由见 COMPARE_PLAN E4 节(保守留一档余量)。不压舱。
     #
-    # 盘上唯一块 ≤ 20G 是硬约束(见 COMPARE_PLAN E4 "干净对照"段): uring 的
-    # disk_bytes_to_use=20G, 唯一块一旦超过上限就触发 LRU 逐出→重写, E3 那
-    # 2.9× 写放大会把"写流干扰读路径"的测量污染成"uring 自伤"。预算按 E1/E3
-    # 落盘实测标定: prime 前缀 8000 块 × 0.875MiB = 7.0G(revisit 复用同一批块,
-    # 不产新块), churn 首轮冷缓存 ~276MiB/条、稳态 ~82MiB/条(≈71MB/s)。
-    # 预算分配: prime 7.0G + churn 首轮 6.6G + mixed 2 波(churn 流约 58s ×
-    # 71MB/s)4.1G ≈ 17.7G, 距 20G 上限留 11% 余量。
+    # 盘上唯一块 ≤ 容量上限是硬约束(见 COMPARE_PLAN E4 "干净对照"段): 唯一块
+    # 一旦超过 uring 的 disk_bytes_to_use 就触发 LRU 逐出→重写, E3 那 2.9× 写放大
+    # 会把"写流干扰读路径"的测量污染成"uring 自伤"。
+    #
+    # 预算按**最坏情况上界**给, 不按预期落盘量(2026-07-14 第一次跑 e4 的教训:
+    # 按"每条 churn 留 ~98MiB"的预期算得 17.2G, 实测 28.4G, 三个 uring 组全废 ——
+    # 落盘量取决于 store 路径的吸收率, 而吸收率不是常数, E3 是 23%、E4 是 75%)。
+    # 上界只由 prompt 大小和请求条数决定, 与吸收率无关:
+    #   上界(块) = prime 8000 + churn 条数 × 488     (一条 6000 词 churn ≈ 488 块)
+    # 本配置: churn 16(独立) + mixed 约 43s÷1.28s ≈ 34 条 = 50 条
+    #   ⇒ 上界 = 8000 + 50×488 = 32400 块 × 0.875MiB ≈ 28.4G < 30G 上限, 留 8% 余量
+    #   ⇒ 盘占用峰值 = max(kv_fs 上界 28.4G, uring backing 30G) = 30G < 35G 可用 ✓
+    # 上界兜得住"uring 比 fs 吸收得更多"的情况 —— 收尾的 kv_fs 落盘哨兵只量得到
+    # fs 那一侧, 真正的保险是这个上界。
+    #
+    # churn 16 / interval 20s 是为了压住上界砍出来的, 代价是每轮的挤出压力从 E3 的
+    # 24 条降到 ~16 条。够不够挤是自验的: 每波 revisit 的盘读量(t_wall × iostat)
+    # 若两 tier 相当且量级可观(E3 同档是 5.32GB), 前缀就是真从盘上回来的;若明显
+    # 偏小, 说明挤出不足、波打在了 GPU/CPU tier 上, 该轮作废。
     # 不要为了多拿样本加波数 —— 加样本走加 serve(下面 a/b/c), 不是延长 mixed。
     #
     # 安静盘基线放在同一个 serve 里(prime,churn,revisit@8 —— 与 E3 revisit@8
@@ -113,7 +133,7 @@ e4)
     # a/b/c 交替三次 serve: 每 serve 基线 16 样本 + mixed 2 波 × 16 = 32 样本,
     # 合并后 48 基线 / 96 mixed 每 tier(≥ E3 每档 48);交替是为了跨 serve 环境
     # 漂移不偏向任一 tier(E1 的教训)
-    E4_MIXED="--phases prime,churn,revisit@8,mixed@8 --mixed-waves 2 --mixed-interval 25"
+    E4_MIXED="--phases prime,churn,revisit@8,mixed@8 --churn 16 --mixed-waves 2 --mixed-interval 20"
     SPECS=(
         "E4_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E4_MIXED"
         "E4_uring_a|$CFG_URING|uring|1|-|0|$E4_MIXED"
@@ -438,8 +458,13 @@ pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉�
 # (上面已确认没有 vllm serve 在跑, 删了不影响活进程)
 (( fail )) || rm -f /dev/shm/vllm_offload_*.mmap
 command -v pidstat >/dev/null || log "警告: 没有 pidstat(sysstat), CPU 监控会缺失, 不阻塞"
+# 盘够不够: uring 的 backing 文件按 URING_CAP_MIB 全量 fallocate + prewarm, fs 目录
+# 无上限但组间即删, 所以峰值 ≈ 上限本身。留 3G 余量给日志和文件系统元数据。
 avail_gb=$(df -BG --output=avail "$DATA" 2>/dev/null | tail -1 | tr -dc 0-9)
-[ -n "$avail_gb" ] && (( avail_gb < 40 )) && log "警告: $DATA 只剩 ${avail_gb}G, uring 组要 20G 备份文件 + fs 目录无上限, 可能不够"
+cap_gb=$(( URING_CAP_MIB / 1024 ))
+if [ -n "$avail_gb" ] && (( avail_gb < cap_gb + 3 )); then
+    log "警告: $DATA 只剩 ${avail_gb}G, uring backing 要 ${cap_gb}G(+fs 目录同量级), 可能不够"
+fi
 (( fail )) && { log "预检失败, 退出"; exit 1; }
 # 内存基线看 cgroup 不看 free: 共享宿主上 free 显示的是宿主 1TB, 没意义
 if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
