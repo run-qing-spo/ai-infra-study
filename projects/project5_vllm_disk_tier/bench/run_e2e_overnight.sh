@@ -46,9 +46,15 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET=1
 export HF_HOME="${HF_HOME:-$DATA/hf}"
 
+# uring 的磁盘容量上限。fs tier 没有对应配置项(无上限), 所以这个数同时是
+# "对照是否干净"的判据: 负载的盘上唯一块总量一旦超过它, uring 就得 LRU 逐出
+# 重写而 fs 不用, 两边不再是同一场比赛(E3 实测 2.9× 写放大的根因)。
+URING_CAP_MIB=20480
+URING_CAP_BYTES=$(( URING_CAP_MIB * 1024 * 1024 ))
+
 CFG_B='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"CPUOffloadingSpec","cpu_bytes_to_use":4294967296}}'
 CFG_FS='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"fs","root_dir":"'$DATA'/kv_fs"}]}}'
-CFG_URING='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"uring","path":"'$DATA'/kv_tier.bin","disk_bytes_to_use":21474836480,"queue_depth":32}]}}'
+CFG_URING='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":4294967296,"secondary_tiers":[{"type":"uring","path":"'$DATA'/kv_tier.bin","disk_bytes_to_use":'$URING_CAP_BYTES',"queue_depth":32}]}}'
 
 # ── 实验矩阵: 每行一个实验 ──────────────────────────────────────────────
 # 字段: 组名|kv-transfer-config|期望tier日志|监控:0/1|额外env|冷组cache余量GiB|bench额外参数
@@ -82,14 +88,39 @@ e3)
     ;;
 e4)
     # E4 读写混战(COMPARE_PLAN E4): mixed@8 —— churn 流持续闭环发压,
-    # 每 20s 插一波 revisit(全部 16 会话 @ c=8, 与 E3 的 revisit@8 同形状),
+    # 每 25s 插一波 revisit(全部 16 会话 @ c=8, 与 E3 的 revisit@8 同形状),
     # 常驻 decode 探针逐 token 记时间戳(E5 的 ITL 证据)。判据: mixed_revisit@8
-    # 相对 E3 revisit@8 "安静盘"基线(fs 369ms / uring 304ms)劣化多少。
+    # 相对 E3 revisit@8 "安静盘"基线(fs 369.3ms 均值 / uring 303.5ms)劣化多少。
     # 定档 c=8 的理由见 COMPARE_PLAN E4 节(保守留一档余量)。不压舱。
-    # 盘预算: 6 波×20s 的 churn 流 ≈ 180 条 ≈ 21G fs 落盘 + prime 7G, 35G 内放得下
+    #
+    # 盘上唯一块 ≤ 20G 是硬约束(见 COMPARE_PLAN E4 "干净对照"段): uring 的
+    # disk_bytes_to_use=20G, 唯一块一旦超过上限就触发 LRU 逐出→重写, E3 那
+    # 2.9× 写放大会把"写流干扰读路径"的测量污染成"uring 自伤"。预算按 E1/E3
+    # 落盘实测标定: prime 前缀 8000 块 × 0.875MiB = 7.0G(revisit 复用同一批块,
+    # 不产新块), churn 首轮冷缓存 ~276MiB/条、稳态 ~82MiB/条(≈71MB/s)。
+    # 预算分配: prime 7.0G + churn 首轮 6.6G + mixed 2 波(churn 流约 58s ×
+    # 71MB/s)4.1G ≈ 17.7G, 距 20G 上限留 11% 余量。
+    # 不要为了多拿样本加波数 —— 加样本走加 serve(下面 a/b/c), 不是延长 mixed。
+    #
+    # 安静盘基线放在同一个 serve 里(prime,churn,revisit@8 —— 与 E3 revisit@8
+    # 同形状), 劣化 = mixed_revisit@8 − 本 serve 自己的 revisit@8。不去对 E3 那次
+    # serve 的数(fs 369.3ms / uring 303.5ms): E1 立下的纪律是跨 serve 差异小于
+    # 15~20ms 的邻居噪声底不许下结论, 而劣化幅度事先并不知道有没有那么大。
+    # 已知残留混淆: mixed 期盘上文件数比基线期多(churn 流一直在写), fs 的元数据
+    # 面随文件数增长, 所以 fs 的劣化里掺了一点"文件更多"而非纯"写流干扰"。E3 的
+    # 每档 3 轮(轮间文件数递增)读数稳定, 说明这一项经验上很小, 记为已知缺口。
+    #
+    # a/b/c 交替三次 serve: 每 serve 基线 16 样本 + mixed 2 波 × 16 = 32 样本,
+    # 合并后 48 基线 / 96 mixed 每 tier(≥ E3 每档 48);交替是为了跨 serve 环境
+    # 漂移不偏向任一 tier(E1 的教训)
+    E4_MIXED="--phases prime,churn,revisit@8,mixed@8 --mixed-waves 2 --mixed-interval 25"
     SPECS=(
-        "E4_fs|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases prime,churn,mixed@8"
-        "E4_uring|$CFG_URING|uring|1|-|0|--phases prime,churn,mixed@8"
+        "E4_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E4_MIXED"
+        "E4_uring_a|$CFG_URING|uring|1|-|0|$E4_MIXED"
+        "E4_fs_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E4_MIXED"
+        "E4_uring_b|$CFG_URING|uring|1|-|0|$E4_MIXED"
+        "E4_fs_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E4_MIXED"
+        "E4_uring_c|$CFG_URING|uring|1|-|0|$E4_MIXED"
     )
     ;;
 gil)
@@ -346,8 +377,10 @@ run_group() {
 
     if [ $rc -eq 0 ]; then
         # 把 phase 汇总和比值直接抄进 SUMMARY, 明早一眼能看
-        # (revisit@N 带并发后缀, 模式不能再要求 revisit 后面紧跟空格)
-        grep -E "^(prime|churn|revisit)|/prime TTFT ratio" "$RES/bench_$group.log" | \
+        # (revisit@N 带并发后缀, 模式不能再要求 revisit 后面紧跟空格;
+        #  mixed 阶段的行是 " wave N" / mixed_revisit@N / mixed_churn / probe ITL)
+        grep -E "^(prime|churn|revisit|mixed|probe| wave)|/prime TTFT ratio" \
+            "$RES/bench_$group.log" | \
             while IFS= read -r l; do log "  $l"; done
         [ -z "${GROUP_STATUS[$group]:-}" ] && GROUP_STATUS[$group]="OK"
     else
@@ -364,6 +397,15 @@ run_group() {
         nfiles=$(find "$DATA/kv_fs" -type f | wc -l | tr -d ' ')
         mib=$(du -sm "$DATA/kv_fs" | cut -f1)
         log "  kv_fs 落盘: ${nfiles} 个文件, ${mib} MiB, 删掉腾磁盘"
+        # fs 没有容量上限, 它的落盘量 = 本轮负载的盘上唯一块总量(按内容哈希天然
+        # 去重), 而 uring 组跑的是同一批 prompt(--seed 固定) ⇒ 唯一块总量相同。
+        # 所以这个数就是"uring 会不会撞上限"的先行指标: 超过 URING_CAP_MIB 就说明
+        # uring 组必然触发 LRU 逐出→重写, 对照不干净(E3 那 2.9× 写放大的根因)。
+        # E4 靠"唯一块 ≤ 20G"换干净对照, 这条越界即作废, 必须缩短 mixed 后重跑。
+        if (( mib > URING_CAP_MIB )); then
+            log "  !! 唯一块 ${mib} MiB > uring 容量 ${URING_CAP_MIB} MiB —— uring 组会逐出重写, 对照不干净"
+            GROUP_STATUS[$group]="WARN(capacity)"
+        fi
         rm -rf "$DATA/kv_fs"
     elif [ "$expect" = uring ]; then
         rm -f "$DATA/kv_tier.bin"   # 下一组 serve 会重新 fallocate + prewarm
