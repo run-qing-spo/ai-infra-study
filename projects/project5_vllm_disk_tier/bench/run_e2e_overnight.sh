@@ -36,6 +36,9 @@ PORT=8000
 READY_TIMEOUT=3600      # 等 serve 就绪的上限(首组可能含模型下载)
 BENCH_TIMEOUT=5400      # 单组负载上限
 GPU_CLEAR_MB=1024       # 显存低于此值视为已清空
+SHUTDOWN_TIMEOUT=30     # vLLM 自己的 shutdown_timeout, 默认 0 = 零等待 SIGKILL
+                        # EngineCore(见 stop_serve 的泄漏归因), 非 0 才走 drain
+                        # 模式给它时间跑完 shutdown() -> SharedOffloadRegion.cleanup()
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-0}"
 EXPERIMENT="${1:-e1}"                   # 实验矩阵: e1 / legacy
 CACHE_ROOM_GIB="${CACHE_ROOM_GIB:-4}"   # 冷组给 page cache 留的余量上限(GiB)
@@ -230,13 +233,25 @@ stop_serve() {
         sleep 2
     done
     kill -0 "$SERVE_PID" 2>/dev/null && { kill -TERM -- -"$SERVE_PID" 2>/dev/null; sleep 10; }
-    # 兜底: 引擎在 EngineCore 子进程里, INT 偶尔收不干净
-    pkill -9 -f "vllm serve" 2>/dev/null
-    pkill -9 -f "EngineCore" 2>/dev/null
+    # 兜底 SIGKILL 只在优雅关停真的失败时开枪, 并且留痕。原来这两行是无守卫无日志
+    # 地照杀, 于是"优雅关停成功"和"失败"混成一团, 下面那桩泄漏因此归因错了两天。
+    if pgrep -f "vllm serve|EngineCore" >/dev/null 2>&1; then
+        log "  !! 优雅关停失败, SIGKILL 兜底(shm 会残留, 靠下面的 rm 清)"
+        pkill -9 -f "vllm serve" 2>/dev/null
+        pkill -9 -f "EngineCore" 2>/dev/null
+    fi
     SERVE_PID=""
-    # SIGKILL 之下 vLLM 清不掉自己的 /dev/shm offload mmap(每次 serve 4.3G),
-    # 攒几组就把 tmpfs 填满, 下一组 SharedOffloadRegion 的 MADV_POPULATE_WRITE
-    # 吃 EFAULT 死在引擎初始化(2026-07-12 E3_uring 踩坑, 攒到第 5 次 serve 才炸)
+    # /dev/shm 泄漏归因(2026-07-14 查清, 修正旧注释): 肇事者不是上面的 pkill。
+    # vLLM 的 shutdown_timeout 默认 0(config/vllm.py:380) → process manager 对
+    # EngineCore 先 terminate 再零等待 SIGKILL(v1/utils.py:621 那个 join 循环
+    # deadline=now, 第一轮就 break) → TieringOffloadingManager.shutdown() →
+    # SharedOffloadRegion.cleanup() 里的 os.unlink 永远跑不到 → 每次 serve 在
+    # tmpfs 上留一具 4.3G 尸体(= cpu_bytes_to_use 的 CPU tier 实体), 攒满 /dev/shm
+    # 后下一组的 MADV_POPULATE_WRITE 分不到页, 吃 EFAULT 死在引擎初始化
+    # (2026-07-12 E3_uring 踩坑, 攒到第 5 次 serve 才炸)。
+    # 根治 = serve 时传 --shutdown-timeout(见 SHUTDOWN_TIMEOUT); 这行 rm 保留当
+    # 兜底: OOM killer / 真挂死之下 SIGKILL 路径永远可能发生, 用 SIGKILL 兜底的
+    # 脚本必须接管被杀进程的清理义务。
     rm -f /dev/shm/vllm_offload_*.mmap
     for i in $(seq 1 60); do
         local used; used=$(gpu_used_mb)
@@ -339,7 +354,8 @@ run_group() {
 
     local cmd=()
     [ "$env0" != "-" ] && cmd+=(env "$env0")
-    cmd+=(vllm serve "$M" --max-model-len "$MAXLEN" --port "$PORT")
+    cmd+=(vllm serve "$M" --max-model-len "$MAXLEN" --port "$PORT"
+          --shutdown-timeout "$SHUTDOWN_TIMEOUT")
     [ "$cfg" != "-" ] && cmd+=(--kv-transfer-config "$cfg")
 
     setsid "${cmd[@]}" > "$slog" 2>&1 &
