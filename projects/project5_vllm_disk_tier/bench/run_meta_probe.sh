@@ -34,7 +34,8 @@ set -uo pipefail
 
 DIR=${1:?用法: sudo bash bench/run_meta_probe.sh <数据目录> [blocks] [reads]}
 BLOCKS=${2:-15000}
-READS=${3:-1000}
+READS=${3:-10000}       # 要跑够几秒 iostat 才采得到样(1 秒粒度); 1000 次只有 0.7s
+REDROP=${REDROP:-100}   # 冷档每这么多次读重清一遍缓存, 维持全程冷
 BIN=./meta_probe
 RES="results_meta_$(date +%Y%m%d_%H%M)"
 
@@ -43,11 +44,34 @@ RES="results_meta_$(date +%Y%m%d_%H%M)"
 [ "$READS" -le "$BLOCKS" ] || { echo "reads($READS) 必须 ≤ blocks($BLOCKS), 理由见头注释"; exit 1; }
 
 mkdir -p "$RES" "$DIR"
-DEV=$(df --output=source "$DIR" | tail -1 | sed 's|/dev/||')
+
+# 设备名要过 realpath:LVM 的 /dev/mapper/xxx-yyy 里带斜杠, 直接喂给 iostat/awk
+# 会炸(第一版就栽在这)。realpath 化成 dm-N, 再顺藤摸到底层物理盘 —— dm/md 这
+# 类虚拟层的 iostat 统计常常是残次品(E3 里 md0 的 r_await 就与 aqu-sz 完全对不
+# 上账, 从判据里剔除了), 物理盘那一路才是可信的。
+SRC=$(realpath "$(df --output=source "$DIR" | tail -1)")
+DEV=$(basename "$SRC")
+# lsblk 必须加 -r(raw):默认输出带树形字符, 底层盘名会变成 "└─nvme0n1" 这种
+# 喂不进 iostat 的东西(第二版栽在这)
+DEV_PHYS=$(lsblk -rnso NAME "$SRC" 2>/dev/null | tail -1)
+DEVS="$DEV"
+[ -n "$DEV_PHYS" ] && [ "$DEV_PHYS" != "$DEV" ] && DEVS="$DEV $DEV_PHYS"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RES/run.log"; }
 
-log "数据目录 $DIR (设备 $DEV, 文件系统 $(df --output=fstype "$DIR" | tail -1))"
+log "数据目录 $DIR (设备 $DEVS, 文件系统 $(df --output=fstype "$DIR" | tail -1))"
 log "blocks=$BLOCKS reads=$READS, 预计占盘 $(( BLOCKS * 875 * 2 / 1000 / 1024 ))G"
+
+# ballast 档只有在"缓存装不下工作集"时才成立 —— 目标余量必须小于工作集,
+# 否则内核压根不需要回收 dentry, 这一档是白跑的(且不会报错, 只会给出
+# 和 hot 一样的数, 看着像"假说被证伪"—— 最坏的一种失败)
+WORKSET_GIB=$(( BLOCKS * 875 / 1000 / 1024 ))
+BALLAST_AVAIL_GIB=${BALLAST_AVAIL_GIB:-4}
+if [ "$BALLAST_AVAIL_GIB" -ge "$WORKSET_GIB" ]; then
+    echo "BALLAST_AVAIL_GIB($BALLAST_AVAIL_GIB) 必须 < 工作集(${WORKSET_GIB}G), 否则 ballast 档无效"
+    echo "  要么调小它, 要么加大 blocks"
+    exit 1
+fi
+log "工作集 ${WORKSET_GIB}G, ballast 档将压到 MemAvailable ≤ ${BALLAST_AVAIL_GIB}G"
 
 # ── 造数据 ──────────────────────────────────────────────────────────────
 # files 和 slab 各一份; slab-reopen 复用 slab 的数据。
@@ -76,8 +100,7 @@ sync
 #
 # drop_caches 前必须 sync:脏页丢不掉, 不 sync 的话 drop 是部分失效的。
 # (本实验全程 O_DIRECT, 脏页主要来自 build 阶段的元数据)
-BALLAST_PID=""
-BALLAST_AVAIL_GIB=${BALLAST_AVAIL_GIB:-4}   # 压到 MemAvailable ≤ 这个值; 须 < 工作集
+BALLAST_PID=""   # 压到 MemAvailable ≤ BALLAST_AVAIL_GIB(上面已校验 < 工作集)
 
 start_ballast() {
     # 裸机没有 cgroup 上限, 用 --avail-gib 判据(容器里才用 --cache-room-gib)
@@ -133,11 +156,23 @@ for layout in files slab slab-reopen; do
             continue
         fi
 
-        iostat -xmt 1 "$DEV" > "$RES/iostat_$tag.log" 2>&1 &
+        # shellcheck disable=SC2086  # DEVS 是设备名列表, 要分词
+        iostat -xmt 1 $DEVS > "$RES/iostat_$tag.log" 2>&1 &
         iopid=$!
 
+        # 冷档全程维持自己的缓存条件:每 REDROP 次读重清一遍, level 跟着档位走
+        # (drop2 档一直只丢 slab, drop3/ballast 档连 page cache 一起丢)。
+        # 不这么做的话冷态只活在头 ~100 次读里, 后面全是热的 —— 均值被稀释 85%,
+        # 而且 iostat 的 1 秒粒度抓不到那 0.07 秒的冷窗口。hot 档当然不重 drop。
+        redrop=()
+        case "$cache" in
+            drop2)           redrop=(--redrop-every "$REDROP" --redrop-level 2) ;;
+            drop3|ballast)   redrop=(--redrop-every "$REDROP" --redrop-level 3) ;;
+        esac
+
         "$BIN" probe --dir "$DIR/$data" --layout "$layout" --blocks "$BLOCKS" \
-            --reads "$READS" > "$RES/probe_$tag.json" 2> "$RES/slab_$tag.log"
+            --reads "$READS" "${redrop[@]}" \
+            > "$RES/probe_$tag.json" 2> "$RES/slab_$tag.log"
         rc=$?
 
         kill $iopid 2>/dev/null; wait $iopid 2>/dev/null
@@ -158,12 +193,41 @@ print(f"  吞吐  {d['mibps']:.0f} MiB/s  (墙钟 {d['wall_s']:.1f}s)")
 h1, h2 = o["first_half"], o["second_half"]
 if h1 > 0:
     drift = (h2 - h1) / h1 * 100
-    flag = "  <<< 冷条件在自我衰减, 这一档的均值被稀释了" if drift < -25 else ""
+    flag = "  <<< 冷条件在自我衰减, 均值被稀释" if drift < -25 else ""
     print(f"  衰减  open 前半 {h1:.1f}us → 后半 {h2:.1f}us ({drift:+.0f}%){flag}")
+    d = o.get("decay") or []
+    if d:
+        # 首桶 = 元数据全冷的上界; 末几桶收敛值 = 稳态冷成本(拿去和 e2e 对账的数)
+        print("  曲线  " + " ".join(f"{x:.0f}" for x in d) + "  us/桶")
 PY
-        # 旁证:这一档的设备平均读请求尺寸。files+drop3 若混进元数据小读, 这里会掉。
-        awk '/^ *'"$DEV"'/ {n++; sz+=$8} END {if(n) printf "  设备平均读请求尺寸 %.0f KiB (%d 个采样点)\n", sz/n*1024, n}' \
-            "$RES/iostat_$tag.log" | tee -a "$RES/run.log"
+        # 旁证:设备读请求数与平均尺寸。数据块 0.875MiB(896KiB), 元数据块 4KiB,
+        # 尺寸上完全可分 —— files+drop3 若真在读盘上的 inode/目录块, 平均尺寸会被
+        # 小读拽下来, 且 r/s 明显高于"每次读一个数据块"该有的量。
+        # (列位置随 sysstat 版本变, 所以按表头名找, 不按列号 —— 第一版用 awk 数
+        #  列号, 碰上 LVM 的斜杠设备名直接炸了)
+        python3 - "$RES/iostat_$tag.log" <<'PY' | tee -a "$RES/run.log"
+import sys
+cols, rows = None, {}
+for line in open(sys.argv[1]):
+    f = line.split()
+    if not f:
+        continue
+    if f[0] == "Device":
+        cols = f
+        continue
+    if cols and len(f) == len(cols) and not f[0][0].isdigit():
+        d = dict(zip(cols, f))
+        try:
+            rps, sz = float(d["r/s"]), float(d.get("rareq-sz", 0))
+        except (KeyError, ValueError):
+            continue
+        if rps > 0:                      # 只统计真在读的采样点
+            rows.setdefault(f[0], []).append((rps, sz))
+for dev, v in rows.items():
+    rps = sum(x[0] for x in v) / len(v)
+    sz  = sum(x[1] for x in v) / len(v)
+    print(f"  设备 {dev:<12} 读 {rps:8.0f} r/s  平均请求 {sz:7.1f} KiB  ({len(v)} 个繁忙采样点)")
+PY
     done
 done
 

@@ -67,6 +67,8 @@ struct Config {
     size_t blocks     = 15000;              // 文件数(files) / slab 内的块数
     size_t block_size = kDefaultBlockSize;
     size_t reads      = 1000;               // probe 阶段随机读多少次
+    size_t redrop       = 0;                // 每读多少次重新 drop_caches(0 = 不重 drop)
+    int    redrop_level = 3;                // 2 = 只丢 dentry/inode; 3 = 连 page cache
     uint64_t seed     = 42;
 };
 
@@ -182,6 +184,25 @@ double mean_slice(const std::vector<double>& v, size_t from, size_t to) {
     return std::accumulate(v.begin() + from, v.begin() + to, 0.0) / (to - from);
 }
 
+// 周期性重 drop:把冷条件从"一次性事件"变成"持续状态"。
+//
+// 不这么做的话冷态只存在于头 100 次读(约 0.07s):元数据体积很小(15000 个
+// inode 才几 MB), 一旦被读回 page cache 就全热了, 后面全是热态 —— 均值被稀释
+// (实测 -85%), 而且 iostat 的 1 秒粒度根本抓不到那 0.07 秒的冷窗口。
+// 每读 N 次清一遍, 全程冷, 均值直接可读, iostat 也有东西可采。
+// 这也更贴 e2e:那里 churn 一直在写新文件, 元数据缓存本来就在被持续冲刷。
+//
+// 注意 drop 的耗时不计入任何分段计时(它在读与读之间做), 但它确实会占墙钟,
+// 所以 --redrop-every 开着时 mibps 不再是设备吞吐, 别拿去比。
+void drop_caches(int level) {
+    int fd = ::open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (fd < 0) die("open drop_caches(需要 root)");
+    ::sync();
+    char c = static_cast<char>('0' + level);
+    if (::write(fd, &c, 1) != 1) die("write drop_caches");
+    ::close(fd);
+}
+
 // slab 里 dentry / inode 的对象数:自变量有没有真的动, 全靠它。
 // probe 前后各读一次 —— drop_caches 之后如果这两个数没掉, 整个实验就是空转。
 void dump_slab_counts(const char* tag) {
@@ -223,6 +244,10 @@ void do_probe(const Config& c) {
 
     double wall0 = now_us();
     for (size_t k = 0; k < c.reads; ++k) {
+        // 重 drop 放在计时窗口之外 —— 它清的是内核缓存, 不该算进 open/read 的账。
+        // level 跟着本档的语义走:drop2 档要一直只丢 slab, drop3 档要连 page cache
+        if (c.redrop && k && k % c.redrop == 0) drop_caches(c.redrop_level);
+
         size_t idx = order[k % order.size()];
 
         if (c.layout == "files") {
@@ -271,6 +296,19 @@ void do_probe(const Config& c) {
     double open_h1 = mean_slice(t_open, 0, half);
     double open_h2 = mean_slice(t_open, half, t_open.size());
 
+    // 分桶衰减曲线(每 1/10 一桶)。前后两半只能告诉你"衰减了", 这条曲线
+    // 才能告诉你"衰减到哪儿收敛"—— 收敛值就是稳态的冷成本, 是能拿去和
+    // e2e 对账的那个数; 首桶则是"元数据全冷"的上界。
+    std::string decay = "[";
+    size_t nb = 10, bs = t_open.size() / nb;
+    for (size_t b = 0; bs > 0 && b < nb; ++b) {
+        char tmp[32];
+        std::snprintf(tmp, sizeof(tmp), "%s%.1f", b ? "," : "",
+                      mean_slice(t_open, b * bs, (b + 1) * bs));
+        decay += tmp;
+    }
+    decay += "]";
+
     Stats o = summarize(t_open), r = summarize(t_read), cl = summarize(t_close);
     double mib = static_cast<double>(c.reads) * c.block_size / (1 << 20);
 
@@ -279,11 +317,11 @@ void do_probe(const Config& c) {
         "{\"layout\":\"%s\",\"blocks\":%zu,\"reads\":%zu,\"block_size\":%zu,"
         "\"wall_s\":%.3f,\"mib\":%.1f,\"mibps\":%.1f,"
         "\"open_us\":{\"mean\":%.2f,\"p50\":%.2f,\"p99\":%.2f,\"max\":%.2f,\"total_ms\":%.1f,"
-        "\"first_half\":%.2f,\"second_half\":%.2f},"
+        "\"first_half\":%.2f,\"second_half\":%.2f,\"decay\":%s},"
         "\"read_us\":{\"mean\":%.2f,\"p50\":%.2f,\"p99\":%.2f,\"max\":%.2f,\"total_ms\":%.1f},"
         "\"close_us\":{\"mean\":%.2f,\"p50\":%.2f,\"p99\":%.2f,\"max\":%.2f,\"total_ms\":%.1f}}\n",
         c.layout.c_str(), c.blocks, c.reads, c.block_size, wall, mib, mib / wall,
-        o.mean, o.p50, o.p99, o.max, o.sum / 1e3, open_h1, open_h2,
+        o.mean, o.p50, o.p99, o.max, o.sum / 1e3, open_h1, open_h2, decay.c_str(),
         r.mean, r.p50, r.p99, r.max, r.sum / 1e3,
         cl.mean, cl.p50, cl.p99, cl.max, cl.sum / 1e3);
 
@@ -295,7 +333,10 @@ void usage() {
         "用法:\n"
         "  meta_probe build --dir D --layout files|slab [--blocks N] [--block-size B]\n"
         "  meta_probe probe --dir D --layout files|slab|slab-reopen [--blocks N]\n"
-        "                   [--block-size B] [--reads M] [--seed S]\n"
+        "                   [--block-size B] [--reads M] [--seed S] [--redrop-every N]\n"
+        "\n"
+        "--redrop-every N: 每读 N 次重新 drop_caches(需 root), 维持全程冷条件。\n"
+        "  不开的话冷态只存在于头 ~100 次读, 均值会被后面的热态稀释(实测 -85%%)。\n"
         "\n"
         "注意: slab 与 slab-reopen 共用同一份 build(--layout slab)。\n"
         "缓存条件(hot / drop2 / drop3)由外部 drop_caches 构造, 见 run_meta_probe.sh。\n");
@@ -315,6 +356,8 @@ int main(int argc, char** argv) {
         else if (k == "--blocks")     c.blocks = std::stoul(v);
         else if (k == "--block-size") c.block_size = std::stoul(v);
         else if (k == "--reads")      c.reads = std::stoul(v);
+        else if (k == "--redrop-every") c.redrop = std::stoul(v);
+        else if (k == "--redrop-level") c.redrop_level = std::stoi(v);
         else if (k == "--seed")       c.seed = std::stoull(v);
         else usage();
     }
