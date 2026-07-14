@@ -36,9 +36,15 @@ endif
 $(MODULE): $(SRCS) csrc/kv_tier_engine.hpp csrc/pool_tier_engine.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -shared $(SRCS) -o $@ -luring
 
+# 元数据面微基准(E1 冷组归因假说的因子分离实验, 见 bench/meta_probe.cpp)。
+# 独立程序, 不依赖 liburing / pybind —— 它量的是 open() 路径, 不是 IO 引擎。
+# 跑法需要 root: sudo bash bench/run_meta_probe.sh <数据目录>
+meta_probe: check bench/meta_probe.cpp
+	$(CXX) $(CXXFLAGS) bench/meta_probe.cpp -o meta_probe
+
 # 单测跑的是策略层(manager 账本逻辑), 用 FakeEngine, 任何平台可跑
 test:
 	$(PY) -m pytest test/ -v
 
 clean:
-	rm -f python/kv_uring_tier/_kvtier*.so
+	rm -f python/kv_uring_tier/_kvtier*.so meta_probe

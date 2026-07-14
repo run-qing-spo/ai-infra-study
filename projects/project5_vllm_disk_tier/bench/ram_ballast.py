@@ -134,6 +134,21 @@ def cache_room_bytes() -> int:
     return cg["limit"] - cg["anon"] - cg["shmem"]
 
 
+def avail_bytes() -> int:
+    """/proc/meminfo 的 MemAvailable:内核估的"不动 swap 能拿到多少"。
+
+    裸机 / 无 cgroup 上限的 VM 用这个当判据(meta_probe 的 ballast 档就是)。
+    它已经把可回收的 page cache 算进来了, 所以"MemAvailable ≤ 目标"等价于
+    "page cache + 空闲内存 < 目标"—— 正是要的压制条件。
+    容器里别用它:MemAvailable 读的是宿主数字, 和自己的 cgroup 配额差一个
+    数量级(AutoDL: 宿主 1TB vs 配额 120G), 那边老老实实用 --cache-room-gib。
+    """
+    mb = meminfo_mb("MemAvailable")
+    if mb is None:
+        sys.exit("/proc/meminfo 读不到 MemAvailable, --avail-gib 用不了(非 Linux?)")
+    return mb * 1024 * 1024
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gib", type=float,
@@ -141,9 +156,13 @@ def main() -> None:
     ap.add_argument("--cache-room-gib", type=float,
                     help="自适应模式: 填到 cgroup 配额里留给 page cache "
                          "的余量 ≤ 这个值(GiB)为止")
+    ap.add_argument("--avail-gib", type=float,
+                    help="自适应模式(裸机): 填到 /proc/meminfo MemAvailable "
+                         "≤ 这个值(GiB)为止。无 cgroup 上限的机器用它")
     args = ap.parse_args()
-    if (args.gib is None) == (args.cache_room_gib is None):
-        ap.error("--gib 和 --cache-room-gib 二选一")
+    modes = [args.gib, args.cache_room_gib, args.avail_gib]
+    if sum(m is not None for m in modes) != 1:
+        ap.error("--gib / --cache-room-gib / --avail-gib 三选一")
 
     avail0 = meminfo_mb("MemAvailable")
 
@@ -162,21 +181,27 @@ def main() -> None:
         # 每次咬 1GiB 再重新读余量:我们自己的匿名页也记在 anon 里,
         # 一边填一边收敛, 不需要预估 serve 占多少。填充会逼内核回收
         # cache, 越到后面越慢, 这是预期行为不是卡死。
-        target = int(args.cache_room_gib * GIB)
-        room0 = cache_room_bytes()
+        # 两种判据同一套收敛逻辑, 只换"余量怎么读":容器看 cgroup 配额,
+        # 裸机看 MemAvailable(理由见 avail_bytes 的 docstring)。
+        if args.cache_room_gib is not None:
+            room_of, goal, name = cache_room_bytes, args.cache_room_gib, "cache-room"
+        else:
+            room_of, goal, name = avail_bytes, args.avail_gib, "avail"
+        target = int(goal * GIB)
+        room0 = room_of()
         while True:
-            room = cache_room_bytes()
+            room = room_of()
             if room <= target:
                 break
             step = min(GIB, room - target)
             bufs.append(alloc_touched(step))
             total += step
             if total % (16 * GIB) < GIB:
-                print(f"  已填 {total / GIB:.0f} GiB, cache 余量 "
+                print(f"  已填 {total / GIB:.0f} GiB, {name} 余量 "
                       f"{room / GIB:.1f} GiB → 目标 {target / GIB:.1f} GiB",
                       flush=True)
-        tag = (f"cache-room {room0 / GIB:.1f} -> {cache_room_bytes() / GIB:.1f}"
-               f" GiB (目标 {args.cache_room_gib:g}, 填了 {total / GIB:.1f} GiB)")
+        tag = (f"{name} {room0 / GIB:.1f} -> {room_of() / GIB:.1f}"
+               f" GiB (目标 {goal:g}, 填了 {total / GIB:.1f} GiB)")
 
     locked = all(try_mlock(b, len(b)) for b in bufs) if bufs else False
     if not locked and swap_active():
