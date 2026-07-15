@@ -146,6 +146,39 @@ e4)
         "E4_uring_c|$CFG_URING|uring|1|-|0|$E4_MIXED"
     )
     ;;
+e6)
+    # E6 真实 trace 锚点(COMPARE_PLAN E6): 回放 Mooncake 生产 trace, 标定真实
+    # 多轮负载落在 E1~E4 扫出来的哪个区间。跑 mooncake_replay.py 而非
+    # long_context_ttft.py(run_group 按 $EXPERIMENT 选脚本)。
+    #
+    # 窗口 = toolagent_trace 前 150 条, 过滤 input_length>16384(真实 16k serve
+    # 也会拒)。选 toolagent 而非 conversation 的理由(dry-run 标定, 2026-07-15):
+    # conversation 装得下盘的窗口(~100 条)读/写只有 0.09 —— trace 开头全是冷首写,
+    # load 路径被饿死;toolagent 每请求 block 密度低一半(4.06 vs 7.5), 且工具/
+    # system 前缀复用前置, N=150 同时满足: 盘上界 27.6G < 36G 可用(留 8.6G)、
+    # 读/写 0.91(读写均衡, load 路径真被打到)、并发估计 p99 16/max 17(正好落在
+    # E3 的 c=16 档 —— uring 优势最大的 +39% 那一档)。conversation 降级为纯标定点
+    # (全 trace 坐标 读/写 0.57、并发 p99 13), 它的"窗口读饿死"本身写进报告。
+    #
+    # 盘上界 27.6G < uring disk_bytes 30G ⇒ 零逐出, 干净对照(E4 纪律)。fs 无上限
+    # 但 27.6G < 36G 可用, 装得下。block-words 480: 真 Qwen tokenizer 校准(400 词
+    # =426 token), 480 词 ≈511 token/块 ≈ Mooncake 真实 512-token 块, 盘上界估算
+    # 对齐。CPU tier 4G ≪ 27.6G 工作集 ⇒ 盘 tier 必被打到。output-cap 64: 主指标
+    # 是 TTFT/prefill(METRICS.md), decode 封顶省时且 E5 已证 decode 不分化。
+    #
+    # a/b/c 交替三次 serve: 回放确定性(同 trace/seed/block-words), a/b/c 是复现,
+    # 交替是让跨 serve 环境漂移不偏向任一 tier(E1 的教训)。每 serve 跑完即删,
+    # 峰值 27.6G 不共存。判据同 E1: revisit 期 iostat 读流量落在冷/热哪区间。
+    E6_ARGS="--trace traces/toolagent_trace.jsonl --max-input-tokens 16384 --max-requests 150 --block-words 480 --output-cap 64"
+    SPECS=(
+        "E6_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
+        "E6_uring_a|$CFG_URING|uring|1|-|0|$E6_ARGS"
+        "E6_fs_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
+        "E6_uring_b|$CFG_URING|uring|1|-|0|$E6_ARGS"
+        "E6_fs_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
+        "E6_uring_c|$CFG_URING|uring|1|-|0|$E6_ARGS"
+    )
+    ;;
 gil)
     # churn +10ms 悬案的证伪探针(COMPARE_PLAN E3 冻结段): 假说是 fs 的 store
     # 任务在 EngineCore 进程里以 Python 线程跑 open/write/replace, 每块 IO
@@ -179,7 +212,7 @@ legacy)
     )
     ;;
 *)
-    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / gil / legacy)" >&2
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / e6 / gil / legacy)" >&2
     exit 1
     ;;
 esac
@@ -403,7 +436,10 @@ run_group() {
     log "  跑负载..."
     local extra=()
     [ "$bench_args" != "-" ] && read -ra extra <<< "$bench_args"
-    timeout "$BENCH_TIMEOUT" python3 bench/long_context_ttft.py \
+    # E6 回放真实 trace, 换驱动脚本; 其余矩阵都是合成负载走 long_context_ttft
+    local bench_script="bench/long_context_ttft.py"
+    [ "$EXPERIMENT" = e6 ] && bench_script="bench/mooncake_replay.py"
+    timeout "$BENCH_TIMEOUT" python3 "$bench_script" \
         --model "$M" --json "$RES/group_$group.json" "${extra[@]}" \
         > "$RES/bench_$group.log" 2>&1
     local rc=$?
@@ -415,8 +451,11 @@ run_group() {
         # 把 phase 汇总和比值直接抄进 SUMMARY, 明早一眼能看
         # (revisit@N 带并发后缀, 模式不能再要求 revisit 后面紧跟空格;
         #  mixed 阶段的行是 " wave N" / mixed_revisit@N / mixed_churn / probe ITL)
-        grep -E "^(prime|churn|revisit|mixed|probe| wave)|/prime TTFT ratio" \
-            "$RES/bench_$group.log" | \
+        local sumpat='^(prime|churn|revisit|mixed|probe| wave)|/prime TTFT ratio'
+        # E6 是 mooncake_replay 的输出: 预检标定行(请求数/读写比/并发/盘上界) +
+        # TTFT 结果(all revisit / 前缀命中·未命中) + 超长丢弃/失败/警告
+        [ "$EXPERIMENT" = e6 ] && sumpat='超长丢弃|请求数|读/写|到达过程|KV 落盘|all revisit|前缀(命中|未命中)|失败请求|^警告'
+        grep -E "$sumpat" "$RES/bench_$group.log" | \
             while IFS= read -r l; do log "  $l"; done
         [ -z "${GROUP_STATUS[$group]:-}" ] && GROUP_STATUS[$group]="OK"
     else
@@ -468,6 +507,12 @@ python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
     || { log "uring 依赖检查失败: 先 make 编 .so;还不行就看上面 import 报错(vLLM 接口合同可能变了)"; fail=1; }
 [ -f bench/long_context_ttft.py ]    || { log "找不到 bench/long_context_ttft.py (要在项目根跑)"; fail=1; }
 [ -f bench/ram_ballast.py ]          || { log "找不到 bench/ram_ballast.py"; fail=1; }
+# E6 额外要 mooncake_replay.py 和 trace 文件 —— trace 没下会跑到一半才炸
+if [ "$EXPERIMENT" = e6 ]; then
+    [ -f bench/mooncake_replay.py ] || { log "找不到 bench/mooncake_replay.py (E6 要它回放)"; fail=1; }
+    for a in $E6_ARGS; do [ "$prev" = --trace ] && trace_file=$a; prev=$a; done
+    [ -f "$trace_file" ] || { log "找不到 E6 trace 文件 '$trace_file' (先下 toolagent_trace.jsonl 到 traces/)"; fail=1; }
+fi
 [ -d "$DATA" ]                       || { log "数据盘 $DATA 不存在"; fail=1; }
 pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉再来"; fail=1; }
 # 上一轮(或上一次脚本)被 -9 杀掉留下的 shm 存货, 起跑前清一次
