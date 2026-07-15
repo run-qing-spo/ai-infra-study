@@ -220,9 +220,13 @@ def report_ttft(name: str, xs: list[float]):
           f"p50={pct(xs,50)*1000:8.1f}ms  p99={pct(xs,99)*1000:8.1f}ms")
 
 
-def preflight(recs: list[dict], a: dict, args):
+def preflight(recs: list[dict], a: dict, args, n_dropped: int = 0, n_all: int = 0):
     """把标定量和盘占用上界打出来 —— dry-run 的主输出, 也是上机前的安检。"""
     print("═══ Mooncake trace 回放 · 预检 / 标定 ═══")
+    if n_dropped:
+        print(f"超长丢弃      {n_dropped}/{n_all} "
+              f"({100*n_dropped/n_all:.0f}%) input_length > "
+              f"{args.max_input_tokens} token(真实 16k serve 也会拒)")
     print(f"请求数        {a['n_req']}")
     print(f"时间跨度      {a['span_s']:.1f}s  (time-scale={args.time_scale}"
           f"{', 裁到 '+str(args.max_duration_s)+'s' if args.max_duration_s else ''})")
@@ -343,6 +347,12 @@ def main():
     ap.add_argument("--json", default=None, help="原始样本落到这个文件")
     ap.add_argument("--dry-run", action="store_true",
                     help="只解析+标定+安检, 不连 server, 不烧 GPU")
+    # 超长请求过滤:trace 的 input_length p99 可达 8w+ token, 远超 serve 的
+    # --max-model-len, 真发上去 vLLM 直接拒。丢弃它们反而更贴真实(16k serve
+    # 本来也拒), 顺带砍掉盘上界(巨请求贡献大量 block)。设成 max-model-len。
+    ap.add_argument("--max-input-tokens", type=int, default=0,
+                    help="丢弃 input_length 超过此值的请求, 0 = 不过滤;"
+                         "上机时设成 serve 的 --max-model-len(如 16384)")
     # 窗口裁剪:整条 trace 一小时、盘装不下, 得裁一段
     ap.add_argument("--time-scale", type=float, default=1.0,
                     help="到达时刻乘这个系数, <1 压缩加压, >1 拉长(默认 1 原速)")
@@ -371,11 +381,17 @@ def main():
     args = ap.parse_args()
 
     recs = load_trace(args.trace)
+    n_all = len(recs)
+    n_dropped = 0
+    if args.max_input_tokens:
+        # 过滤放在时间窗口之前:先按真实 context 上限筛, 再裁时间段
+        recs = [r for r in recs if r["input_length"] <= args.max_input_tokens]
+        n_dropped = n_all - len(recs)
     recs = window(recs, args)
     if not recs:
-        raise SystemExit("窗口内没有请求, 检查 --max-* 参数")
+        raise SystemExit("窗口内没有请求, 检查 --max-* / --max-input-tokens 参数")
     a = analyze(recs)
-    preflight(recs, a, args)
+    preflight(recs, a, args, n_dropped, n_all)
 
     if args.dry_run:
         return
