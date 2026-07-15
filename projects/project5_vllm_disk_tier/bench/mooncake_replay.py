@@ -307,8 +307,11 @@ def replay(recs: list[dict], args):
     # with 退出即 join 所有在飞请求
 
     if saturated.is_set():
-        print(f"警告: in-flight 触顶 {args.max_inflight}, 到达过程被压缩; "
-              f"提高 --max-inflight 重跑, 否则并发深度标定偏低")
+        # 在飞压到上限 = 客户端在限流。并发扫描里这是**故意**的(靠它把并发钉在
+        # c), 回放退化成闭环并发 c、trace 到达时序被改写 —— 是特性不是告警。
+        # 只有当你本意是"按原始到达率开环回放"时, 触顶才意味着并发标定偏低。
+        print(f"注: 在飞触顶 {args.max_inflight}, 已退化为闭环并发 "
+              f"{args.max_inflight}(到达时序被改写);扫并发时这是预期")
 
     ok = [s for s in samples if s and s.get("ttft") is not None]
     err = [s for s in samples if s and s.get("err")]
@@ -329,6 +332,32 @@ def replay(recs: list[dict], args):
     report_ttft("  前缀未命中(新建)", miss_ttft)
     if err:
         print(f"失败请求 {len(err)}/{len(recs)}: {err[0].get('err')!r} ...")
+
+    # 实测在飞并发 + 饱和自检(用每条的 t_wall..t_wall+total 做扫描线)。回答
+    # "这个 c 有没有把服务器压到饱和":实测并发钉死在 max-inflight、且 ttft 后半段
+    # 明显更慢(backlog 在涨) = 该档仍饱和, 它的 TTFT 量的是队列不是 tier, 不能用。
+    # 有这两行, 下次一眼看穿过载, 不用靠 fs≈uring 反推(上次那次废数据的教训)。
+    iv = [(s["t_wall"], s["t_wall"] + s["total"]) for s in ok]
+    ev = []
+    for lo, hi in iv:
+        ev.append((lo, 1))
+        ev.append((hi, -1))
+    ev.sort()
+    depth = 0
+    series = []
+    for _, d in ev:
+        depth += d
+        if d > 0:
+            series.append(depth)
+    if series:
+        print(f"实测在飞并发   p50={pct(series,50):.0f}  p99={pct(series,99):.0f}  "
+              f"max={max(series)}  (--max-inflight={args.max_inflight})")
+    by_sub = [s["ttft"] for s in sorted(ok, key=lambda s: s["t_wall"])]
+    if len(by_sub) >= 4:
+        h = len(by_sub) // 2
+        m1, m2 = statistics.mean(by_sub[:h]), statistics.mean(by_sub[h:])
+        flag = "  ← 后半明显更慢, backlog 在涨, 该档仍饱和" if m2 > 1.5 * m1 else ""
+        print(f"ttft 前半 {m1*1000:.0f}ms → 后半 {m2*1000:.0f}ms{flag}")
 
     if args.json:
         with open(args.json, "w") as f:

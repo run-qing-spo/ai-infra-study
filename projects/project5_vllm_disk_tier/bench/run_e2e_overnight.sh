@@ -166,18 +166,36 @@ e6)
     # 对齐。CPU tier 4G ≪ 27.6G 工作集 ⇒ 盘 tier 必被打到。output-cap 64: 主指标
     # 是 TTFT/prefill(METRICS.md), decode 封顶省时且 E5 已证 decode 不分化。
     #
-    # a/b/c 交替三次 serve: 回放确定性(同 trace/seed/block-words), a/b/c 是复现,
-    # 交替是让跨 serve 环境漂移不偏向任一 tier(E1 的教训)。每 serve 跑完即删,
-    # 峰值 27.6G 不共存。判据同 E1: revisit 期 iostat 读流量落在冷/热哪区间。
-    E6_ARGS="--trace traces/toolagent_trace.jsonl --max-input-tokens 16384 --max-requests 150 --block-words 480 --output-cap 64"
-    SPECS=(
-        "E6_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
-        "E6_uring_a|$CFG_URING|uring|1|-|0|$E6_ARGS"
-        "E6_fs_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
-        "E6_uring_b|$CFG_URING|uring|1|-|0|$E6_ARGS"
-        "E6_fs_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E6_ARGS"
-        "E6_uring_c|$CFG_URING|uring|1|-|0|$E6_ARGS"
-    )
+    # 并发扫描(2026-07-16 定): 开环按 trace 原始到达率回放会把单张 4090 灌爆 ——
+    # 150 条 ~5800-token 请求在 33s 内涌入, GPU 一步嚼不下, 攒成 150 深的调度队列,
+    # 实测 TTFT 19s 全是排队, tier 的 load 路径被彻底淹没, fs≈uring(还被 serve
+    # 单调漂移伪装成"fs 恒赢", 详见 git 历史那次废数据的归因)。根子是真实到达率
+    # 是一个集群的, 单卡跑不动 —— 这本身是 E6 的一条边界结论。
+    #
+    # 修法: 用 --max-inflight 把在飞并发压到 GPU 追得上的水位, 让 TTFT 量到的是
+    # tier 而非过载队列。但"哪个 c 才在饱和悬崖以下"不拍脑袋 —— 直接扫 c ∈
+    # {1,4,8,16}(= E3 的档), 画 TTFT-vs-c 曲线自己暴露拐点, 且能直接叠在 E3 的
+    # 合成曲线上, 顺带把"真实 toolagent 请求内容能否复现 E3 的 tier 分化"验掉。
+    # E3 已在同机测过 c≤16 稳定(revisit@8 749/559ms、@16 ~750ms, 非雪崩), 所以
+    # 悬崖预期在 16 之上; 扫描 + driver 的实测并发/ttft 爬升自检当场证实。
+    #
+    # 每个 (c) 一组新 serve: 同一 serve 内重放同一 trace 会命中已驻留的块(cache
+    # 污染, E3 那次靠 churn 挤回盘解决), 而 E6 没有 churn 相, 只能靠冷 serve 保证
+    # 每档都是冷→load。窗口/映射沿用前案(toolagent 150 条、过滤 16384、block-words
+    # 480、盘上界 27.6G < 36G 可用、CPU tier 4G ≪ 工作集 ⇒ 盘 tier 必被打到)。
+    # 每档两复现, 且第二复现把 tier 顺序对调(fs先→uring先), 抵消单调 serve 漂移
+    # (上一次 fs 恒排每对之首 + 上漂 = 假"fs 赢", 这次结构上消掉)。
+    E6_TRACE="traces/toolagent_trace.jsonl"
+    E6_BASE="--trace $E6_TRACE --max-input-tokens 16384 --max-requests 150 --block-words 480 --output-cap 64"
+    SPECS=()
+    for c in 1 4 8 16; do
+        a="$E6_BASE --max-inflight $c"
+        # 复现 a: fs 先; 复现 b: uring 先 —— 每档内 fs/uring 各当一次"队首"
+        SPECS+=("E6_c${c}_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$a")
+        SPECS+=("E6_c${c}_uring_a|$CFG_URING|uring|1|-|0|$a")
+        SPECS+=("E6_c${c}_uring_b|$CFG_URING|uring|1|-|0|$a")
+        SPECS+=("E6_c${c}_fs_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$a")
+    done
     ;;
 gil)
     # churn +10ms 悬案的证伪探针(COMPARE_PLAN E3 冻结段): 假说是 fs 的 store
@@ -454,7 +472,7 @@ run_group() {
         local sumpat='^(prime|churn|revisit|mixed|probe| wave)|/prime TTFT ratio'
         # E6 是 mooncake_replay 的输出: 预检标定行(请求数/读写比/并发/盘上界) +
         # TTFT 结果(all revisit / 前缀命中·未命中) + 超长丢弃/失败/警告
-        [ "$EXPERIMENT" = e6 ] && sumpat='超长丢弃|请求数|读/写|到达过程|KV 落盘|all revisit|前缀(命中|未命中)|失败请求|^警告'
+        [ "$EXPERIMENT" = e6 ] && sumpat='超长丢弃|请求数|读/写|到达过程|KV 落盘|all revisit|前缀(命中|未命中)|失败请求|实测在飞并发|ttft 前半|^注:'
         grep -E "$sumpat" "$RES/bench_$group.log" | \
             while IFS= read -r l; do log "  $l"; done
         [ -z "${GROUP_STATUS[$group]:-}" ] && GROUP_STATUS[$group]="OK"
@@ -510,8 +528,7 @@ python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
 # E6 额外要 mooncake_replay.py 和 trace 文件 —— trace 没下会跑到一半才炸
 if [ "$EXPERIMENT" = e6 ]; then
     [ -f bench/mooncake_replay.py ] || { log "找不到 bench/mooncake_replay.py (E6 要它回放)"; fail=1; }
-    for a in $E6_ARGS; do [ "$prev" = --trace ] && trace_file=$a; prev=$a; done
-    [ -f "$trace_file" ] || { log "找不到 E6 trace 文件 '$trace_file' (先下 toolagent_trace.jsonl 到 traces/)"; fail=1; }
+    [ -f "$E6_TRACE" ] || { log "找不到 E6 trace 文件 '$E6_TRACE' (先下 toolagent_trace.jsonl 到 traces/)"; fail=1; }
 fi
 [ -d "$DATA" ]                       || { log "数据盘 $DATA 不存在"; fail=1; }
 pgrep -f "vllm serve" >/dev/null && { log "已有 vllm serve 在跑, 先清掉再来"; fail=1; }
