@@ -119,9 +119,10 @@ class BlockText:
     def __call__(self, hid: int) -> str:
         t = self._cache.get(hid)
         if t is None:
-            # 用 (全局 seed, hid) 播种:换 --seed 能整体换一批文本(报告纪律里的
-            # "关键结论换 seed 重跑一遍确认不翻"), 但同一次运行里 id→文本稳定
-            rng = random.Random((self.seed, hid))
+            # 用 "seed:hid" 播种:换 --seed 能整体换一批文本(报告纪律里的
+            # "关键结论换 seed 重跑一遍确认不翻"), 但同一次运行里 id→文本稳定。
+            # 用 str 而非 tuple:Python 3.12 的 random 只收 int/float/str/bytes
+            rng = random.Random(f"{self.seed}:{hid}")
             t = " ".join(rng.choice(_VOCAB) for _ in range(self.block_words))
             self._cache[hid] = t
         return t
