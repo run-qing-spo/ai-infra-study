@@ -53,10 +53,14 @@ import argparse
 import gzip
 import json
 import random
+import re
 import statistics
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional      # 不用 `dict | None`:那是 3.10+ 语法, 而 dry-run
+                                 # 要在 Mac(python3 = 3.9)上跑; GPU 机是 3.12
 
 # 请求原语 one_request 复用现有 driver(同一套计时/流式掐 TTFT, 保证 E6 的数和
 # E1~E4 可比), 但它 import openai —— 只在 replay() 里惰性 import, 好让 --dry-run
@@ -71,6 +75,11 @@ def pct(xs, p):
 # 只有被逐出的 block 才真落盘, 所以 distinct_blocks × 28MiB 是磁盘占用的**上界**
 # (兜最坏, 沿用 E4 的容量纪律)。
 KV_MIB_PER_BLOCK = 28.0
+BLOCK_TOKENS = 512               # Mooncake 的 hash_id 粒度
+
+# E6 实测的 GPU KV cache 容量(serve 日志 kv_cache_utils.py:"GPU KV cache size:
+# 114,240 tokens", Qwen2.5-7B + 4090)。复用距离要跟它比才有意义。
+DEFAULT_GPU_CACHE_TOKENS = 114240
 
 # block 文本的词表:沿用 long_context_ttft 的常见词, 大多 1 词≈1 token, 便于
 # --block-words 直接逼近 512 token。词表大小无所谓, 确定性来自 per-id 播种。
@@ -171,6 +180,102 @@ def analyze(recs: list[dict]) -> dict:
     )
 
 
+def reuse_distances(recs: list[dict]) -> list[int]:
+    """LRU 栈距离:同一个 block 相邻两次访问之间, 隔了多少个**不同**的 block。
+
+    为什么是这个量(2026-07-17 加, E6 miss 归因的可证伪点):
+    读 vLLM 源码发现, offload tier 的 lookup 起点被钉在 GPU prefix cache 的命中
+    边界上 —— `start_block_idx = num_computed_tokens // offloaded_block_size`,
+    然后 `_maximal_prefix_lookup` 从那里往后扫, 第一个 MISS 就 break。而 Mooncake
+    的复用结构是"共享前缀 + 独有新后缀":GPU 只要吃掉了**全部**共享前缀, 边界之后
+    就永远是从没算过的新块, tier 必然查空、submit_load 一次都不会被调用。所以
+    tier 能否被激活, 取决于"共享前缀有没有被逐出 GPU", 而这正是栈距离在回答:
+        栈距离 < GPU 容量  ⟺  该次复用在 LRU 下命中 GPU  ⟹  tier 永远轮不到
+    这解释了 E6 实测的 c=1 盘读 0.00GB / load_bytes 精确 0 字节。
+
+    口径与近似(别当精确模型用):
+      - 距离单位是 512-token block(Mooncake 的 hash_id 粒度), ×512 得 token 数;
+        vLLM 真实的逐出粒度是 16-token block, 这里只做量级判断。
+      - vLLM v1 的 GPU prefix cache 不是纯 LRU(free block queue 近似 FIFO,
+        cached 块可被重新分配), 所以这是**近似**判据: 栈距离远小于容量 ⟹ 几乎
+        必然命中; 远大于 ⟹ 几乎必然逐出; 骑在容量附近的那部分说不准。
+      - 只算 prompt 侧的 block 复用, 不含 decode 产生的 KV(trace 无文本, 且
+        E6 的 output 被 --output-cap 封到 64 token, 对容量的影响是二阶的)。
+
+    经典 Fenwick tree(BIT)算法, O(n log n):BIT 里只在"每个 block 的最后一次
+    访问位置"记 1, 于是 (上次位置, 当前位置) 开区间的和 = 中间的 distinct 数。
+    """
+    accesses = [h for r in recs for h in r["hash_ids"]]
+    n = len(accesses)
+    if n == 0:
+        return []
+    tree = [0] * (n + 1)
+
+    def upd(i: int, v: int) -> None:
+        i += 1
+        while i <= n:
+            tree[i] += v
+            i += i & -i
+
+    def qry(i: int) -> int:            # 前缀和 [0, i]
+        i += 1
+        s = 0
+        while i > 0:
+            s += tree[i]
+            i -= i & -i
+        return s
+
+    last: dict[int, int] = {}
+    out: list[int] = []
+    for t, b in enumerate(accesses):
+        p = last.get(b)
+        if p is not None:
+            out.append(qry(t - 1) - qry(p))   # (p, t) 开区间的 distinct 数
+            upd(p, -1)                        # 旧位置退休, 只保留最后一次
+        upd(t, 1)
+        last[b] = t
+    return out
+
+
+# 窗口要能标定 load 路径, 至少得有这个比例的复用距离超出 GPU 容量。5% 是工程判断
+# 不是理论值:E6 窗口是 0.0%(测出来 tier 零激活), 全 trace 是 17.9%。低于 5% 时
+# 即便偶有激活也是零星几次, 撑不起 TTFT 对比。
+MIN_TIER_REACHABLE = 0.05
+
+
+def report_reuse_distance(recs: list[dict], gpu_cache_tokens: int) -> bool:
+    """把栈距离分布对着 GPU 容量报, 回答"tier 有没有机会被用上"。
+
+    Returns: True 如果这个窗口够得着磁盘 tier 的 load 路径。
+    """
+    d = reuse_distances(recs)
+    print()
+    print("── 复用距离 · 磁盘 tier 有没有机会被激活 ──")
+    if not d:
+        print("无复用, 不适用")
+        return False
+    cap_blocks = gpu_cache_tokens / BLOCK_TOKENS
+    print(f"LRU 栈距离(两次访问同一 block 之间隔了多少 distinct block):")
+    print(f"  p50={pct(d,50):.0f}  p90={pct(d,90):.0f}  p99={pct(d,99):.0f}  "
+          f"max={max(d)} block")
+    print(f"GPU prefix cache 容量 {gpu_cache_tokens} token = {cap_blocks:.0f} block")
+    inside = sum(1 for x in d if x < cap_blocks)
+    out = len(d) - inside
+    print(f"  距离 < GPU 容量: {inside}/{len(d)} ({100*inside/len(d):.1f}%)"
+          f"  ← 命中 GPU, **永远轮不到 tier**")
+    print(f"  距离 > GPU 容量: {out}/{len(d)} "
+          f"({100*out/len(d):.1f}%)  ← 只有这部分才可能打到 tier")
+    if max(d) < cap_blocks:
+        print(f"!! 连 max({max(d)}) 都够不着容量线({cap_blocks:.0f}) —— 预测磁盘 tier")
+        print("!! 的 load 路径**一次都不会**被激活。2026-07-16 实测正是如此:"
+              "c=1 的")
+        print("!! load_bytes = 0 字节、md0 读 0.00GB。")
+    elif out / len(d) < MIN_TIER_REACHABLE:
+        print(f"!! 只有 {100*out/len(d):.1f}% 的复用够得着 tier(<{100*MIN_TIER_REACHABLE:.0f}%)"
+              f" —— 这个窗口标定不了 load 路径。")
+    return out / len(d) >= MIN_TIER_REACHABLE
+
+
 def estimate_concurrency(recs: list[dict], service_s: float) -> list[int]:
     """把每条请求摊成 [到达, 到达+service_s] 的占用区间, 扫描线数并发深度。
 
@@ -221,6 +326,74 @@ def report_ttft(name: str, xs: list[float]):
           f"p50={pct(xs,50)*1000:8.1f}ms  p99={pct(xs,99)*1000:8.1f}ms")
 
 
+# ── tier 激活哨兵 ────────────────────────────────────────────────────────────
+# 2026-07-17 加。教训:2026-07-16 那轮 16 组全跑完、TTFT 报得漂漂亮亮,事后拿
+# iostat 核验才发现盘读 ≈ 0、tier 的 load 路径**从没被激活过** —— 脚本对"自己的
+# 测量对象在不在"完全无感,报的全是 GPU 排队。E3 的饱和自检(§339)是同一型的教训:
+# 有效性哨兵必须由脚本当场喊出来,不能靠人事后反推。
+#
+# 判据分两层,分别对应"能判"和"判不了":
+#   (1) load_bytes ≈ 0  → tier 整体(CPU primary + 磁盘 secondary)一次都没被读过。
+#       这是铁证, 脚本自己就能判死, 本轮 TTFT 与 tier 读路径无关。
+#   (2) load_bytes > 0  → 打到了 tier, 但**其中多少真落到盘上**这里判不了 ——
+#       load_bytes 是 CPU+盘的合账, 命中 CPU tier 不产生任何盘 IO。要分开只能
+#       t_wall × iostat 对齐(bench/e6_xcheck.py), 所以这里只提示、不宣判。
+OFFLOAD_METRIC_RE = re.compile(
+    r"^(vllm:kv_offload_\w+?)(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$")
+
+
+def scrape_offload_metrics(base_url: str) -> Optional[dict]:
+    """从 vLLM 的 /metrics 抓 KV offload 计数器。抓不到返回 None(绝不阻塞回放)。"""
+    url = base_url.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/metrics", timeout=5) as r:
+            txt = r.read().decode()
+    except Exception as e:
+        print(f"注: /metrics 抓取失败({e!r}), tier 激活哨兵本轮跳过")
+        return None
+    out: dict[str, float] = {}
+    for line in txt.splitlines():
+        if line.startswith("#"):
+            continue
+        m = OFFLOAD_METRIC_RE.match(line)
+        if m:                       # 多 engine 时同名指标多行, 累加
+            out[m.group(1)] = out.get(m.group(1), 0.0) + float(m.group(2))
+    return out
+
+
+def report_tier_activation(m0: Optional[dict], m1: Optional[dict],
+                           expect_read_blocks: int):
+    """回放前后的 counter 差 = 本轮真实搬运量。回答"tier 被打到了没有"。"""
+    if m0 is None or m1 is None:
+        return
+    d = {k: m1.get(k, 0.0) - v for k, v in m0.items()}
+    load = d.get("vllm:kv_offload_load_bytes", 0.0)
+    store = d.get("vllm:kv_offload_store_bytes", 0.0)
+    expect = expect_read_blocks * KV_MIB_PER_BLOCK * 2**20
+    print()
+    print("── 有效性哨兵:tier 的 load 路径被激活了吗 ──")
+    print(f"本轮 tier load {load/2**30:6.2f} GiB   store {store/2**30:6.2f} GiB"
+          f"   (trace 结构预期读 {expect/2**30:.2f} GiB)")
+    if expect <= 0:
+        return
+    frac = load / expect
+    if frac < 0.05:
+        print(f"!! tier LOAD 路径未激活(实测/预期 = {frac:.1%})——复用被 GPU "
+              f"prefix cache / CPU tier 截留在上层了。")
+        print("!! 本轮 TTFT 量的是 GPU 排队与 store 路径, **不反映 tier 读路径**,")
+        print("!! 不能用来比较 fs/uring 的 load 性能。要激活它需要逐出压力")
+        print("!! (churn 那类持续写流), 光有 trace 结构上的前缀复用不够。")
+    elif frac < 0.5:
+        print(f"?  tier load 只有预期的 {frac:.1%} —— 大部分复用被上层截留,"
+              f" 结论要按这个比例打折。")
+    else:
+        print(f"OK tier load = 预期的 {frac:.1%}。注意:这是 CPU tier + 磁盘 tier"
+              f" 的合账,其中多少真落到盘上要 t_wall×iostat 对齐才知道")
+        print("   (bench/e6_xcheck.py),命中 CPU tier 不产生任何盘 IO。")
+
+
 def preflight(recs: list[dict], a: dict, args, n_dropped: int = 0, n_all: int = 0):
     """把标定量和盘占用上界打出来 —— dry-run 的主输出, 也是上机前的安检。"""
     print("═══ Mooncake trace 回放 · 预检 / 标定 ═══")
@@ -243,9 +416,17 @@ def preflight(recs: list[dict], a: dict, args, n_dropped: int = 0, n_all: int = 
           f"读/写 = {a['rw_ratio']:.2f}")
     rd = a["reuse_depth"]
     hit = [d for d in rd if d > 0]
-    print(f"命中前缀的请求 {len(hit)}/{a['n_req']} ({100*len(hit)/a['n_req']:.0f}%)  "
+    print(f"复用前缀的请求 {len(hit)}/{a['n_req']} ({100*len(hit)/a['n_req']:.0f}%)  "
           f"复用深度 mean={statistics.mean(rd):.1f} block  "
           f"p99={pct(rd,99):.0f} block" if a["n_req"] else "")
+    # 这个"读"是 trace 结构上的**逻辑**复用, 不是盘读。中间隔着 GPU prefix cache
+    # 和 CPU tier 两层截留 —— 2026-07-16 实测:逻辑读/写 0.91 的窗口, 物理盘读
+    # ≈ 0(tier load_bytes 在 c=1 是 0 字节), 复用全被上层吃掉。磁盘 tier 的激活
+    # 开关是**逐出压力**, 不是复用率。离线标定看不见这一层, 别拿它预测盘负载。
+    print("  ↑ 逻辑复用(trace 结构), **不等于**盘读:GPU prefix cache / CPU tier")
+    print("    会截留大部分复用。真实盘读要上机 + iostat 对齐才知道(见 E6 核验)。")
+    print()
+    reuse_ok = report_reuse_distance(recs, args.gpu_cache_tokens)
     print()
     print("── 标定量 (2) 并发 load 深度 · 对到 E3 档 {1,4,8,16} ──")
     series = estimate_concurrency(recs, args.service_s)
@@ -258,9 +439,35 @@ def preflight(recs: list[dict], a: dict, args, n_dropped: int = 0, n_all: int = 
     print(f"KV 落盘上界   {a['disk_upper_mib']/1024:.1f} GiB "
           f"= {a['distinct_blocks']} block × {KV_MIB_PER_BLOCK:.0f} MiB")
     budget = args.disk_budget_gib
-    verdict = "OK" if a["disk_upper_mib"]/1024 <= budget else "!! 超预算, 缩窗口或加盘"
+    disk_ok = a["disk_upper_mib"] / 1024 <= budget
+    verdict = "OK" if disk_ok else "!! 超预算, 缩窗口或加盘"
     print(f"盘预算        {budget} GiB   → {verdict}")
     print(f"（uring 若要零逐出, --disk-bytes 需 ≥ 上界；fs 无上限但盘要装得下）")
+
+    # ── 窗口判据汇总 ────────────────────────────────────────────────────────
+    # 2026-07-17 加, 直接来自 E6 的教训:当年选窗口只看了 (1) 盘装得下 + 读写比
+    # 均衡, 漏掉 (2), 结果 16 组、一整夜跑完, 核验才发现 tier 的 load 路径一次
+    # 都没被激活 —— 窗口从一开始就结构性地测不了它要测的东西。两条判据是**反向**
+    # 的:窗口越长, 复用距离越够得着 tier, 盘越装不下。中间不一定有解, 没解就得
+    # 承认这个尺度测不了, 而不是挑个装得下的窗口自欺。
+    print()
+    print("── 窗口判据汇总(要标定 load 路径, 前两条必须同时过)──")
+    print(f"  (1) 盘装得下           {'OK' if disk_ok else '!! 不过'}")
+    print(f"  (2) 复用距离够得着 tier {'OK' if reuse_ok else '!! 不过'}")
+    if disk_ok and reuse_ok:
+        print("  → 可上机标定 load 路径。上机后仍要看回放末尾的 tier 激活哨兵"
+              "(真值), 这里只是离线预测。")
+    elif not reuse_ok:
+        print("  → **不可用于标定 load 路径**:复用会被 GPU prefix cache 全吃掉,")
+        print("     跑出来的 TTFT 量的是 GPU 排队与 store 路径, 不是 tier 读路径。")
+        print("     加窗口长度能拉长复用距离, 但盘上界会同比涨 —— 先确认有解。")
+    else:
+        print("  → 盘装不下:缩窗口, 但缩完要回来重看 (2), 别把 tier 缩没了。")
+    if args.max_input_tokens == 0:
+        print()
+        print("!! --max-input-tokens=0(未过滤):上机时 serve 会拒掉超长请求, 这份")
+        print("!! 标定与实跑口径**不符**, 取到的根本不是同一批请求。实跑必须设成")
+        print("!! serve 的 --max-model-len(E6 = 16384)。")
 
 
 def replay(recs: list[dict], args):
@@ -295,6 +502,7 @@ def replay(recs: list[dict], args):
 
     print(f"开环回放 {len(recs)} 条, 峰值 in-flight 上限 {args.max_inflight} "
           f"(命中=复现相位被压缩就调大它)")
+    m0 = scrape_offload_metrics(args.base_url)   # tier 激活哨兵:回放前的基线
     t_start = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.max_inflight) as ex:
         for idx, r in enumerate(recs):
@@ -313,25 +521,38 @@ def replay(recs: list[dict], args):
         print(f"注: 在飞触顶 {args.max_inflight}, 已退化为闭环并发 "
               f"{args.max_inflight}(到达时序被改写);扫并发时这是预期")
 
+    m1 = scrape_offload_metrics(args.base_url)   # tier 激活哨兵:回放后
+
     ok = [s for s in samples if s and s.get("ttft") is not None]
     err = [s for s in samples if s and s.get("err")]
     ttfts = [s["ttft"] for s in ok]
     print()
     report_ttft("all revisit TTFT", ttfts)
-    # 命中前缀 vs 未命中 分开报:前者打的才是 tier 的 load 路径
+    # 按 trace 结构分:这条请求的前导 block 之前出现过没有。
+    #
+    # 注意这是**纯客户端的 trace 分析** —— 只看 hash_ids 的复用结构, 全程不碰
+    # vLLM, 不看任何 tier 状态。所以它答的是"这条请求在 trace 里复用了前缀吗",
+    # **不是**"它打到 tier 了吗"。原标签写的是"前缀命中(打 tier)", 是错的:复用
+    # 可以命中 GPU prefix cache、CPU tier、磁盘 tier 任意一层, 这段代码一层都分
+    # 不出来。2026-07-16 实测正是被这个标签坑了 —— 147/150 "命中", 而 tier 的
+    # load_bytes 是 0 字节, 复用全被 GPU prefix cache 吃掉了。要知道打没打 tier
+    # 看下面的激活哨兵, 要知道打没打盘看 bench/e6_xcheck.py。
     seen: set = set()
-    hit_ttft, miss_ttft = [], []
+    reuse_ttft, first_ttft = [], []
     for idx, r in enumerate(recs):
         s = samples[idx]
         lead = any(h in seen for h in r["hash_ids"][:1])  # 有前导复用
         for h in r["hash_ids"]:
             seen.add(h)
         if s and s.get("ttft") is not None:
-            (hit_ttft if lead else miss_ttft).append(s["ttft"])
-    report_ttft("  前缀命中(打 tier)", hit_ttft)
-    report_ttft("  前缀未命中(新建)", miss_ttft)
+            (reuse_ttft if lead else first_ttft).append(s["ttft"])
+    report_ttft("  前缀复用(trace 结构)", reuse_ttft)
+    report_ttft("  前缀首现(必然全算)", first_ttft)
     if err:
         print(f"失败请求 {len(err)}/{len(recs)}: {err[0].get('err')!r} ...")
+
+    # 预期读量按 trace 结构算(复现的 block 数),哨兵拿它当分母
+    report_tier_activation(m0, m1, analyze(recs)["read_blocks"])
 
     # 实测在飞并发 + 饱和自检(用每条的 t_wall..t_wall+total 做扫描线)。回答
     # "这个 c 有没有把服务器压到饱和":实测并发钉死在 max-inflight、且 ttft 后半段
@@ -408,6 +629,10 @@ def main():
                     help="dry-run 估并发深度用的名义服务时长(E3 c=8 一波量级)")
     ap.add_argument("--disk-budget-gib", type=float, default=30.0,
                     help="盘预算, 落盘上界超了就报警(E4 用 30G)")
+    ap.add_argument("--gpu-cache-tokens", type=int, default=DEFAULT_GPU_CACHE_TOKENS,
+                    help="GPU KV cache 容量(token), 复用距离拿它当判据。默认取 E6 "
+                         "宿主实测值; 换模型/换卡要照 serve 日志的 "
+                         "'GPU KV cache size' 改")
     args = ap.parse_args()
 
     recs = load_trace(args.trace)
