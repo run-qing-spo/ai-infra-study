@@ -6,6 +6,7 @@
 # 引擎本体(io_uring 数据面)的验证在 GPU 机器上:
 #   make && python3 bench/bench_engine.py --smoke
 
+import json
 import sys
 from pathlib import Path
 
@@ -57,6 +58,11 @@ class FakeEngine:
 
     def stats(self):
         return {}
+
+    def drain_records(self):
+        # 真引擎的 per-job 账本在 C++ 侧;策略层单测只要求接口在
+        # (manager 构造时 hasattr 检查, 忘重编 .so 会当场炸)
+        return []
 
 
 class MgrWithFakeEngine(UringSecondaryTierManager):
@@ -181,3 +187,65 @@ def test_engine_ring_full_rolls_back(mgr):
     assert results == {1: False}
     assert len(mgr._free) == NUM_SLOTS
     assert b"k1" not in mgr._storing
+
+
+def test_counter_funnel(mgr):
+    # E2 账本:offered → filtered/rejected → first/rewrite 的漏斗必须闭合,
+    # 这是吸收率对比(uring vs fs 文件账)的口径基础
+    for i in range(NUM_SLOTS):
+        store(mgr, i, [f"k{i}".encode()], [i % 8])
+    finish(mgr)
+    c = mgr._counters
+    assert c["store_blocks_offered"] == NUM_SLOTS
+    assert c["store_blocks_first"] == NUM_SLOTS
+
+    store(mgr, 10, [b"k0"], [0])            # 已在盘 → filter
+    assert c["store_blocks_filtered"] == 1
+
+    store(mgr, 11, [b"new"], [0])           # 满 → 逐出 LRU 头 k0(最老)
+    finish(mgr)
+    assert c["evicted_blocks"] == 1
+    assert c["store_blocks_first"] == NUM_SLOTS + 1
+
+    store(mgr, 12, [b"k0"], [1])            # 被逐出的 k0 回来 → 重写
+    finish(mgr)
+    assert c["store_blocks_rewrite"] == 1
+    # 唯一块口径:_ever_stored 只进不出, k0 重写不重复计
+    assert len(mgr._ever_stored) == NUM_SLOTS + 1
+
+    mgr.lookup(b"k0", None)                 # hit
+    mgr.lookup(b"ghost", None)              # miss
+    assert c["lookup_hit"] >= 1 and c["lookup_miss"] >= 1
+
+
+def test_capacity_reject_counted(mgr):
+    for i in range(NUM_SLOTS):
+        store(mgr, i, [f"k{i}".encode()], [i % 8])
+    finish(mgr)
+    for i in range(NUM_SLOTS):              # 全部 pin 住 → 逐无可逐
+        load(mgr, 50 + i, [f"k{i}".encode()], [i % 8])
+    store(mgr, 100, [b"new"], [0])
+    assert mgr._counters["store_jobs_rejected_capacity"] == 1
+    assert mgr._counters["store_blocks_rejected_capacity"] == 1
+    # load 侧计数(fixture 的 load 都带 is_promotion=True)
+    assert mgr._counters["load_jobs_promotion"] == NUM_SLOTS
+
+
+def test_stats_dump_on_shutdown(tmp_path):
+    buf = memoryview(bytearray(8 * BLOCK)).cast("B", (8, BLOCK))
+    m = MgrWithFakeEngine(
+        offloading_spec=None,
+        primary_kv_view=buf,
+        tier_type="uring",
+        path=str(tmp_path / "kv.bin"),
+        disk_bytes_to_use=NUM_SLOTS * BLOCK,
+    )
+    store(m, 1, [b"k1"], [0])
+    m._engine.complete_all()
+    list(m.get_finished_jobs())
+    m.shutdown()
+    # 账本文件在 backing 旁边, backing 本身被 shutdown 删掉(不存在也无妨)
+    data = json.loads((tmp_path / "kv.bin.stats.json").read_text())
+    assert data["counters"]["store_blocks_first"] == 1
+    assert data["gauges"]["present_blocks"] == 1
+    assert data["job_records"]["schema"][0] == "job_id"

@@ -57,11 +57,31 @@ struct JobDesc {
     uint64_t job_id;
     bool     is_write;              // true: store(内存→盘)  false: load(盘→内存)
     std::vector<BlockXfer> xfers;
+    // per-job 账本的提交侧字段, submit() 里填, 调用方不用管
+    double   t_submit = 0.0;        // CLOCK_REALTIME 秒
+    uint32_t q_jobs_at_submit = 0;  // 提交时已在途的 job 数(不含自己)
 };
 
 struct JobResult {
     uint64_t job_id;
     bool     success;               // 任一 block 短读/短写/errno 即 false
+};
+
+// per-job 账本(COMPARE_PLAN E2 工具缺口之二):每个 job 完成时记一条,
+// Python 侧 drain_records() 低频批量取走。时间戳统一 CLOCK_REALTIME 的
+// 秒 —— 必须能和 bench 的 t_wall(time.time())、iostat 时间轴直接对齐,
+// 这是"+10ms 通路定位不能靠 iostat 从外面猜"的前提。两段分解:
+//   queue   = t_first_issue - t_submit(SPSC 排队 + worker 忙 + gather 等待)
+//   service = t_done - t_first_issue(ring 里飞的时间, 含 io-wq punt)
+struct JobRecord {
+    uint64_t job_id;
+    bool     is_write;
+    uint32_t n_blocks;
+    double   t_submit;               // 调度线程 push 进 in_q_ 的时刻
+    double   t_first_issue;          // worker 首次为它向 ring 下发的时刻
+    double   t_done;                 // 最后一个 block 落定的时刻
+    uint32_t q_jobs_at_submit;       // 提交时已在途的 job 数(不含自己)
+    uint32_t dev_inflight_at_issue;  // 首次下发时设备在飞的 block 数
 };
 
 // fallocate 预留出来的 extent 是 unwritten 状态, 首写要做状态转换(元数据
@@ -73,6 +93,11 @@ struct JobResult {
 // 2.2GB/s 约 9s), 一次性启动开销, 顺带兼当"盘真的能写"的启动自检。
 // 同步 pwrite、不走 ring:不污染 EngineStats 的 bench 记账。
 void prewarm_file(int fd, uint64_t file_bytes);
+
+// 账本时钟(两个引擎共用, 同 prewarm_file 的共享模式)。CLOCK_REALTIME
+// 而非 steady:NTP 步进的精度损失对 ms 级分析无感, 换来和 bench 的
+// t_wall(time.time())、iostat 时间轴零换算对齐。
+double now_realtime();
 
 // 全部单调递增, 调度线程读个近似值做观测就够了
 struct EngineStats {
@@ -117,6 +142,10 @@ public:
 
     EngineStats stats() const;
 
+    // 取走并清空已完成 job 的账本。调用方(Python dump 循环)~10s 来一次,
+    // 低频, 锁开销可忽略。
+    std::vector<JobRecord> drain_records();
+
 private:
     void worker_loop();
 
@@ -145,6 +174,12 @@ private:
                           st_jobs_failed_{0}, st_ops_completed_{0},
                           st_bytes_written_{0}, st_bytes_read_{0},
                           st_submit_calls_{0}, st_sq_full_events_{0};
+
+    // per-job 账本:worker 在 finish_job 时 push(每 job 一次, 不在 block
+    // 热路径), Python 低频 drain。一把小锁最简单可靠, 不值得上第三条 SPSC
+    // (SPSC 定容会丢账, 账本丢一条对不上 jobs_submitted 就没法对账了)。
+    std::mutex             records_mu_;
+    std::vector<JobRecord> records_;
 
     std::thread worker_;
 };

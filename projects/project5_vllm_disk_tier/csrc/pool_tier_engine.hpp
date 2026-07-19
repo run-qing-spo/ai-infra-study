@@ -61,6 +61,11 @@ public:
 
     EngineStats stats() const;
 
+    // per-job 账本, 语义同 KvTierEngine::drain_records(pybind 模板要求两个
+    // 引擎接口同构)。"first issue" 在本引擎 = 第一个 block 被 worker 拿起
+    // 做同步 IO 的时刻;dev_inflight = 此刻正在 IO 里的 block 数(= 忙线程数)。
+    std::vector<JobRecord> drain_records();
+
 private:
     void worker_loop();
 
@@ -69,6 +74,13 @@ private:
         uint64_t job_id;
         uint32_t remaining;        // 还没落定的 block 数
         bool     failed = false;
+        // per-job 账本字段(kv_tier_engine.hpp 的 JobRecord 注释)
+        bool     is_write = false;
+        uint32_t n_blocks = 0;
+        double   t_submit = 0.0;
+        double   t_first_issue = 0.0;   // 0 = 还没有 worker 碰过它
+        uint32_t q_jobs_at_submit = 0;
+        uint32_t dev_inflight_at_issue = 0;
     };
     // 一个 block 的搬运任务 = worker 的抢单粒度。
     struct BlockTask {
@@ -91,10 +103,15 @@ private:
     std::deque<BlockTask> tasks_;
     std::unordered_map<uint64_t, JobState> jobs_;
     std::deque<JobResult> results_;
+    // 完成 job 的账本(挂在 mu_ 下, 不另设锁 —— 本引擎三件套本来就共一把锁,
+    // records 的读写全在既有临界区里, 顺路)
+    std::vector<JobRecord> records_;
     uint64_t next_seq_ = 0;
 
     std::atomic<uint64_t> pending_jobs_{0};
     std::atomic<bool>     stop_{false};
+    // 正在同步 IO 里的 block 数(锁外自增减, 只做 dev_inflight 快照观测)
+    std::atomic<uint32_t> io_inflight_{0};
 
     // stats 用 relaxed atomic:观测量, 不参与同步(同 KvTierEngine)。
     // 注意 submit_calls 在本引擎的语义是 pread/pwrite 调用数 = 每 block

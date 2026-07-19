@@ -21,9 +21,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from collections import OrderedDict
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -167,6 +169,29 @@ class UringSecondaryTierManager(SecondaryTierManager):
         # 没经过引擎就地完成/失败的 job 结果
         self._local_results: list[JobResult] = []
 
+        # ---- E2 观测账本(COMPARE_PLAN E2 节的三件工具缺口) ----
+        # 唯一块口径:_ever_stored 只进不出(逐出也不删), 于是
+        # counters["store_blocks_first"] 的累计值 = 累计唯一块数 —— 和 fs 的
+        # 文件账同口径(fs 无逐出, 文件集合天然 = 唯一块集合)。引擎的
+        # bytes_written 是物理口径, 含逐出后重写(E3 的 2.9x 写放大就混在
+        # 里面), 不能当吸收率的分子。
+        self._ever_stored: set[OffloadKey] = set()
+        # 漏斗计数:offered → filtered / 容量拒 / 环满拒 → 首写 / 重写 / IO 失败。
+        # "上层静默丢块"在这层数不到(丢弃发生在 vLLM 侧, 调用根本不来),
+        # 证伪靠两头对账:bench 算的 churn 产出块数 vs 这里的 offered。
+        self._counters: Counter = Counter()
+        # 引擎 per-job 账本的 Python 侧缓存(drain_records 批量取走后攒着)
+        self._job_records: list[tuple] = []
+        # 初始化成"现在", 让第一次落盘发生在启动 _DUMP_INTERVAL_S 之后 ——
+        # 单测(毫秒级)永远不会触发周期 dump, 不往 /tmp 撒文件
+        self._last_dump: float = time.monotonic()
+        self._dump_warned: bool = False
+        # 忘了重编 .so 就当场炸在 serve 启动, 别让 E2 跑完一轮才发现账本是空的
+        if not hasattr(self._engine, "drain_records"):
+            raise RuntimeError(
+                "engine has no drain_records(): stale _kvtier .so, rebuild (make)"
+            )
+
         logger.info(
             "UringSecondaryTierManager: %d slots x %d bytes at %s "
             "(odirect=%s, prewarm=%s)",
@@ -207,11 +232,17 @@ class UringSecondaryTierManager(SecondaryTierManager):
 
     # 返回值合同(tiering/base.py): True=在盘上, False=不在, None=在途稍后再问
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+        # 三态计数是 promotion 对账的一半:lookup 答过 hit 的块数减去实际
+        # 来的 load 块数 = 上层放弃的 promotion(CPU tier 满时 vLLM 的
+        # _initiate_promotion 直接判 MISS, 不会调到这层)。
         if key in self._present:
+            self._counters["lookup_hit"] += 1
             return True
         if key in self._storing:
             # 正在落盘:数据此刻还在 primary(框架 pin 着), 让框架稍后再问
+            self._counters["lookup_retry"] += 1
             return None
+        self._counters["lookup_miss"] += 1
         return False
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -221,12 +252,16 @@ class UringSecondaryTierManager(SecondaryTierManager):
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
+        self._counters["store_blocks_offered"] += len(job_metadata.keys)
         # 已在盘上/在途的 block 不重写(接口要求第 1 条:filter)
         todo = [
             (k, int(bid))
             for k, bid in zip(job_metadata.keys, job_metadata.block_ids)
             if k not in self._present and k not in self._storing
         ]
+        self._counters["store_blocks_filtered"] += (
+            len(job_metadata.keys) - len(todo)
+        )
         if not todo:
             self._local_results.append(JobResult(job_id=job_id, success=True))
             return
@@ -235,6 +270,8 @@ class UringSecondaryTierManager(SecondaryTierManager):
         if slots is None:
             # 满且逐无可逐(全被 in-flight pin 住)→ 拒绝这个 job。
             # 上层的兜底是这些 block 留在 primary 或被丢弃后 recompute。
+            self._counters["store_jobs_rejected_capacity"] += 1
+            self._counters["store_blocks_rejected_capacity"] += len(todo)
             self._local_results.append(JobResult(job_id=job_id, success=False))
             return
 
@@ -244,6 +281,8 @@ class UringSecondaryTierManager(SecondaryTierManager):
             self._storing[k] = s
         if not self._engine.submit_store(job_id, slots, bids):
             # 引擎入口环满(1023 个在途 job 才会发生):回滚并报失败
+            self._counters["store_jobs_rejected_ring"] += 1
+            self._counters["store_blocks_rejected_ring"] += len(keys)
             for k in keys:
                 self._free.append(self._storing.pop(k))
             self._local_results.append(JobResult(job_id=job_id, success=False))
@@ -253,6 +292,14 @@ class UringSecondaryTierManager(SecondaryTierManager):
     def submit_load(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
         pairs = list(zip(job_metadata.keys, job_metadata.block_ids))
+        # promotion 对账的另一半。is_promotion 直接访问不 getattr 兜底:
+        # 真身没这个字段就当场炸(同 import 段"名字对不上不许静默滑过"的
+        # 纪律), 静默记 0 会把 E2 的丢块分析带偏。
+        self._counters["load_jobs"] += 1
+        self._counters["load_blocks"] += len(pairs)
+        if job_metadata.is_promotion:
+            self._counters["load_jobs_promotion"] += 1
+            self._counters["load_blocks_promotion"] += len(pairs)
         if any(k not in self._present for k, _ in pairs):
             # lookup 已经报过 MISS/RETRY, 正常流程走不到;防御性失败
             self._local_results.append(JobResult(job_id=job_id, success=False))
@@ -280,19 +327,30 @@ class UringSecondaryTierManager(SecondaryTierManager):
                 for k in keys:
                     slot = self._storing.pop(k)
                     if ok:
+                        # 唯一块判定只认"成功落上盘"这一刻:first = 一生第一次,
+                        # rewrite = 逐出后回来重写(容量逼出来的物理重复写)
+                        if k in self._ever_stored:
+                            self._counters["store_blocks_rewrite"] += 1
+                        else:
+                            self._ever_stored.add(k)
+                            self._counters["store_blocks_first"] += 1
                         self._present[k] = slot  # 插入即 LRU 最新
                     else:
+                        self._counters["store_blocks_io_failed"] += 1
                         self._free.append(slot)
             else:
                 for k in keys:
                     self._unpin(k)
                 if not ok:
+                    self._counters["load_blocks_io_failed"] += len(keys)
                     # 读失败说明盘上数据可疑(短读/介质错):整批逐出,
                     # 下次这些 key 直接 MISS → recompute, 不再踩同一个坑
                     for k in keys:
                         if k in self._present and k not in self._load_refs:
                             self._free.append(self._present.pop(k))
+                            self._counters["evicted_after_load_fail"] += 1
             results.append(JobResult(job_id=job_id, success=ok))
+        self._maybe_dump()
         return results
 
     def has_pending_work(self) -> bool:
@@ -306,6 +364,8 @@ class UringSecondaryTierManager(SecondaryTierManager):
 
     def shutdown(self) -> None:
         self._engine.drain()
+        # 账本终写要在删 backing 之前;stats 文件本身不删, bench 收尾要收走
+        self._dump_stats()
         # cache tier 语义:内容不跨进程生命周期保留(同 P4 SsdBlockStore 析构
         # unlink 的决定)。要做持久化 KV 池是另一个项目。
         try:
@@ -319,6 +379,67 @@ class UringSecondaryTierManager(SecondaryTierManager):
     # 给 bench / 调试用:引擎内部计数器
     def engine_stats(self) -> dict:
         return dict(self._engine.stats())
+
+    # ------------------------------------------------------------------ #
+    # E2 账本出口
+    # ------------------------------------------------------------------ #
+    # serve 场景下本对象活在 EngineCore 子进程里, bench 拿不到 Python 对象,
+    # 账本唯一的出口是文件(<backing>.stats.json)。周期覆盖写 + shutdown
+    # 终写:优雅关停(--shutdown-timeout 30)拿全量;被 SIGKILL 时最多丢
+    # 最后一个周期 —— /dev/shm 泄漏那课的直接应用:留档义务不能只挂在
+    # 优雅路径上。
+
+    _DUMP_INTERVAL_S = 10.0
+
+    # drain_records() 返回 tuple, 字段序由 pybind 侧定死, 这里是唯一的
+    # schema 权威;分析脚本按它解列, 不许自己猜下标
+    _RECORD_SCHEMA = [
+        "job_id", "is_write", "n_blocks",
+        "t_submit", "t_first_issue", "t_done",
+        "q_jobs_at_submit", "dev_inflight_at_issue",
+    ]
+
+    def tier_stats(self) -> dict:
+        return {
+            "t_wall": time.time(),
+            "block_size": self._block_size,
+            "num_slots": self._num_slots,
+            "counters": dict(self._counters),
+            "gauges": {
+                "present_blocks": len(self._present),
+                "storing_blocks": len(self._storing),
+                "load_ref_keys": len(self._load_refs),
+                "free_slots": len(self._free),
+                "ever_stored_blocks": len(self._ever_stored),
+                "inflight_jobs": len(self._job_keys),
+            },
+            "engine": self.engine_stats(),
+        }
+
+    def _maybe_dump(self) -> None:
+        if time.monotonic() - self._last_dump < self._DUMP_INTERVAL_S:
+            return
+        self._dump_stats()
+
+    def _dump_stats(self) -> None:
+        self._last_dump = time.monotonic()
+        self._job_records.extend(self._engine.drain_records())
+        payload = self.tier_stats()
+        payload["job_records"] = {
+            "schema": self._RECORD_SCHEMA,
+            "rows": self._job_records,
+        }
+        path = self._path + ".stats.json"
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)  # 原子替换:分析脚本永远读不到半截 JSON
+        except OSError as e:
+            # dump 是观测不是功能, 不许把 scheduler 线程炸掉;只告警一次
+            if not self._dump_warned:
+                self._dump_warned = True
+                logger.warning("tier stats dump to %s failed: %s", path, e)
 
     # ------------------------------------------------------------------ #
     # 内部
@@ -347,6 +468,9 @@ class UringSecondaryTierManager(SecondaryTierManager):
                 if k in self._load_refs:
                     continue  # 有 load 在读它的 slot, 不能动
                 slots.append(self._present.pop(k))
+                # 计数放 pop 处:即使本 job 最终拿不够被拒, 这些 key 也真的
+                # 从盘上账本消失了(原逻辑如此 —— slot 进 free, key 不回来)
+                self._counters["evicted_blocks"] += 1
         if len(slots) < n:
             self._free.extend(slots)
             return None

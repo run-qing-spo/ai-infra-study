@@ -84,12 +84,20 @@ PoolTierEngine::~PoolTierEngine() {
 }
 
 bool PoolTierEngine::submit(JobDesc&& job) {
-    pending_jobs_.fetch_add(1, std::memory_order_relaxed);
+    job.t_submit = now_realtime();
+    // 快照语义同 uring 版:fetch_add 旧值 = 此刻已在途的 job 数
+    job.q_jobs_at_submit = static_cast<uint32_t>(
+        pending_jobs_.fetch_add(1, std::memory_order_relaxed));
     st_jobs_submitted_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(mu_);
         // 空 job(block 全被 Python 侧过滤光)直接完成, 语义同 uring 版。
         if (job.xfers.empty()) {
+            // 账本同 uring 版收尾路径:没碰过 IO, first_issue = done
+            double t_now = now_realtime();
+            records_.push_back(JobRecord{job.job_id, job.is_write, 0,
+                                         job.t_submit, t_now, t_now,
+                                         job.q_jobs_at_submit, 0});
             results_.push_back(JobResult{job.job_id, true});
             st_jobs_completed_.fetch_add(1, std::memory_order_relaxed);
             pending_jobs_.fetch_sub(1, std::memory_order_release);
@@ -97,8 +105,14 @@ bool PoolTierEngine::submit(JobDesc&& job) {
             return true;
         }
         uint64_t seq = next_seq_++;
-        jobs_.emplace(seq, JobState{job.job_id,
-                                    static_cast<uint32_t>(job.xfers.size())});
+        JobState js;
+        js.job_id           = job.job_id;
+        js.remaining        = static_cast<uint32_t>(job.xfers.size());
+        js.is_write         = job.is_write;
+        js.n_blocks         = static_cast<uint32_t>(job.xfers.size());
+        js.t_submit         = job.t_submit;
+        js.q_jobs_at_submit = job.q_jobs_at_submit;
+        jobs_.emplace(seq, js);
         for (const BlockXfer& x : job.xfers) {
             tasks_.push_back(BlockTask{seq, x, job.is_write});
         }
@@ -126,6 +140,13 @@ void PoolTierEngine::drain() {
     });
 }
 
+std::vector<JobRecord> PoolTierEngine::drain_records() {
+    std::vector<JobRecord> out;
+    std::lock_guard<std::mutex> g(mu_);
+    out.swap(records_);
+    return out;
+}
+
 EngineStats PoolTierEngine::stats() const {
     EngineStats s;
     s.jobs_submitted = st_jobs_submitted_.load(std::memory_order_relaxed);
@@ -150,6 +171,14 @@ void PoolTierEngine::worker_loop() {
             if (tasks_.empty()) break;   // 只可能是 stop 且没活了
             t = tasks_.front();
             tasks_.pop_front();
+            // 本 job 第一个被拿起的 block:记 first issue(锁内, jobs_ 安全)。
+            // dev_inflight 快照取"别的 worker 此刻正在 IO 里的 block 数"。
+            JobState& js0 = jobs_.at(t.seq);
+            if (js0.t_first_issue == 0.0) {
+                js0.t_first_issue = now_realtime();
+                js0.dev_inflight_at_issue =
+                    io_inflight_.load(std::memory_order_relaxed);
+            }
         }
 
         // 锁外做同步 IO:每 block 一次 syscall, 这就是与 uring 引擎的对照点。
@@ -157,9 +186,11 @@ void PoolTierEngine::worker_loop() {
         // 失败, 不做 resume 循环(O_DIRECT 下剩余长度可能掉出 4K 对齐;
         // uring 侧 res != block_bytes 也是一票否决, 见 kv_tier_engine.cpp ③)。
         std::byte* buf = mem_base_ + t.x.mem_offset;
+        io_inflight_.fetch_add(1, std::memory_order_relaxed);
         ssize_t res = t.is_write
             ? ::pwrite(fd_, buf, block_bytes_, static_cast<off_t>(t.x.disk_offset))
             : ::pread(fd_, buf, block_bytes_, static_cast<off_t>(t.x.disk_offset));
+        io_inflight_.fetch_sub(1, std::memory_order_relaxed);
         st_submit_calls_.fetch_add(1, std::memory_order_relaxed);
         bool ok = (res == static_cast<ssize_t>(block_bytes_));
         if (ok) {
@@ -174,6 +205,11 @@ void PoolTierEngine::worker_loop() {
             if (!ok) js.failed = true;
             if (--js.remaining == 0) {
                 bool job_ok = !js.failed;
+                records_.push_back(JobRecord{js.job_id, js.is_write,
+                                             js.n_blocks, js.t_submit,
+                                             js.t_first_issue, now_realtime(),
+                                             js.q_jobs_at_submit,
+                                             js.dev_inflight_at_issue});
                 results_.push_back(JobResult{js.job_id, job_ok});
                 st_jobs_completed_.fetch_add(1, std::memory_order_relaxed);
                 if (!job_ok) st_jobs_failed_.fetch_add(1, std::memory_order_relaxed);

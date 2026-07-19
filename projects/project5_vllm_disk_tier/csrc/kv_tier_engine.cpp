@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <stdexcept>
 #include <unordered_map>
@@ -26,6 +27,13 @@ constexpr size_t   kRingCap   = 1024;   // in_q_/out_q_ 容量(2 的幂)。一�
                                         // 1023 个在途 job 远超 scheduler 实际压力
 constexpr unsigned kReapBatch = 256;    // 一次 reap 最多收的 CQE 数
 } // namespace
+
+// 选型理由见 hpp 声明处
+double now_realtime() {
+    timespec ts;
+    ::clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<double>(ts.tv_sec) + ts.tv_nsec * 1e-9;
+}
 
 // 语义与成本见 hpp 注释。4MiB 块:够摊薄 syscall, 又不占多少内存;
 // file_bytes = num_slots × block_bytes 且 block_bytes 是 4K 倍数,
@@ -117,7 +125,10 @@ KvTierEngine::~KvTierEngine() {
 }
 
 bool KvTierEngine::submit(JobDesc&& job) {
-    pending_jobs_.fetch_add(1, std::memory_order_relaxed);
+    job.t_submit = now_realtime();
+    // fetch_add 返回旧值 = 此刻已在途的 job 数, 顺手就是排队深度快照
+    job.q_jobs_at_submit = static_cast<uint32_t>(
+        pending_jobs_.fetch_add(1, std::memory_order_relaxed));
     if (!in_q_.push(std::move(job))) {
         pending_jobs_.fetch_sub(1, std::memory_order_relaxed);
         return false;   // 环满:调用方把这个 job 报失败, 上层退化 recompute
@@ -145,6 +156,13 @@ void KvTierEngine::drain() {
     drain_cv_.wait(lk, [this] {
         return pending_jobs_.load(std::memory_order_acquire) == 0;
     });
+}
+
+std::vector<JobRecord> KvTierEngine::drain_records() {
+    std::vector<JobRecord> out;
+    std::lock_guard<std::mutex> g(records_mu_);
+    out.swap(records_);
+    return out;
 }
 
 EngineStats KvTierEngine::stats() const {
@@ -180,6 +198,9 @@ void KvTierEngine::worker_loop() {
         size_t   next_xfer = 0;     // 下一个还没下发的 xfer 下标
         uint32_t inflight  = 0;     // 已下发未完成的 block 数
         bool     failed    = false;
+        // per-job 账本的 worker 侧字段(JobRecord 注释)
+        double   t_first_issue = 0.0;       // 0 = 还没碰过 ring
+        uint32_t dev_inflight_at_issue = 0;
     };
     std::unordered_map<uint64_t, JobState> jobs;
     std::deque<uint64_t> issue_order;   // FIFO 下发:先来的 job 先占 ring 深度
@@ -190,6 +211,18 @@ void KvTierEngine::worker_loop() {
 
     auto finish_job = [&](uint64_t seq, JobState& js) {
         bool ok = !js.failed;
+        double t_done = now_realtime();
+        // 空 job(全被 Python 侧过滤光)没碰过 ring:first_issue = done,
+        // queue/service 都记 0 时长, 不污染延迟分布的形状
+        if (js.t_first_issue == 0.0) js.t_first_issue = t_done;
+        {
+            std::lock_guard<std::mutex> g(records_mu_);
+            records_.push_back(JobRecord{
+                js.desc.job_id, js.desc.is_write,
+                static_cast<uint32_t>(js.desc.xfers.size()),
+                js.desc.t_submit, js.t_first_issue, t_done,
+                js.desc.q_jobs_at_submit, js.dev_inflight_at_issue});
+        }
         // out_q_ 满时自旋等调度线程来收。容量 1023, 实际到不了这里;
         // 真到了, 说明上层根本没在 poll, 背压停在引擎侧是对的。
         while (!out_q_.push(JobResult{js.desc.job_id, ok})) {
@@ -236,6 +269,13 @@ void KvTierEngine::worker_loop() {
             uint64_t seq = issue_order.front();
             auto it = jobs.find(seq);
             JobState& js = it->second;
+            // 首次为这个 job 下发:记账。next_xfer==0 保证跨轮续发不重记
+            // (SQ 满回滚会把 next_xfer 退回 0 重记一次, 防御路径, 不影响账)
+            if (js.next_xfer == 0) {
+                js.t_first_issue = now_realtime();
+                js.dev_inflight_at_issue =
+                    static_cast<uint32_t>(backend.in_flight());
+            }
             while (room > 0 && js.next_xfer < js.desc.xfers.size()) {
                 const BlockXfer& x = js.desc.xfers[js.next_xfer];
                 p3::IoRequest r;
@@ -310,6 +350,17 @@ void KvTierEngine::worker_loop() {
             // 收尾前把 in_q_ 里残留的 job 也报失败, 不让 drain 卡死
             JobDesc leftover;
             while (in_q_.pop(leftover)) {
+                // 账本也补一条(没碰过 ring):不然 records 和 jobs_submitted
+                // 对不上账, 分析脚本没法做完整性校验
+                double t_now = now_realtime();
+                {
+                    std::lock_guard<std::mutex> g(records_mu_);
+                    records_.push_back(JobRecord{
+                        leftover.job_id, leftover.is_write,
+                        static_cast<uint32_t>(leftover.xfers.size()),
+                        leftover.t_submit, t_now, t_now,
+                        leftover.q_jobs_at_submit, 0});
+                }
                 while (!out_q_.push(JobResult{leftover.job_id, false})) {
                     std::this_thread::yield();
                 }

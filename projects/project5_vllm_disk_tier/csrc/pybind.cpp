@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "kv_tier_engine.hpp"
@@ -84,6 +85,25 @@ public:
 
     void drain() { engine_->drain(); }
 
+    // per-job 账本。tuple 而不是 dict:几万条 record 的场景下轻一个量级;
+    // 字段序是接口合同, 与 manager._RECORD_SCHEMA 一一对应, 改这里必须同步
+    // 改那边 —— (job_id, is_write, n_blocks, t_submit, t_first_issue,
+    //            t_done, q_jobs_at_submit, dev_inflight_at_issue)
+    std::vector<std::tuple<uint64_t, bool, uint32_t, double, double, double,
+                           uint32_t, uint32_t>>
+    drain_records() {
+        auto rs = engine_->drain_records();
+        std::vector<std::tuple<uint64_t, bool, uint32_t, double, double,
+                               double, uint32_t, uint32_t>> out;
+        out.reserve(rs.size());
+        for (const auto& r : rs) {
+            out.emplace_back(r.job_id, r.is_write, r.n_blocks, r.t_submit,
+                             r.t_first_issue, r.t_done, r.q_jobs_at_submit,
+                             r.dev_inflight_at_issue);
+        }
+        return out;
+    }
+
     py::dict stats() const {
         auto s = engine_->stats();
         py::dict d;
@@ -136,7 +156,9 @@ void bind_engine(py::module_& m, const char* py_name,
         .def("poll_finished", &E::poll_finished, py::arg("max_n") = 1024)
         // drain 会长时间阻塞, 必须放 GIL, 否则把整个 scheduler 进程卡死
         .def("drain", &E::drain, py::call_guard<py::gil_scoped_release>())
-        .def("stats", &E::stats);
+        .def("stats", &E::stats)
+        // per-job 账本, 字段序见 PyEngine::drain_records 注释
+        .def("drain_records", &E::drain_records);
 }
 
 } // namespace
