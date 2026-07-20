@@ -357,7 +357,8 @@ cleanup() {
     # 盘和 tmpfs 的残留一律清掉。数据本身在 $RES 里, 这些只是 tier 的工作区,
     # 留着既占盘又污染下一轮的缓存状态。
     rm -rf "$DATA/kv_fs" 2>/dev/null
-    rm -f "$DATA/kv_tier.bin" "$DATA/kv_tier.bin.stats.json.tmp" 2>/dev/null
+    rm -f "$DATA/kv_tier.bin" "$DATA/kv_tier.bin.stats.json.tmp" \
+          "$DATA/kv_tier.bin.records.jsonl" 2>/dev/null
     rm -f /dev/shm/vllm_offload_*.mmap 2>/dev/null
 }
 trap cleanup EXIT
@@ -522,6 +523,13 @@ run_group() {
         mv "$DATA/kv_tier.bin.stats.json" "$RES/tier_stats_${group}_stale.json"
         log "  !! 发现上一组未收走的 uring 账本, 存为 tier_stats_${group}_stale.json"
     fi
+    # 流水是 append 打开的, 残留不挪走就会被本组续写, 两组数据混成一份且
+    # 无从分辨 —— 覆盖写没有这个问题, 是换成 append 之后新欠下的债, 必须还
+    if [ -f "$DATA/kv_tier.bin.records.jsonl" ]; then
+        mv "$DATA/kv_tier.bin.records.jsonl" \
+           "$RES/tier_stats_${group}_stale.records.jsonl"
+        log "  !! 发现上一组未收走的 uring 流水, 存为 tier_stats_${group}_stale.records.jsonl"
+    fi
 
     setsid "${cmd[@]}" > "$slog" 2>&1 &
     SERVE_PID=$!
@@ -637,10 +645,14 @@ run_group() {
         return 2
     fi
 
-    # uring 账本(唯一块漏斗 + per-job 时戳)收进结果目录。必须在 stop_serve
-    # 之后: 全量终写挂在 manager.shutdown() 上, 优雅关停时才发生; 万一被
-    # pkill -9 兜底打死, 这里收到的是 10s 周期 dump 的最后一版, 照收并记警报
-    # (账本缺尾巴 ≠ 作废, 但分析时要知道)。.tmp 残留一并清掉。
+    # uring 账本收进结果目录, 两个文件:
+    #   .stats.json        counters/gauges 快照 + 记录条数(10s 周期覆盖写)
+    #   .records.jsonl     per-job 时戳流水(每次收割即 append)
+    # 分成两个文件是 2026-07-20 E3D 丢 r3 之后改的:原来记录内嵌在 stats.json
+    # 里全量覆盖写, dump 的 10s 周期和 revisit 的 21s 一轮撞相位, 第三轮必然
+    # 落在最后一次 dump 之后, 而 shutdown 的终写在 SIGINT 关停下并没有跑 ——
+    # 一整轮实验数据就这么没了, 两组一模一样。现在记录不依赖任何"最后的
+    # 机会", 条数对不上时下面会报, 分析脚本也会自己拦。
     if [ "$expect" = uring ]; then
         if [ -f "$DATA/kv_tier.bin.stats.json" ]; then
             mv "$DATA/kv_tier.bin.stats.json" "$RES/tier_stats_$group.json"
@@ -648,6 +660,14 @@ run_group() {
         else
             log "  !! uring 账本缺失(.stats.json 没出现) —— manager dump 没跑?"
             GROUP_STATUS[$group]="${GROUP_STATUS[$group]:-OK} WARN(stats)"
+        fi
+        if [ -f "$DATA/kv_tier.bin.records.jsonl" ]; then
+            mv "$DATA/kv_tier.bin.records.jsonl" \
+               "$RES/tier_stats_$group.records.jsonl"
+            log "  uring 流水已收: $(wc -l < "$RES/tier_stats_$group.records.jsonl") 条"
+        else
+            log "  !! uring 流水缺失(.records.jsonl 没出现) —— 窗口审计做不了"
+            GROUP_STATUS[$group]="${GROUP_STATUS[$group]:-OK} WARN(records)"
         fi
         rm -f "$DATA/kv_tier.bin.stats.json.tmp"
     fi
