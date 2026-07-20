@@ -584,6 +584,19 @@ run_group() {
         rm -f "$DATA/kv_tier.bin"   # 下一组 serve 会重新 fallocate + prewarm
     fi
 
+    # 盘满哨兵(2026-07-20 补, E3 复盘教训): fs tier 没有容量上限, 负载一超盘
+    # 就 ENOSPC, 而它**不报警也不停** —— 每块 store 失败一次、日志刷一行, 实验
+    # 照跑完、状态照 OK。E3 两轮的 fs 组各撞了 77884 次, 从 c=4 档起全程满盘,
+    # 直到今天才发现(吸收率 23% 的真身就是盘的物理上限, 不是 store 路径衰减)。
+    # 满盘不只是丢块: XFS 接近满时分配器劣化, 且失败路径本身在刷元数据操作,
+    # 两者都直接砸在被测的 IO 路径上 ⇒ 见到就作废, 不许当"轻微异常"。
+    local nospc
+    nospc=$(grep -icE "No space left on device" "$slog" 2>/dev/null || echo 0)
+    if [ "${nospc:-0}" != 0 ]; then
+        log "  !! 盘满: serve 日志 ${nospc} 次 ENOSPC —— 本组数据作废, 缩小负载重跑"
+        GROUP_STATUS[$group]="FAIL(ENOSPC×${nospc})"
+    fi
+
     if ! stop_serve; then
         log "  !! 显存清不掉, 中止剩余组, 免得后面全是 OOM 废数据"
         GROUP_STATUS[$group]="${GROUP_STATUS[$group]} GPU_STUCK"
@@ -645,6 +658,40 @@ if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
 elif [ -f /sys/fs/cgroup/memory.max ]; then
     log "cgroup 内存基线: limit=$(cat /sys/fs/cgroup/memory.max) current=$(( $(cat /sys/fs/cgroup/memory.current) >> 30 ))G"
 fi
+# CPU 基线同理, 也不能信 nproc/lscpu: 容器里它们穿透看宿主(实测宿主 128 核),
+# 真正能用的是 cgroup 配额(实测 16 核)。差 8 倍, 解读任何 cpu_util 都要先有
+# 正确的分母 —— "顶满配额"和"随便用用"在绝对核数上长得一模一样, 只有对上
+# 配额才分得开。此前七轮 e2e 没有一份 RESULTS 记过这个数(2026-07-20 补)。
+cpu_host=$(grep -c ^processor /proc/cpuinfo)
+cpu_quota=未知
+if [ -f /sys/fs/cgroup/cpu.max ]; then                          # cgroup v2
+    read -r quota_us period_us < /sys/fs/cgroup/cpu.max
+    if [ "$quota_us" = max ]; then cpu_quota=无限
+    else cpu_quota=$(awk "BEGIN{printf \"%.1f\", $quota_us/$period_us}"); fi
+elif [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then           # cgroup v1
+    quota_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    period_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    if (( quota_us < 0 )); then cpu_quota=无限
+    else cpu_quota=$(awk "BEGIN{printf \"%.1f\", $quota_us/$period_us}"); fi
+fi
+# affinity 要单独记: 配额是 CFS 时间片掐出来的, 不是 cpuset 圈出来的 ——
+# 实测 allowed 是 0-127 而配额只有 16 核, 线程能在 128 个核上飘, 跨 socket
+# 访存是 IO 抖动的一个来源, 和限流是两回事, 别混着归因。
+log "CPU 基线: 宿主 ${cpu_host} 核, cgroup 配额 ${cpu_quota} 核, affinity=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status), OMP_NUM_THREADS=${OMP_NUM_THREADS:-未设}"
+if [ "$cpu_quota" != 无限 ] && [ "$cpu_quota" != 未知 ]; then
+    # 并发组的客户端线程 + vLLM 调度 + io-wq worker 全挤在这点配额里。并发数
+    # 逼近配额时 CPU 先饱和, 测出来的组间差可能是抢 CPU 而不是 IO 路径的差。
+    log "  提醒: 并发数接近 ${cpu_quota} 时 CPU 先于盘饱和, 该组 TTFT 归因要先排除 CPU"
+fi
+# 限流快照: cpu.stat 是容器本次开机以来的累计值, 关机重开清零, 所以只有
+# 起跑前/收尾各采一次做差才有意义。注意"顶满配额"和"被 CFS 掐住"是两件事,
+# throttled_usec 是后者唯一的直接读数, nr_throttled 只数次数不给时长。
+CPUSTAT=/sys/fs/cgroup/cpu.stat
+[ -f "$CPUSTAT" ] || CPUSTAT=/sys/fs/cgroup/cpu/cpu.stat
+if [ -f "$CPUSTAT" ]; then
+    cp "$CPUSTAT" "$RES/cpu_stat_before.txt"
+    log "限流基线: $(awk '/nr_throttled|throttled_usec/{printf "%s=%s ", $1, $2}' "$CPUSTAT")"
+fi
 
 # 模型预下载: 已缓存则秒过; 没缓存就先下完再开组, 免得下载吃掉 serve 就绪超时
 log "预下载模型 $M (进度见 $RES/download.log)..."
@@ -686,6 +733,15 @@ for g in "${GROUP_ORDER[@]}"; do
     log "  组 $g: $s"
     [ "$s" = "OK" ] || all_ok=0
 done
+# 这一晚被 CFS 掐了多少: 和起跑前的快照做差(cpu.stat 是累计值, 绝对值没用)。
+# throttled 明显非零 = 这批数字是在 CPU 配额封顶下测的, 组间差先归因 CPU 再谈 IO。
+if [ -f "$RES/cpu_stat_before.txt" ] && [ -f "$CPUSTAT" ]; then
+    cp "$CPUSTAT" "$RES/cpu_stat_after.txt"
+    log "CPU 限流账(本轮增量): $(awk '
+        FNR==NR { before[$1]=$2; next }
+        /nr_periods|nr_throttled|throttled_usec/ { printf "%s+%d ", $1, $2-before[$1] }
+    ' "$RES/cpu_stat_before.txt" "$CPUSTAT")"
+fi
 log "原始数据: $RES/group_*.json + pidstat/iostat/iou_wrk 日志, 明早把整个 $RES/ 拉回来"
 
 if [ "$AUTO_SHUTDOWN" = 1 ] && [ "$all_ok" = 1 ]; then
