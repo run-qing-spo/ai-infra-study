@@ -280,18 +280,33 @@ gil)
     # 效应量(~10ms)低于跨 serve 噪声底(15-20ms), 单组对比不算数 ——
     # w16/w2 交替各两个 serve, 判据用批间同向性(26 批全同向的老办法),
     # 不看均值差。w2 的写带宽不构成混淆: 2 线程 O_DIRECT 顺序写 ≫ churn
-    # 期实测 ~85MB/s 的 store 流量。phases 沿用 E3 全谱, 顺带观测 store
-    # 排空变慢对 revisit 有无反作用
+    # 期实测 ~85MB/s 的 store 流量。
+    #
+    # 2026-07-20 改负载: 原稿沿用 E3 全谱(churn 24 × 12 轮), 而那正是把盘
+    # 写满、撞 77884 次 ENOSPC 的那套负载 —— 照跑数据全废。换成 E2 的纯 churn
+    # (48 条, 实测落盘 21.3G < 35G 盘), 同时消掉 revisit 这个无关变量: 要测的
+    # 是 store 路径对 prefill 的干扰, load 在场只添噪。基线组 none 必须同批跑,
+    # 因为"税"的定义就是相对无 offload 的差(E2 已标定: fs +7.7ms、uring +1.3ms)。
+    #
+    # 预期与判读: GIL 争抢的代价随线程数超线性(convoy), 16→2 若把 +7.7ms
+    # 明显压下去 ⇒ GIL 坐实; 若纹丝不动, 说明代价正比于 Python 总工作量而非
+    # 并发争抢, 换候选(元数据事务 / 派发路径本身)。
+    # 自检: w2 的 store 更慢, kv_fs 落盘量应当低于 w16 的 24889 文件;
+    # 两组若一字不差, 说明 n_write_threads 这个配置键没生效, 本轮作废。
     GIL_PHASES="prime"
-    for c in 1 4 8 16; do
-        for _ in 1 2 3; do GIL_PHASES+=",churn,revisit@$c"; done
-    done
+    for _ in 1 2 3 4 5 6 7 8; do GIL_PHASES+=",churn"; done
+    GIL_ARGS="--phases $GIL_PHASES --churn 6"
     CFG_FS_W2="${CFG_FS/\"root_dir\"/\"n_write_threads\":2,\"root_dir\"}"
     SPECS=(
-        "GIL_w16_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
-        "GIL_w2_a|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
-        "GIL_w16_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
-        "GIL_w2_b|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|--phases $GIL_PHASES"
+        "GIL_none_a|-|-|1|-|0|$GIL_ARGS"
+        "GIL_w16_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
+        "GIL_w2_a|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
+        "GIL_none_b|-|-|1|-|0|$GIL_ARGS"
+        "GIL_w2_b|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
+        "GIL_w16_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
+        "GIL_none_c|-|-|1|-|0|$GIL_ARGS"
+        "GIL_w16_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
+        "GIL_w2_c|$CFG_FS_W2|fs|1|PYTHONHASHSEED=0|0|$GIL_ARGS"
     )
     ;;
 legacy)
