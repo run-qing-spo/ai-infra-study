@@ -113,12 +113,12 @@ class UringSecondaryTierManager(SecondaryTierManager):
             "type": "uring",
             "path": "/root/autodl-tmp/kv_tier.bin",
             "disk_bytes_to_use": 21474836480,
-            "queue_depth": 32,         # 可选;默认 = 微基准 sweet spot(BENCH_ANALYSIS §2)
+            "queue_depth": 32,         # 可选;默认 = 微基准 sweet spot(BENCH_ANALYSIS 的引擎参数一节)
             "use_odirect": true,       # 可选;对齐不满足时自动降级并告警
             "prewarm": true            # 可选;启动时预写整个 backing 文件, 把
                                        # fallocate 的 unwritten extent 全部翻成
                                        # written, 消除首写 NOWAIT 失败 → io-wq
-                                       # punt(BENCH_ANALYSIS §3 dd 预写的内化)。
+                                       # punt(BENCH_ANALYSIS 的 punt 机制一节)。
                                        # 代价是启动多花 文件大小/盘写带宽 的时间
         }
     """
@@ -364,6 +364,12 @@ class UringSecondaryTierManager(SecondaryTierManager):
 
     def shutdown(self) -> None:
         self._engine.drain()
+        # drain 只保证引擎把 job 做完、结果推进 out_q_, **没人收割**;而首写
+        # 计数只在 get_finished_jobs 里加, 所以关停时最后一批在途 job 的块会
+        # 整批漏账(2026-07-20 实测: storing 256 块 / 2 个 job 悬空, 引擎写了
+        # 22659 块 manager 只记 22556)。这里补一次收割再落账 —— 结果丢掉是
+        # 对的, 上层已经不再来问了, 我们只要账。
+        list(self.get_finished_jobs())
         # 账本终写要在删 backing 之前;stats 文件本身不删, bench 收尾要收走
         self._dump_stats()
         # cache tier 语义:内容不跨进程生命周期保留(同 P4 SsdBlockStore 析构

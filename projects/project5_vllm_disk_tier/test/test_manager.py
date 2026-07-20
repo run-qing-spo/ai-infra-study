@@ -243,9 +243,12 @@ def test_stats_dump_on_shutdown(tmp_path):
     store(m, 1, [b"k1"], [0])
     m._engine.complete_all()
     list(m.get_finished_jobs())
+    # 关停时还有一个在途 job: shutdown 必须自己收割它, 否则整批漏账
+    store(m, 2, [b"k2"], [1])
     m.shutdown()
     # 账本文件在 backing 旁边, backing 本身被 shutdown 删掉(不存在也无妨)
     data = json.loads((tmp_path / "kv.bin.stats.json").read_text())
-    assert data["counters"]["store_blocks_first"] == 1
-    assert data["gauges"]["present_blocks"] == 1
+    assert data["counters"]["store_blocks_first"] == 2   # 含关停时收割的那个
+    assert data["gauges"]["present_blocks"] == 2
+    assert data["gauges"]["storing_blocks"] == 0         # 没有悬空未收割的块
     assert data["job_records"]["schema"][0] == "job_id"

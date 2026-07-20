@@ -187,7 +187,7 @@ void KvTierEngine::worker_loop() {
     // 提交和执行完全串行, 每批头尾盘都在干等。QD/2 保证阻塞等待期间
     // 任何时刻至少还有一半 IO 在盘里飞, 批量摊薄和流水线两头都保住。
     // (dm 机器 QD 32→256 吞吐平坦, 联动主要是护住低 QD 默认配置,
-    // 不是治已观测到的病 —— 见 BENCH_ANALYSIS §8.3 后记。)
+    // 不是治已观测到的病 —— 见 BENCH_ANALYSIS 的引擎参数一节。)
     const size_t submit_threshold =
         std::max<size_t>(1, std::min<size_t>(32, queue_depth_ / 2));
 

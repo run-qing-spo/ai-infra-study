@@ -2,7 +2,7 @@
 
 // PoolTierEngine — 对照组引擎:std::thread 线程池 + 同步 pread/pwrite。
 //
-// 存在的唯一理由(BENCH_ANALYSIS §4):bench 里的 pool/pool-slab 是 Python
+// 存在的唯一理由(BENCH_ANALYSIS 的提交模型一节):bench 里的 pool/pool-slab 是 Python
 // 线程池, 拿它们和 uring 引擎对比, 等于同时比 "C++ vs Python(GIL)" 和
 // "io_uring vs 线程池" 两个变量, 归因拆不开。本类把 Python 变量拆掉:
 //

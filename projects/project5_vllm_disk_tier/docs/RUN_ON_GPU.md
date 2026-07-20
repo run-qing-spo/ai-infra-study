@@ -29,9 +29,9 @@ O_DIRECT)降低 revisit TTFT 和 CPU 占用, 且不产生负优化。
   O_DIRECT;NFS 类网络盘不行,那就换 `--dir`)。
 - 内核:`uname -r`。**5.15 + md RAID 数据盘会让 io_uring 100% punt 到
   io-wq**(md 的 REQ_NOWAIT 支持 5.17 才进主线),引擎退化成隐形线程池,
-  CPU 优势不成立 —— 详见 BENCH_ANALYSIS.md §5。在这种宿主上跑 e2e 依然
+  CPU 优势不成立 —— 详见 BENCH_ANALYSIS.md 的 punt 机制一节。在这种宿主上跑 e2e 依然
   有效,但对 C2 的预期要按 §4.4 的修正版看。
-  **【§12 修正】**punt 是警报不是判决:一台 md RAID1 + 企业盘宿主实测
+  **【BENCH_ANALYSIS 修正】**punt 是警报不是判决:一台 md RAID1 + 企业盘宿主实测
   iou_wrk 非零但 uring 三轴全赢(串行单列也够打满低延迟阵列, io-wq 税
   低于线程池)。筛机流程改成:iou_wrk 非零 → 先跑四引擎微基准, 用对照
   数字下判决, 不直接释放。
@@ -192,10 +192,10 @@ vllm serve $M --max-model-len 16384 --kv-transfer-config '{
       "path": "/root/autodl-tmp/kv_tier.bin",
       "disk_bytes_to_use": 21474836480,
       "queue_depth": 32}]}}'
-# queue_depth=32: 微基准 sweep 的 sweet spot (BENCH_ANALYSIS §2/§5)。
+# queue_depth=32: 微基准 sweep 的 sweet spot (BENCH_ANALYSIS 的引擎参数一节)。
 # 现在也是引擎默认值(旧默认 512 是错参数, 已改), 显式写出是为了实验
 # 配置自文档化。gather threshold 在引擎内随 QD 联动 min(32, QD/2),
-# 低 QD 不会 lockstep(BENCH_ANALYSIS §8.3)。
+# 低 QD 不会 lockstep(BENCH_ANALYSIS 的引擎参数一节)。
 ```
 
 起服务后在日志里确认:`Created secondary tier #0 (uring)`(C2)/
@@ -245,7 +245,7 @@ A 组同负载的吞吐和 TTFT —— 差值就是"挂着 tier 但全 miss"的�
 - 若 C2 反而更差:先查是不是没走 O_DIRECT(日志里有降级 warning)、
   churn 是否真的把 CPU tier 挤爆(metrics 里看)、盘是不是网络盘
 
-**【§5 诊断后的修正版预期(md + 5.15 宿主)】**:微基准里 uring 的
+**【punt 诊断后的修正版预期(md + 5.15 宿主)】**:微基准里 uring 的
 load 吞吐输 pool ~1.8×、CPU 反而更高(punt 退化成隐形线程池),照搬到
 e2e 的天真预期是 C2 ≥ C1 的 TTFT、CPU 也不占优。但 e2e 的变量组合完全
 不同:promotion 是一个前缀几百 MB 的突发 load(不是 2 GiB 持续流),
@@ -257,9 +257,9 @@ e2e 的天真预期是 C2 ≥ C1 的 TTFT、CPU 也不占优。但 e2e 的变量
 **【2026-07-11 实测,开放问题关闭】**:两次独立运行 C2 均优于 C1
 (revisit mean -11%、p99 -8%),且 pidstat 显形了 CPU 记账位置的差异
 (fs 把 ~15 个点内核态 IO 记在 EngineCore,uring 挪给 io-wq)。四组
-数字、CPU 账和同盘微基准复测全在 BENCH_ANALYSIS.md **§13**;原始数据
+数字、CPU 账和同盘微基准复测全在 BENCH_ANALYSIS.md 的**端到端一节**;原始数据
 `results_e2e_20260711_0058/`。上面第 3 条预期里"差距要并发才显形"
-估计保守了 —— 串行 revisit 就已可测,并发加压是 §8 的后续。
+估计保守了 —— 串行 revisit 就已可测,并发加压见 COMPARE_PLAN 的 E3。
 
 ## 5. 结果落盘
 

@@ -118,7 +118,7 @@ void* alloc_aligned(size_t n) {
 // ── build:造数据 ────────────────────────────────────────────────────────
 // 必须真写数据, 不能 fallocate 了事:xfs 的 fallocate 留下 unwritten extent,
 // 首次 O_DIRECT 读会撞上 extent 转换, 那是另一种开销, 会污染测量。
-// (项目里 uring tier 的 prewarm 干的就是这件事, 见 BENCH_ANALYSIS §5)
+// (项目里 uring tier 的 prewarm 干的就是这件事, 见 BENCH_ANALYSIS 的 punt 机制一节)
 void do_build(const Config& c) {
     char* buf = static_cast<char*>(alloc_aligned(c.block_size));
     std::memset(buf, 0xAB, c.block_size);

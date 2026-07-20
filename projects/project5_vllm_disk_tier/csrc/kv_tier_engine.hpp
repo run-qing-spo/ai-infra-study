@@ -86,7 +86,7 @@ struct JobRecord {
 
 // fallocate 预留出来的 extent 是 unwritten 状态, 首写要做状态转换(元数据
 // 变更), 文件系统层 NOWAIT 会失败 → IO 被 punt 给 io-wq(BENCH_ANALYSIS
-// §3 的 dd 预写实验:预写后 store iou_wrk 6→0)。本函数把整个文件真写一遍
+// 的 punt 机制一节:预写后 store iou_wrk 6→0)。本函数把整个文件真写一遍
 // 零, 把 extent 全部翻成 written —— 当年 dd 预写的代码内等价物。注意
 // posix_fallocate / FALLOC_FL_ZERO_RANGE 造出来的都还是 unwritten, 绕不
 // 过去, 必须真写。成本 = 文件大小 / 盘顺序写带宽(20G 按 dd 标定的

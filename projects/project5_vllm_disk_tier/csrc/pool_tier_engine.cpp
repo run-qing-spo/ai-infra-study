@@ -46,7 +46,7 @@ PoolTierEngine::PoolTierEngine(const std::string& path, uint64_t file_bytes,
     }
     // 预分配策略与 KvTierEngine 一字不差:fallocate 优先, 不支持则退化
     // ftruncate。unwritten extent 首写转换的成本两个引擎同样要付
-    // (BENCH_ANALYSIS §10.1), 预写与否由 bench 协议统一控制。
+    // (BENCH_ANALYSIS 的 punt 机制一节), 预写与否由 bench 协议统一控制。
     // (后加的 prewarm 开关不改变这一点:bench 默认关, 协议行为不变;
     //  e2e 由 manager 打开, 两个引擎吃到同样的 extent 状态, 对照仍公平。)
     if (::posix_fallocate(fd_, 0, static_cast<off_t>(file_bytes)) != 0) {

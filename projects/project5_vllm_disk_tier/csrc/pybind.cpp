@@ -7,7 +7,7 @@
 //     只讲"第几个 slot / 第几个 block", 不碰字节 —— 和 P4 的账本层一致。
 //   - submit_* 返回 False = 引擎入口环满, Python 层按 job 失败处理。
 //
-// PoolEngine(C++ 线程池对照组, BENCH_ANALYSIS §4)接口与 Engine 完全同构,
+// PoolEngine(C++ 线程池对照组, BENCH_ANALYSIS 的提交模型一节)接口与 Engine 完全同构,
 // 包装逻辑用模板共享 —— bench 侧换个类名就能跑同一条代码路径, 保证对照里
 // 唯一变量是引擎内部的提交模型。
 
@@ -166,10 +166,10 @@ void bind_engine(py::module_& m, const char* py_name,
 PYBIND11_MODULE(_kvtier, m) {
     m.doc() = "io_uring + O_DIRECT KV tier engine (project2 SPSC + project3 uring + project4 slab)";
 
-    // 默认 QD=32:微基准 sweep 的 sweet spot(BENCH_ANALYSIS §2/§5);
+    // 默认 QD=32:微基准 sweep 的 sweet spot(BENCH_ANALYSIS 的引擎参数一节);
     // 512 在 md 机器上让 io-wq 坍缩到 1 worker, dm 机器上也无收益。
     // gather threshold 在引擎内随 QD 联动(min(32, QD/2)), 低 QD 不会 lockstep。
     bind_engine<p5::KvTierEngine>(m, "Engine", "queue_depth", 32);
-    // C++ 线程池对照组:拆 "C++ 加成" 和 "io_uring 加成"(BENCH_ANALYSIS §4)
+    // C++ 线程池对照组:拆 "C++ 加成" 和 "io_uring 加成"(BENCH_ANALYSIS 的提交模型一节)
     bind_engine<p5::PoolTierEngine>(m, "PoolEngine", "num_threads", 32);
 }

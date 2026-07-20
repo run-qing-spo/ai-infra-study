@@ -2,7 +2,7 @@
 # 微基准:同一份 block 搬运负载, 四种磁盘引擎对打(不涉及 vLLM, 纯 IO 层):
 #
 #   uring : 本项目引擎 —— SPSC → 单线程 io_uring 批量提交, O_DIRECT, 单大文件
-#   cpp-pool : C++ 对照组(BENCH_ANALYSIS §4) —— std::thread 线程池 + 同步
+#   cpp-pool : C++ 对照组(BENCH_ANALYSIS 的提交模型一节) —— std::thread 线程池 + 同步
 #           pread/pwrite, 其余(单大文件/O_DIRECT/submit-poll 接口)与 uring
 #           引擎一字不差。uring vs cpp-pool 的差 = 提交模型本身, 不掺 GIL。
 #   pool  : 复刻 vLLM fs tier 的语义 —— 线程池, 每 block 一个文件,
