@@ -339,7 +339,26 @@ cleanup() {
     # 脚本被杀 / 出错退出时别留孤儿: 掐掉监控、压舱和 serve 进程组
     ((${#MON_PIDS[@]})) && kill "${MON_PIDS[@]}" 2>/dev/null
     [ -n "$BALLAST_PID" ] && kill "$BALLAST_PID" 2>/dev/null
-    [ -n "$SERVE_PID" ] && kill -TERM -- -"$SERVE_PID" 2>/dev/null
+    # 2026-07-20: 原版只发一个 TERM 就退出, 两个后果都踩到了 ——
+    # (a) setsid 起的 serve 脱离进程组, TERM 之后还要走完 30s drain, 脚本
+    #     早退出了它还活着, 下次预检直接被"已有 vllm serve 在跑"挡回来;
+    # (b) 删 kv_fs / backing 写在 run_group 的组收尾里, 组没跑完根本轮不到,
+    #     中断一次就把 35G 留在盘上(本次实测: 盘只剩 1G)。
+    # 所以中断路径必须自己接管清理义务 —— 同 /dev/shm 泄漏那次的教训:
+    # 用信号兜底的脚本, 得替被杀的进程把手尾做完。
+    if [ -n "$SERVE_PID" ]; then
+        kill -TERM -- -"$SERVE_PID" 2>/dev/null
+        for _ in $(seq 1 "${SHUTDOWN_TIMEOUT:-30}"); do
+            kill -0 -- -"$SERVE_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 -- -"$SERVE_PID" 2>/dev/null
+    fi
+    # 盘和 tmpfs 的残留一律清掉。数据本身在 $RES 里, 这些只是 tier 的工作区,
+    # 留着既占盘又污染下一轮的缓存状态。
+    rm -rf "$DATA/kv_fs" 2>/dev/null
+    rm -f "$DATA/kv_tier.bin" "$DATA/kv_tier.bin.stats.json.tmp" 2>/dev/null
+    rm -f /dev/shm/vllm_offload_*.mmap 2>/dev/null
 }
 trap cleanup EXIT
 
