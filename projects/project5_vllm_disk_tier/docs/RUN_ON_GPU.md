@@ -79,6 +79,7 @@ python3 -c "from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory;
 
 # 编译依赖
 apt install -y liburing-dev        # Ubuntu 22.04 自带 liburing 2.1, 够用
+apt install -y fio                 # 盘上限标定用(第 3 步)
 pip install pybind11 pytest openai
 ```
 
@@ -109,6 +110,28 @@ EOF
 ```
 
 ## 3. 引擎冒烟 + 微基准(不涉及 vLLM)
+
+**新宿主先跑一次 fio 盘上限标定**(一次性,不进例行预检;换宿主/换数据盘
+才重跑)。目的:拿到这块盘在**我们的 IO 形状**下的带宽上限,之后
+"引擎打没打满盘"就有客观分母,不用拿引擎自己的数字互相佐证。
+bs 必须对齐真实 block 大小(理由同微基准 --block-mb:盘的上限随请求
+大小变,小了测出来偏低),iodepth 对齐引擎 QD:
+
+```bash
+cd /root/autodl-tmp
+fio --name=wceil --rw=randwrite --bs=1M --size=8G --direct=1 \
+    --ioengine=io_uring --iodepth=32 --numjobs=1 \
+    --runtime=30 --time_based --group_reporting
+fio --name=rceil --rw=randread  --bs=1M --size=8G --direct=1 \
+    --ioengine=io_uring --iodepth=32 --numjobs=1 \
+    --runtime=30 --time_based --group_reporting
+rm -f wceil* rceil*
+```
+
+两个数(写/读 MB/s)记进当次 RESULTS.md 抬头。注意 fio 的 io_uring 在
+punt 宿主(§0)上吃同一笔 io-wq 税 —— 这正合适:它代表"理想 io_uring
+用户在这台机器的天花板",引擎该跟它比。若怀疑单 job 没打满盘,加
+`--numjobs=4` 对照一次,差值就是还没提取的余量。
 
 ```bash
 # 正确性:64 块写→抹→读→逐字节校验

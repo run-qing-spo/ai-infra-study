@@ -21,6 +21,7 @@
 
 import argparse
 import json
+import os
 import random
 import statistics
 import threading
@@ -114,6 +115,10 @@ def main():
     ap.add_argument("--probe-tokens", type=int, default=256,
                     help="mixed 阶段常驻 decode 探针每请求生成的 token 数, 0 关探针。"
                          "探针量的是 ITL 在 IO 高峰被压高多少(E5 的端到端证据)")
+    ap.add_argument("--pre-revisit-stat-dir", default=None,
+                    help="每次 revisit 前对该目录全量 stat(dentry/inode 预热)。"
+                         "E3 dentry 预热对照专用, 只动元数据缓存温度这一个变量;"
+                         "对照组不带本参数(COMPARE_PLAN §55 封顶实验)")
     args = ap.parse_args()
 
     # 提前把 --phases 校验完, 别跑了半宿在中途炸
@@ -172,6 +177,22 @@ def main():
         elif base == "revisit":
             c = int(conc) if conc else args.revisit_concurrency
             q_idx += 1
+            # dentry 预热对照(COMPARE_PLAN §55): revisit 计时窗口之外把目标
+            # 目录全量 stat 扫热。O_DIRECT 下数据页不进 page cache, 这一扫只动
+            # 元数据温度这一个变量;每轮 churn 都新增几千文件冲刷缓存, 所以
+            # 每次 revisit 前都要重扫。行首前缀凑 sumpat 的 ^revisit, 进 SUMMARY。
+            if args.pre_revisit_stat_dir:
+                t0 = time.time()
+                n_f = 0
+                for dirpath, _dirs, files in os.walk(args.pre_revisit_stat_dir):
+                    for fn in files:
+                        try:
+                            os.stat(os.path.join(dirpath, fn))
+                            n_f += 1
+                        except OSError:
+                            pass  # 正撞上 tmp+rename 替换窗口, 跳过
+                print(f"revisit-prewarm: stat {n_f} files in "
+                      f"{time.time() - t0:.1f}s ({args.pre_revisit_stat_dir})")
             print(f"phase {step}: revisit sessions @ concurrency {c} "
                   f"(round {rnd}, this is the number that matters)")
 

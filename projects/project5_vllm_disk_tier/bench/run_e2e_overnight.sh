@@ -5,8 +5,11 @@
 # 用法(远端 GPU 机, 在项目根目录):
 #   tmux new -s e2e
 #   bash bench/run_e2e_overnight.sh e1        # Ctrl-B D 断开
+#   bash bench/run_e2e_overnight.sh e2        # store 剖析: 纯 churn 循环, none/fs/uring × a/b/c
 #   bash bench/run_e2e_overnight.sh e3        # 并发轴: fs/uring 各一次 serve, 扫 c∈{1,4,8,16}×3轮
+#   bash bench/run_e2e_overnight.sh e3dentry  # dentry 预热对照: fs_warm/fs_ctrl 成对 + uring 锚点
 #   bash bench/run_e2e_overnight.sh e4        # 读写混战: churn 流不停 + revisit 波 @c8 + ITL 探针
+#   bash bench/run_e2e_overnight.sh e4phase   # 相位共振干预: uring 波间隔 19.3s×3 + 20s 参考点
 #   bash bench/run_e2e_overnight.sh legacy    # 旧 A/B/C1/C2 四组
 #   # 或者不用 tmux: nohup bash bench/run_e2e_overnight.sh e1 > overnight.log 2>&1 &
 #
@@ -83,6 +86,37 @@ e1)
         "E1_uring_cold|$CFG_URING|uring|1|-|$CACHE_ROOM_GIB|-"
     )
     ;;
+e2)
+    # E2 store 剖析(COMPARE_PLAN E2 重启版): 纯 churn 循环, 把 load 从环境里
+    # 整个拿掉。一次收三件: churn TTFT 税(fs/uring 的 churn 均值 − A 组无
+    # offload 基线;E3 里 fs 系统性 +10ms 的悬案)、吸收率之谜(纯 churn 若
+    # 落盘 ≈8 成 → 坐实"revisit 波打断下沉"; 掉回 2 成 → 文件数/时长衰减)、
+    # store 侧 fs/uring 对比空白。观测三路: fs 的 kv_fs 文件账(收尾统计,
+    # 既有), uring 的 <backing>.stats.json 账本(manager 10s 周期 dump:
+    # 唯一块漏斗 + per-job queue/service 时戳, 2026-07-20 实装), iostat 写带宽。
+    #
+    # churn 压容量(E4 纪律, 零逐出才能写量对称): 上界 = prime 8000 +
+    # 48×488 = 31424 块 ≈ 26.9G < 30G 上限(余 10%)。8 轮 × 6 条: 轮数多、
+    # 每轮小, "落盘增量 vs 文件数"曲线的粒度才够判衰减形态; 文件数推到
+    # ~3.1 万(超 E4 复跑无衰减的 2.6 万, 逼近 E3 低吸收的 4 万)。时长轴
+    # (E3 的 30+ 分钟)在零逐出约束下盖不满, 如实记为本设计的边界。
+    # A 组也跑同一负载: churn 不读盘、文本全新不吃 prefix cache, TTFT 由
+    # GPU prefill 主导, 三组可比;它的 iostat 顺带证"无 offload 时零盘写"。
+    E2_PHASES="prime"
+    for _ in 1 2 3 4 5 6 7 8; do E2_PHASES+=",churn"; done
+    E2_ARGS="--phases $E2_PHASES --churn 6"
+    SPECS=(
+        "E2_none_a|-|-|1|-|0|$E2_ARGS"
+        "E2_fs_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E2_ARGS"
+        "E2_uring_a|$CFG_URING|uring|1|-|0|$E2_ARGS"
+        "E2_none_b|-|-|1|-|0|$E2_ARGS"
+        "E2_fs_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E2_ARGS"
+        "E2_uring_b|$CFG_URING|uring|1|-|0|$E2_ARGS"
+        "E2_none_c|-|-|1|-|0|$E2_ARGS"
+        "E2_fs_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E2_ARGS"
+        "E2_uring_c|$CFG_URING|uring|1|-|0|$E2_ARGS"
+    )
+    ;;
 e3)
     # E3 并发 load 深度(COMPARE_PLAN E3): 同一 serve 内 prime 一次, 每个并发
     # 档 c 前重新 churn 把前缀挤回盘, 每档 3 轮取合并样本。不压舱 ——
@@ -95,6 +129,30 @@ e3)
     SPECS=(
         "E3_fs|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|--phases $E3_PHASES"
         "E3_uring|$CFG_URING|uring|1|-|0|--phases $E3_PHASES"
+    )
+    ;;
+e3dentry)
+    # E3 归因封顶: dentry 预热对照(COMPARE_PLAN §55)。§14 微基准已证冷元数据
+    # **足以**致碎(充分性), 这里补 e2e 内的干预(排他性): 同 E3 负载, warm 组
+    # 每次 revisit 前把 kv_fs 全量 stat 扫热 —— O_DIRECT 下数据页不进 page
+    # cache, 只动元数据温度一个变量。预测: warm 组 fs 设备请求尺寸回 ~773KiB、
+    # 请求数骤降、对 uring 差距显著收窄; 不中则归因降级回"充分性+内插一致"。
+    #
+    # 不重跑完整 E3 矩阵: 档位压到 c=16 单档(分化最大, +39%)× 3 轮;
+    # fs_warm/fs_ctrl 同机成对消跨 serve 漂移(E1 纪律), uring 各一组当同机
+    # 差距锚点; b 轮把 warm/ctrl 顺序对调, 抵消单调 serve 漂移(E6 学的)。
+    # churn 16 条/轮 × 3 轮 = 48 条: 上界 8000 + 48×488 = 31424 块 ≈ 26.9G
+    # < 30G, uring 组零逐出; 挤出压力 16 条已由 E4 自验证够(满量 5443MB)。
+    E3D_PHASES="prime,churn,revisit@16,churn,revisit@16,churn,revisit@16"
+    E3D_CTRL="--phases $E3D_PHASES --churn 16"
+    E3D_WARM="$E3D_CTRL --pre-revisit-stat-dir $DATA/kv_fs"
+    SPECS=(
+        "E3D_fs_warm_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E3D_WARM"
+        "E3D_fs_ctrl_a|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E3D_CTRL"
+        "E3D_uring_a|$CFG_URING|uring|1|-|0|$E3D_CTRL"
+        "E3D_fs_ctrl_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E3D_CTRL"
+        "E3D_fs_warm_b|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E3D_WARM"
+        "E3D_uring_b|$CFG_URING|uring|1|-|0|$E3D_CTRL"
     )
     ;;
 e4)
@@ -144,6 +202,22 @@ e4)
         "E4_uring_b|$CFG_URING|uring|1|-|0|$E4_MIXED"
         "E4_fs_c|$CFG_FS|fs|1|PYTHONHASHSEED=0|0|$E4_MIXED"
         "E4_uring_c|$CFG_URING|uring|1|-|0|$E4_MIXED"
+    )
+    ;;
+e4phase)
+    # E4 相位共振干预(COMPARE_PLAN §100): 波间隔 20s ≈ 16.0 × churn 周期
+    # 1.24~1.25s ⇒ 相位在 serve 内被冻住, 抽中坏相位整个 serve 全坏(uring_a
+    # 那次 +78%)。互质间隔 19.3s(≈15.44 周期)让相位逐波游走 —— 预测:
+    # "全坏 serve"消失, 各 serve 的批间形态趋同(逐批散点核, e4_phase_audit.py);
+    # 不中则相位冻结归因要回炉。20s 参考点同机再锚一次(用户定: 一个即可)。
+    # fs 不陪跑: 其 +117% 劣化与 GPU 相位无关, 散点已证(§109)。
+    # 容量与 e4 同一套预算: 上界 ≈ 28.4G < 30G, 零逐出。
+    E4P_BASE="--phases prime,churn,revisit@8,mixed@8 --churn 16 --mixed-waves 2"
+    SPECS=(
+        "E4P_uring_193_a|$CFG_URING|uring|1|-|0|$E4P_BASE --mixed-interval 19.3"
+        "E4P_uring_200_ref|$CFG_URING|uring|1|-|0|$E4P_BASE --mixed-interval 20"
+        "E4P_uring_193_b|$CFG_URING|uring|1|-|0|$E4P_BASE --mixed-interval 19.3"
+        "E4P_uring_193_c|$CFG_URING|uring|1|-|0|$E4P_BASE --mixed-interval 19.3"
     )
     ;;
 e6)
@@ -230,7 +304,7 @@ legacy)
     )
     ;;
 *)
-    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e3 / e4 / e6 / gil / legacy)" >&2
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e2 / e3 / e3dentry / e4 / e4phase / e6 / gil / legacy)" >&2
     exit 1
     ;;
 esac
@@ -409,6 +483,12 @@ run_group() {
           --shutdown-timeout "$SHUTDOWN_TIMEOUT")
     [ "$cfg" != "-" ] && cmd+=(--kv-transfer-config "$cfg")
 
+    # 上一组 uring 账本的残留(fail 路径没收走的)先挪走, 别被本组 serve 覆盖
+    if [ -f "$DATA/kv_tier.bin.stats.json" ]; then
+        mv "$DATA/kv_tier.bin.stats.json" "$RES/tier_stats_${group}_stale.json"
+        log "  !! 发现上一组未收走的 uring 账本, 存为 tier_stats_${group}_stale.json"
+    fi
+
     setsid "${cmd[@]}" > "$slog" 2>&1 &
     SERVE_PID=$!
     log "  serve 已启动 pid=$SERVE_PID, 等就绪..."
@@ -508,6 +588,21 @@ run_group() {
         log "  !! 显存清不掉, 中止剩余组, 免得后面全是 OOM 废数据"
         GROUP_STATUS[$group]="${GROUP_STATUS[$group]} GPU_STUCK"
         return 2
+    fi
+
+    # uring 账本(唯一块漏斗 + per-job 时戳)收进结果目录。必须在 stop_serve
+    # 之后: 全量终写挂在 manager.shutdown() 上, 优雅关停时才发生; 万一被
+    # pkill -9 兜底打死, 这里收到的是 10s 周期 dump 的最后一版, 照收并记警报
+    # (账本缺尾巴 ≠ 作废, 但分析时要知道)。.tmp 残留一并清掉。
+    if [ "$expect" = uring ]; then
+        if [ -f "$DATA/kv_tier.bin.stats.json" ]; then
+            mv "$DATA/kv_tier.bin.stats.json" "$RES/tier_stats_$group.json"
+            log "  uring 账本已收: tier_stats_$group.json"
+        else
+            log "  !! uring 账本缺失(.stats.json 没出现) —— manager dump 没跑?"
+            GROUP_STATUS[$group]="${GROUP_STATUS[$group]:-OK} WARN(stats)"
+        fi
+        rm -f "$DATA/kv_tier.bin.stats.json.tmp"
     fi
     return 0
 }
