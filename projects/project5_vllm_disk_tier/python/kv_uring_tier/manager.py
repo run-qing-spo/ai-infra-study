@@ -180,8 +180,16 @@ class UringSecondaryTierManager(SecondaryTierManager):
         # "上层静默丢块"在这层数不到(丢弃发生在 vLLM 侧, 调用根本不来),
         # 证伪靠两头对账:bench 算的 churn 产出块数 vs 这里的 offered。
         self._counters: Counter = Counter()
-        # 引擎 per-job 账本的 Python 侧缓存(drain_records 批量取走后攒着)
-        self._job_records: list[tuple] = []
+        # per-job 账本不在内存里攒:每次 drain 出来立刻 append 到
+        # <backing>.records.jsonl。2026-07-20 E3D 的教训 —— 原来攒在
+        # self._job_records 里等周期 dump 全量覆盖写, 结果 10s 的 dump 周期
+        # 和 21s 一轮的 revisit 撞相位, 第三轮记录必然落在最后一次 dump 之后,
+        # 而 shutdown 的补写又没跑(见 shutdown 注释), 整轮数据跟着进程没了。
+        # 两组一模一样地丢 r3, 不是偶然是相位。写完即落就没有"最后的机会"
+        # 这回事; 顺带治了全量覆盖的 O(n²) —— 记录只增不减, 实验越长写越重。
+        self._records_path: str = self._path + ".records.jsonl"
+        self._records_fp = None       # 首次写时才开, 单测不落文件
+        self._records_written: int = 0
         # 初始化成"现在", 让第一次落盘发生在启动 _DUMP_INTERVAL_S 之后 ——
         # 单测(毫秒级)永远不会触发周期 dump, 不往 /tmp 撒文件
         self._last_dump: float = time.monotonic()
@@ -350,6 +358,8 @@ class UringSecondaryTierManager(SecondaryTierManager):
                             self._free.append(self._present.pop(k))
                             self._counters["evicted_after_load_fail"] += 1
             results.append(JobResult(job_id=job_id, success=ok))
+        # 记录每次收割都落, 快照按周期落 —— 两条节奏分开, 见 _flush_records
+        self._flush_records()
         self._maybe_dump()
         return results
 
@@ -370,8 +380,18 @@ class UringSecondaryTierManager(SecondaryTierManager):
         # 22659 块 manager 只记 22556)。这里补一次收割再落账 —— 结果丢掉是
         # 对的, 上层已经不再来问了, 我们只要账。
         list(self.get_finished_jobs())
-        # 账本终写要在删 backing 之前;stats 文件本身不删, bench 收尾要收走
+        # 账本终写要在删 backing 之前;stats 文件本身不删, bench 收尾要收走。
+        # 注意这次终写已经**不是**记录的最后防线了 —— 2026-07-20 实测它在
+        # SIGINT 关停下压根没跑(账本 t_wall 停在 r3 开始前 0.2s), 上游到底
+        # 有没有调到这层的 shutdown() 还没查清。记录靠每次收割即落兜底,
+        # 这里只补最后一次快照。
         self._dump_stats()
+        if self._records_fp is not None:
+            try:
+                self._records_fp.close()
+            except OSError:
+                pass
+            self._records_fp = None
         # cache tier 语义:内容不跨进程生命周期保留(同 P4 SsdBlockStore 析构
         # unlink 的决定)。要做持久化 KV 池是另一个项目。
         try:
@@ -427,13 +447,45 @@ class UringSecondaryTierManager(SecondaryTierManager):
             return
         self._dump_stats()
 
+    def _flush_records(self) -> None:
+        """引擎里攒的 per-job 记录追加落盘, 一行一条。
+
+        独立于 _dump_stats 是有意的, 而且**必须**每次收割都调, 不能挂在 10s
+        的 dump 周期上 —— 挂上去就等于没改, r3 照样丢在最后一次 dump 之后。
+        记录是流水账只能 append;counters / gauges 是快照必须整体覆盖, 混在
+        一个文件里就得全量重写, 那正是丢 r3 的那个设计。
+
+        只 flush 到内核, 不 fsync。要防的是进程被 SIGKILL(shm 泄漏那课
+        已经证明这条路随时会走), 写进内核页缓存就够了, 进程没了数据还在;
+        真机器掉电丢最后几条记录, 这个代价认。fsync 在 scheduler 线程上
+        每次收割来一发, 那是拿被测系统的延迟去换观测, 本末倒置。
+        """
+        rows = self._engine.drain_records()
+        if not rows:
+            return
+        try:
+            if self._records_fp is None:
+                self._records_fp = open(self._records_path, "a")
+            for r in rows:
+                self._records_fp.write(json.dumps(list(r)) + "\n")
+            self._records_fp.flush()
+            self._records_written += len(rows)
+        except OSError as e:
+            if not self._dump_warned:
+                self._dump_warned = True
+                logger.warning("tier records append to %s failed: %s",
+                               self._records_path, e)
+
     def _dump_stats(self) -> None:
         self._last_dump = time.monotonic()
-        self._job_records.extend(self._engine.drain_records())
+        self._flush_records()
         payload = self.tier_stats()
+        # 记录本体在 .records.jsonl 里, 这里只留 schema 和条数, 供分析脚本
+        # 对账:条数对不上就是 flush 漏了, 别拿残缺账本得结论
         payload["job_records"] = {
             "schema": self._RECORD_SCHEMA,
-            "rows": self._job_records,
+            "path": os.path.basename(self._records_path),
+            "n_rows": self._records_written,
         }
         path = self._path + ".stats.json"
         try:

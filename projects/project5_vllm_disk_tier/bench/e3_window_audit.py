@@ -8,10 +8,16 @@
                  之外", 得出"加载滞后、没测到引擎"的结论 —— 纯属对齐错误。
                  t_wall 取值在请求发出**之前**(long_context_ttft.py one_request),
                  窗口是 [t_wall, t_wall + total]。
-  第二次(对的)  读 job 100% 落在 revisit 窗口内, 一块没漏。真正的问题是别的:
-                 r1 读 5832 块 IO 只花 40ms 而 TTFT 1121ms; r2 读 6221 块 45ms
-                 TTFT 531ms; r3 一块不读 TTFT 517ms。读与不读几乎不影响 TTFT
-                 —— IO 占 TTFT 约 4%, 引擎再快也没地方兑现。
+  第二次           读 job 100% 落在 revisit 窗口内。r1 读 5832 块 IO 只花 40ms 而
+                 TTFT 1121ms, r2 读 6221 块 45ms TTFT 531ms —— IO 占 TTFT 不到
+                 10%, 引擎再快也没地方兑现。这条站得住。
+  第三次           但当时把 r3 的"零读"读成了"数据全在内存、没碰盘", 那是错的。
+                 引擎 bytes_read 10.30 GiB, 设备实际读 15.62 GiB, 差 5.32 GiB
+                 正好一轮; 账本 t_wall 停在 r3 开始前 0.20s(uring_b 是 0.47s)。
+                 真相是账本被截断:10s 的 dump 周期撞 21s 一轮的 revisit, r3 必然
+                 落在最后一次 dump 之后, 而 shutdown 的终写在 SIGINT 关停下没跑。
+                 修法见 manager.py 的 _flush_records —— 记录改成收割即 append。
+                 教训: 账本里的"没有", 要和设备侧对账过才是"没发生"。
 
 所以判据不是"加载在不在窗口内"(那题已答完), 而是 **IO 服务时间占 TTFT 的比例**。
 占比低于 IO_BOUND_FRAC 时, 这个负载就不是 IO-bound 的, 拿它比 fs/uring 的 TTFT
@@ -92,7 +98,10 @@ for path in sorted(glob.glob(f"{RES}/tier_stats_*.json")):
             note = (f"IO 服务 mean={statistics.mean(svc):5.1f}ms max={max(svc):6.1f}ms"
                     f"  → 占 TTFT {frac:5.1%}")
         else:
-            note = "零读 —— 这轮全在 tier 内存里, 没碰盘"
+            # 别急着读成"没碰盘"。E3D 两组的 r3 都是零读记录, 查下来是账本被
+            # 截断(dump 周期撞实验节奏 + shutdown 终写没跑), 设备侧实打实读了
+            # 5.32 GiB。真没读还是没记下来, 要拿设备侧读量对账才能分辨
+            note = "零读记录 —— 先与 iostat 对账, 可能是账本截断而非真没读"
         print(f"  r{r_no} 窗口[{lo - t0:6.1f},{hi - t0:6.1f}]s  "
               f"读job={len(rd):3d} blocks={sum(r[2] for r in rd):6d}  "
               f"TTFT={ttft:7.1f}ms  {note}")

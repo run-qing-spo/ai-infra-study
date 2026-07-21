@@ -632,9 +632,15 @@ run_group() {
     # 直到今天才发现(吸收率 23% 的真身就是盘的物理上限, 不是 store 路径衰减)。
     # 满盘不只是丢块: XFS 接近满时分配器劣化, 且失败路径本身在刷元数据操作,
     # 两者都直接砸在被测的 IO 路径上 ⇒ 见到就作废, 不许当"轻微异常"。
+    # grep -c 无匹配时**既打印 0 又返回退出码 1**, 所以 `|| echo 0` 会在已有的
+    # "0" 后面再追加一个 "0", 变量成了两行的 "0\n0"; 再拿字符串比 != 0 必然
+    # 成立 —— 2026-07-20 的 gil 九组就这样全被误判作废, 而实际一次 ENOSPC 都
+    # 没有。改用 || true 保住退出码, 并换成数值比较: 万一以后又混进非数字,
+    # 是当场报错而不是静默把好数据判死。
     local nospc
-    nospc=$(grep -icE "No space left on device" "$slog" 2>/dev/null || echo 0)
-    if [ "${nospc:-0}" != 0 ]; then
+    nospc=$(grep -icE "No space left on device" "$slog" 2>/dev/null || true)
+    nospc=${nospc:-0}
+    if [ "$nospc" -ne 0 ]; then
         log "  !! 盘满: serve 日志 ${nospc} 次 ENOSPC —— 本组数据作废, 缩小负载重跑"
         GROUP_STATUS[$group]="FAIL(ENOSPC×${nospc})"
     fi
