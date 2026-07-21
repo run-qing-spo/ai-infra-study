@@ -22,3 +22,12 @@ def register() -> None:
         logger.info("Registered secondary tier type 'uring'")
     except ValueError:
         pass  # 已注册(plugin 被加载了多次), 幂等处理
+
+    # 调度层 tier IO 计时埋点。只在设了 KVTIER_SCHED_LEDGER 时真装, 否则 no-op。
+    # 借同一个 plugin 钩子 = fs 组也会装(plugin 与配哪个 tier 无关), 这样 fs
+    # 才有 IO 账本可算占比。见 sched_ledger.py。
+    try:
+        from . import sched_ledger
+        sched_ledger.maybe_install()
+    except Exception as e:  # 埋点绝不能影响注册主流程
+        logger.warning("sched_ledger 未装载(不影响 serve): %r", e)

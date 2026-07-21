@@ -531,6 +531,13 @@ run_group() {
         log "  !! 发现上一组未收走的 uring 流水, 存为 tier_stats_${group}_stale.records.jsonl"
     fi
 
+    # 调度层 tier IO 计时账本(fs 和 uring 都写, 同高度可比)。文件名带组名,
+    # 每组各写各的, 无跨组 append 污染, 不用像 uring 原生账本那样挪残留。
+    # serve 进程(及 spawn 的 EngineCore)继承这个环境变量, 由 kv_uring_tier
+    # 的 plugin 钩子 sched_ledger.maybe_install() 认到才启用。绝对路径:serve
+    # 的 CWD 未必是脚本 CWD。算完用 bench/tier_io_share.py 读。
+    export KVTIER_SCHED_LEDGER="$PWD/$RES/tier_stats_${group}.sched.records.jsonl"
+
     setsid "${cmd[@]}" > "$slog" 2>&1 &
     SERVE_PID=$!
     log "  serve 已启动 pid=$SERVE_PID, 等就绪..."
