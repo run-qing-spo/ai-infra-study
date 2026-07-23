@@ -1,0 +1,27 @@
+{
+  "vllm": {
+    "repository": "https://github.com/vllm-project/vllm.git",
+    "tag": "v0.24.0",
+    "commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "commit_date": "2026-06-28",
+    "docs": "https://docs.vllm.ai/en/v0.24.0/features/kv_offloading_usage/"
+  },
+  "scope": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py",
+    "vllm/v1/kv_offload/base.py",
+    "vllm/v1/kv_offload/cpu/manager.py",
+    "vllm/v1/kv_offload/cpu/spec.py",
+    "vllm/v1/kv_offload/tiering/base.py",
+    "vllm/v1/kv_offload/tiering/manager.py",
+    "vllm/v1/kv_offload/tiering/spec.py",
+    "vllm/v1/kv_offload/tiering/factory.py",
+    "vllm/v1/kv_offload/tiering/async_lookup.py",
+    "vllm/v1/kv_offload/tiering/fs/manager.py",
+    "vllm/v1/kv_offload/tiering/fs/io.py",
+    "vllm/v1/kv_offload/tiering/fs/thread_pool.py",
+    "vllm/v1/kv_offload/file_mapper.py"
+  ]
+}
+
