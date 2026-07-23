@@ -1,5 +1,5 @@
-# sched_ledger — 调度层的 tier IO 计时埋点。回答的问题是:
-#   "fs tier 一次 load 让请求阻塞了多久", 从而算出 IO 占 TTFT 的比例。
+# sched_ledger — 调度层的 tier job 计时埋点。回答的问题是:
+#   "框架提交一次 secondary job 后,多久首次观察到它完成"。
 #
 # 为什么需要它:uring tier 有 C++ 引擎的 per-job 账本(设备下发→完成,
 # manager._RECORD_SCHEMA), fs tier 走 vLLM 原生路径, JobResult 只带
@@ -16,14 +16,15 @@
 #
 #   t_submit = submit_load/submit_store 被调用的时刻
 #   t_done   = 框架 get_finished_jobs() 首次看到这个 job 完成的时刻
-#   服务时间 = t_done - t_submit = "请求为了等这个 tier 阻塞了多久"
+#   job sojourn = t_done - t_submit。它含 tier 排队、IO 和 scheduler 轮询粒度,
+#   但在补到 request_resume 事件前,不能把它直接命名成"请求阻塞时间"。
 #
 # 这比 uring 的 C++ 账本(设备下发→完成)宽一点:它含了排队 + 轮询粒度。
-# 但它才是能放进 TTFT 占比的那个分子(请求真正等的时间)。uring 的窄账本
-# 留作"设备读本身多快"的交叉验证, 两者不混。
+# 等 request_resume 事件补齐后,才能判断其中多少真正落在请求关键路径上。
+# uring 的窄账本留作"设备读本身多快"的交叉验证,两者不混。
 #
-# 时钟用 time.time()(epoch), 和 bench 的 t_wall、uring 账本的 t_wall 同坐标,
-# tier_io_share.py 的窗口对齐才成立(别用 perf_counter, 那是任意原点)。
+# wall time 保留给旧的 iostat 窗口对齐;正式持续时间使用 monotonic_ns,
+# 不受 NTP/系统校时影响。
 #
 # 开关:只在设了环境变量 KVTIER_SCHED_LEDGER(指向要写的 .jsonl)时启用,
 # 没设就完全不动手。任何异常一律吞掉打日志 —— 埋点绝不能把 serve 带崩。
@@ -32,6 +33,8 @@ import logging
 import os
 import threading
 import time
+
+from .request_ids import extract_req_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +48,10 @@ def _extract_job_metadata(args, kwargs):
 def _instrument_tier(tier, write_row):
     """给单个 tier 实例的 submit/get_finished 覆盖上计时版(实例级, 不动类)。"""
     tier_type = getattr(tier, "tier_type", "?")
-    # job_id -> (is_write, n_blocks, t_submit)。只在调度线程读写, 无需加锁,
+    # job_id -> job metadata。只在调度线程读写, 无需加锁,
     # 但 write_row 落文件是共享的, 那把锁在外面。
     pending: dict = {}
+    run_id = os.environ.get("KVTIER_RUN_ID", "")
 
     orig_submit_load = tier.submit_load
     orig_submit_store = tier.submit_store
@@ -58,7 +62,17 @@ def _instrument_tier(tier, write_row):
         if jm is None:
             return
         try:
-            pending[jm.job_id] = (is_write, int(len(jm.block_ids)), time.time())
+            req_context = getattr(jm, "req_context", None)
+            engine_req_id = getattr(req_context, "req_id", None)
+            pending[jm.job_id] = {
+                "is_write": is_write,
+                "is_promotion": bool(getattr(jm, "is_promotion", False)),
+                "n_blocks": int(len(jm.block_ids)),
+                "req_id": extract_req_id(engine_req_id),
+                "vllm_internal_req_id": engine_req_id,
+                "t_submit": time.time(),
+                "t_submit_mono_ns": time.monotonic_ns(),
+            }
         except Exception:
             pass
 
@@ -73,18 +87,27 @@ def _instrument_tier(tier, write_row):
     def w_get_finished(*args, **kwargs):
         results = list(orig_get_finished(*args, **kwargs))
         t_done = time.time()
+        t_done_mono_ns = time.monotonic_ns()
         for r in results:
             info = pending.pop(getattr(r, "job_id", None), None)
             if info is None:
                 continue  # store 的完成也会出现;没 stash 到的(极早期)跳过
-            is_write, n_blocks, t_submit = info
             write_row({
+                "schema_version": 1,
+                "record_type": "tier_job",
+                "run_id": run_id,
                 "tier": tier_type,
                 "job_id": r.job_id,
-                "is_write": is_write,
-                "n_blocks": n_blocks,
-                "t_submit": t_submit,
+                "req_id": info["req_id"],
+                "vllm_internal_req_id": info["vllm_internal_req_id"],
+                "is_write": info["is_write"],
+                "is_promotion": info["is_promotion"],
+                "n_blocks": info["n_blocks"],
+                "success": bool(getattr(r, "success", False)),
+                "t_submit": info["t_submit"],
                 "t_done": t_done,
+                "t_submit_mono_ns": info["t_submit_mono_ns"],
+                "t_done_mono_ns": t_done_mono_ns,
             })
         return results
 

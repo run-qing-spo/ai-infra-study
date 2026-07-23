@@ -427,6 +427,7 @@ class UringSecondaryTierManager(SecondaryTierManager):
 
     def tier_stats(self) -> dict:
         return {
+            "run_id": os.environ.get("KVTIER_RUN_ID", ""),
             "t_wall": time.time(),
             "block_size": self._block_size,
             "num_slots": self._num_slots,

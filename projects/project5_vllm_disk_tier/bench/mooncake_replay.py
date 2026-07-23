@@ -52,6 +52,7 @@
 import argparse
 import gzip
 import json
+import os
 import random
 import re
 import statistics
@@ -475,6 +476,7 @@ def replay(recs: list[dict], args):
     这样到达过程(= E3 的并发轴来源)才被如实复现。"""
     from openai import OpenAI
     from long_context_ttft import one_request
+    from kv_uring_tier.request_ids import make_req_id
     client = OpenAI(base_url=args.base_url, api_key="EMPTY")
     bt = BlockText(args.block_words, args.seed)
 
@@ -483,19 +485,25 @@ def replay(recs: list[dict], args):
     saturated = threading.Event()
 
     def fire(idx: int, r: dict):
+        req_id = make_req_id(args.run_id, f"mooncake:request:{idx}")
         try:
             n_out = min(int(r["output_length"] * args.output_scale),
                         args.output_cap) if args.output_cap else \
                     int(r["output_length"] * args.output_scale)
             n_out = max(1, n_out)
             prompt = build_prompt(bt, r["hash_ids"])
-            s = one_request(client, args.model, prompt, n_out)
+            s = one_request(client, args.model, prompt, n_out,
+                            request_id=req_id)
             s["idx"] = idx
             s["arrival_s"] = r["_arrival_s"]
             s["n_blocks"] = len(r["hash_ids"])
+            s["run_id"] = args.run_id
+            s["phase"] = "mooncake_replay"
             samples[idx] = s
         except Exception as e:                       # 单条失败不该整轮崩
-            samples[idx] = dict(idx=idx, ttft=None, err=repr(e),
+            samples[idx] = dict(req_id=req_id, run_id=args.run_id,
+                                phase="mooncake_replay", idx=idx,
+                                ttft=None, err=repr(e),
                                 arrival_s=r["_arrival_s"])
         finally:
             inflight.release()
@@ -596,6 +604,8 @@ def main():
     ap.add_argument("--base-url", default="http://localhost:8000/v1")
     ap.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--json", default=None, help="原始样本落到这个文件")
+    ap.add_argument("--run-id", default=os.environ.get("KVTIER_RUN_ID", ""),
+                    help="本次 serve lifecycle 的唯一 ID;正式 runner 自动设置")
     ap.add_argument("--dry-run", action="store_true",
                     help="只解析+标定+安检, 不连 server, 不烧 GPU")
     # 超长请求过滤:trace 的 input_length p99 可达 8w+ token, 远超 serve 的
@@ -634,6 +644,8 @@ def main():
                          "宿主实测值; 换模型/换卡要照 serve 日志的 "
                          "'GPU KV cache size' 改")
     args = ap.parse_args()
+    if not args.run_id:
+        args.run_id = f"manual-{time.time_ns()}"
 
     recs = load_trace(args.trace)
     n_all = len(recs)

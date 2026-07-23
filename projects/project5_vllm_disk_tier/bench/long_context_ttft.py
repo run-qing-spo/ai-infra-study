@@ -26,9 +26,11 @@ import random
 import statistics
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from openai import OpenAI
+from kv_uring_tier.request_ids import make_req_id
 
 # 用固定词表拼可复现的"伪文档"。词≈token 的换算按 1 词 ≈ 1.3 token 粗估,
 # 精确 token 数不重要 —— 三组配置吃到的是同一批 prompt, 对比是公平的。
@@ -42,26 +44,49 @@ def make_text(rng: random.Random, n_words: int) -> str:
 
 
 def one_request(client, model: str, prompt: str, max_tokens: int,
-                keep_chunk_times: bool = False) -> dict:
+                keep_chunk_times: bool = False,
+                request_id: str = None) -> dict:
     """流式发一次补全, 掐第一个 token 的表。"""
+    # formal runner 总会传确定性 ID;随机 fallback 只给手工调用保底。
+    request_id = request_id or ("kvt-" + uuid.uuid4().hex)
     t_wall = time.time()      # 绝对时间戳:事后把样本对到 iostat/meminfo 的时间轴上
+    t_start_ns = time.monotonic_ns()
     t0 = time.perf_counter()
     ttft = None
+    t_first_ns = None
     n_chunks = 0
+    response_id = None
     chunk_t = [] if keep_chunk_times else None   # 逐 token 绝对到达时刻(ITL 探针用)
     stream = client.completions.create(
         model=model, prompt=prompt, max_tokens=max_tokens,
         temperature=0.0, stream=True,
+        # vLLM 0.24.0 的 _base_request_id() 明确优先读取 X-Request-Id。
+        # 走 header 不依赖 OpenAI SDK 是否把 vLLM 扩展字段列进请求模型。
+        extra_headers={"X-Request-Id": request_id},
     )
     for chunk in stream:
+        chunk_response_id = getattr(chunk, "id", None)
+        if chunk_response_id is not None:
+            if response_id is None:
+                response_id = chunk_response_id
+            elif chunk_response_id != response_id:
+                raise RuntimeError(
+                    f"one request returned multiple response ids: "
+                    f"{response_id!r} vs {chunk_response_id!r}"
+                )
         if chunk.choices and chunk.choices[0].text:
             if ttft is None:
                 ttft = time.perf_counter() - t0
+                t_first_ns = time.monotonic_ns()
             n_chunks += 1
             if chunk_t is not None:
                 chunk_t.append(time.time())
-    d = dict(ttft=ttft, total=time.perf_counter() - t0, chunks=n_chunks,
-             t_wall=t_wall)
+    t_done_ns = time.monotonic_ns()
+    d = dict(req_id=request_id, response_id=response_id,
+             ttft=ttft, total=time.perf_counter() - t0, chunks=n_chunks,
+             t_wall=t_wall, client_start_mono_ns=t_start_ns,
+             client_first_chunk_mono_ns=t_first_ns,
+             client_done_mono_ns=t_done_ns)
     if chunk_t is not None:
         d["chunk_t"] = chunk_t
     return d
@@ -86,6 +111,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://localhost:8000/v1")
     ap.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    ap.add_argument("--run-id", default=os.environ.get("KVTIER_RUN_ID", ""),
+                    help="本次 serve lifecycle 的唯一 ID;进入每条客户端样本和"
+                         "服务端账本,正式 runner 会自动设置")
     ap.add_argument("--sessions", type=int, default=16,
                     help="长前缀会话数。sessions × prefix 要 > CPU tier 容量才踩得到盘")
     ap.add_argument("--prefix-words", type=int, default=6000,
@@ -120,6 +148,8 @@ def main():
                          "E3 dentry 预热对照专用, 只动元数据缓存温度这一个变量;"
                          "对照组不带本参数(COMPARE_PLAN §55 封顶实验)")
     args = ap.parse_args()
+    if not args.run_id:
+        args.run_id = f"manual-{time.time_ns()}"
 
     # 提前把 --phases 校验完, 别跑了半宿在中途炸
     phases = [t.strip() for t in args.phases.split(",") if t.strip()]
@@ -142,6 +172,8 @@ def main():
     def run_and_report(key: str, round_no: int, samples: list[dict]):
         for s in samples:
             s["round"] = round_no
+            s["phase"] = key
+            s["run_id"] = args.run_id
         out.setdefault(key, []).extend(samples)
         report(key, samples)
 
@@ -159,7 +191,9 @@ def main():
             run_and_report(tok, rnd, [
                 one_request(client, args.model,
                             p + f"\n\nQuestion 1: summarize keyword #{i}. Answer:",
-                            args.gen_tokens)
+                            args.gen_tokens,
+                            request_id=make_req_id(
+                                args.run_id, f"prime:{rnd}:session:{i}"))
                 for i, p in enumerate(prefixes)
             ])
 
@@ -170,8 +204,10 @@ def main():
             run_and_report(tok, rnd, [
                 one_request(client, args.model,
                             make_text(rng, args.churn_words) + "\n\nSummarize. Answer:",
-                            args.gen_tokens)
-                for _ in range(args.churn)
+                            args.gen_tokens,
+                            request_id=make_req_id(
+                                args.run_id, f"churn:{rnd}:request:{i}"))
+                for i in range(args.churn)
             ])
 
         elif base == "revisit":
@@ -200,7 +236,10 @@ def main():
                 i, p = i_p
                 return one_request(client, args.model,
                                    p + f"\n\nQuestion {q}: now count keyword #{i}. Answer:",
-                                   args.gen_tokens)
+                                   args.gen_tokens,
+                                   request_id=make_req_id(
+                                       args.run_id,
+                                       f"revisit:{tok}:{rnd}:session:{i}"))
 
             if c <= 1:
                 samples = [go(ip) for ip in enumerate(prefixes)]
@@ -223,6 +262,16 @@ def main():
             # 且独立播种保证三个流的文本互不重复(重复文本命中 prefix cache)
             churn_rng = random.Random(args.seed + 1000 * rnd)
             churn_samples = []
+            churn_seq = 0
+            churn_seq_lock = threading.Lock()
+
+            def next_churn_req_id():
+                nonlocal churn_seq
+                with churn_seq_lock:
+                    seq = churn_seq
+                    churn_seq += 1
+                return make_req_id(
+                    args.run_id, f"mixed:{tok}:{rnd}:churn:{seq}")
 
             def churn_flow():
                 # 闭环发压, 节奏与独立 churn phase 相同, 唯一区别是不停
@@ -232,12 +281,23 @@ def main():
                             client, args.model,
                             make_text(churn_rng, args.churn_words)
                             + "\n\nSummarize. Answer:",
-                            args.gen_tokens))
+                            args.gen_tokens,
+                            request_id=next_churn_req_id()))
                 except Exception as e:
                     dead.append(f"churn 流死于: {e!r}")
 
             probe_rng = random.Random(args.seed + 2000 * rnd)
             probe_samples = []
+            probe_seq = 0
+            probe_seq_lock = threading.Lock()
+
+            def next_probe_req_id():
+                nonlocal probe_seq
+                with probe_seq_lock:
+                    seq = probe_seq
+                    probe_seq += 1
+                return make_req_id(
+                    args.run_id, f"mixed:{tok}:{rnd}:probe:{seq}")
 
             def probe_flow():
                 # 常驻长 decode:逐 token 记绝对时刻, 事后对 iostat 看 IO 高峰
@@ -249,7 +309,8 @@ def main():
                             client, args.model,
                             make_text(probe_rng, 200)
                             + "\n\nWrite a long story. Answer:",
-                            args.probe_tokens, keep_chunk_times=True))
+                            args.probe_tokens, keep_chunk_times=True,
+                            request_id=next_probe_req_id()))
                 except Exception as e:
                     dead.append(f"decode 探针死于: {e!r}")
 
@@ -275,13 +336,18 @@ def main():
                     return one_request(
                         client, args.model,
                         p + f"\n\nQuestion {q}: now count keyword #{i}. Answer:",
-                        args.gen_tokens)
+                        args.gen_tokens,
+                        request_id=make_req_id(
+                            args.run_id,
+                            f"mixed:{tok}:{rnd}:wave:{wave}:session:{i}"))
 
                 with ThreadPoolExecutor(max_workers=c) as ex:
                     ws = list(ex.map(go_wave, enumerate(prefixes)))
                 # 波编号跨多个 mixed token 连续, 语义与 revisit 的 round 一致
                 for s in ws:
                     s["round"] = (rnd - 1) * args.mixed_waves + wave
+                    s["phase"] = f"mixed_revisit@{c}"
+                    s["run_id"] = args.run_id
                 wave_samples.extend(ws)
                 report(f" wave {wave}", ws)
 
@@ -295,11 +361,15 @@ def main():
             report(f"mixed_revisit@{c}", wave_samples)
             for s in churn_samples:
                 s["round"] = rnd
+                s["phase"] = "mixed_churn"
+                s["run_id"] = args.run_id
             out.setdefault("mixed_churn", []).extend(churn_samples)
             report("mixed_churn", churn_samples)
             if probe_samples:
                 for s in probe_samples:
                     s["round"] = rnd
+                    s["phase"] = "probe"
+                    s["run_id"] = args.run_id
                 out.setdefault("probe", []).extend(probe_samples)
                 # ITL = 相邻 chunk 到达时刻之差, 各请求内部取差后合并
                 itls = [b - a for s in probe_samples

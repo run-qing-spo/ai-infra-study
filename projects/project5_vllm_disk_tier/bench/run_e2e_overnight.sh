@@ -43,7 +43,7 @@ SHUTDOWN_TIMEOUT=30     # vLLM 自己的 shutdown_timeout, 默认 0 = 零等待 
                         # EngineCore(见 stop_serve 的泄漏归因), 非 0 才走 drain
                         # 模式给它时间跑完 shutdown() -> SharedOffloadRegion.cleanup()
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-0}"
-EXPERIMENT="${1:-e1}"                   # 实验矩阵: e1 / legacy
+EXPERIMENT="${1:-e1}"                   # 实验矩阵: trace-smoke / e1 / ...
 CACHE_ROOM_GIB="${CACHE_ROOM_GIB:-4}"   # 冷组给 page cache 留的余量上限(GiB)
 
 # HF 下载三件套(2026-07-10 组 A 踩坑: 模型没缓存, xet 后端直连 CAS 服务 401):
@@ -74,6 +74,17 @@ CFG_URING='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connect
 # 字段: 组名|kv-transfer-config|期望tier日志|监控:0/1|额外env|冷组cache余量GiB|bench额外参数
 # ("-" = 无;余量 0 = 热组不压舱)。加实验 = 加一行, run_group 骨架和监控全复用。
 case "$EXPERIMENT" in
+trace-smoke)
+    # 只验 request ID 外键链,绝不进入性能结论。16 个长会话 + 16 条 churn
+    # 越过 GPU + 4GiB CPU tier、制造 secondary store/load job,同时远低于
+    # 30GiB 磁盘上限。fs/uring 各起一个短 lifecycle,收尾由
+    # trace_join_audit.py 自动判 PASS/FAIL。
+    TRACE_ARGS="--sessions 16 --churn 16 --gen-tokens 1 --phases prime,churn,revisit@1"
+    SPECS=(
+        "TRACE_fs|$CFG_FS|fs|0|PYTHONHASHSEED=0|0|$TRACE_ARGS"
+        "TRACE_uring|$CFG_URING|uring|0|-|0|$TRACE_ARGS"
+    )
+    ;;
 e1)
     # E1 工作集 vs page cache(COMPARE_PLAN E1): fs/uring × 热/冷 四次 serve。
     # 负载沿用默认串行 prime→churn→revisit;判据三层: revisit TTFT 对比 +
@@ -319,7 +330,7 @@ legacy)
     )
     ;;
 *)
-    echo "未知实验矩阵 '$EXPERIMENT'(可选: e1 / e2 / e3 / e3dentry / e4 / e4phase / e6 / gil / legacy)" >&2
+    echo "未知实验矩阵 '$EXPERIMENT'(可选: trace-smoke / e1 / e2 / e3 / e3dentry / e4 / e4phase / e6 / gil / legacy)" >&2
     exit 1
     ;;
 esac
@@ -509,6 +520,9 @@ stop_ballast() {
 run_group() {
     local group=$1 cfg=$2 expect=$3 mon=$4 env0=$5 ballast=$6 bench_args=$7
     local slog="$RES/serve_$group.log"
+    # group 名会在不同 results 目录重复;把 lifecycle 目录也纳入 run_id,
+    # 才能让跨多夜汇总时仍保持全局唯一。
+    local run_id="${RES##*/}:$group"
 
     log "════ 组 $group 开始 (显存基线 $(gpu_used_mb) MiB) ════"
 
@@ -537,6 +551,11 @@ run_group() {
     # 的 plugin 钩子 sched_ledger.maybe_install() 认到才启用。绝对路径:serve
     # 的 CWD 未必是脚本 CWD。算完用 bench/tier_io_share.py 读。
     export KVTIER_SCHED_LEDGER="$PWD/$RES/tier_stats_${group}.sched.records.jsonl"
+    # 客户端稳定 req_id → vLLM external ID → EngineCore internal ID 的映射。
+    # 映射由 API 进程写, scheduler 账本记录相同 internal ID,两张表离线连接。
+    export KVTIER_RUN_ID="$run_id"
+    export KVTIER_REQ_MAP="$PWD/$RES/request_map_${group}.jsonl"
+    : > "$KVTIER_REQ_MAP"
 
     setsid "${cmd[@]}" > "$slog" 2>&1 &
     SERVE_PID=$!
@@ -587,7 +606,8 @@ run_group() {
     local bench_script="bench/long_context_ttft.py"
     [ "$EXPERIMENT" = e6 ] && bench_script="bench/mooncake_replay.py"
     timeout "$BENCH_TIMEOUT" python3 "$bench_script" \
-        --model "$M" --json "$RES/group_$group.json" "${extra[@]}" \
+        --model "$M" --json "$RES/group_$group.json" --run-id "$run_id" \
+        "${extra[@]}" \
         > "$RES/bench_$group.log" 2>&1
     local rc=$?
 
@@ -684,6 +704,20 @@ run_group() {
         fi
         rm -f "$DATA/kv_tier.bin.stats.json.tmp"
     fi
+
+    # 请求主键连接是正式数据的第一道机器验收门。等 serve 停掉、所有文件句柄
+    # flush 且 uring 原生流水搬完后再审;不能边写边数。任何断链都让本组作废。
+    if [ $rc -eq 0 ]; then
+        local audit_log="$RES/trace_audit_$group.txt"
+        if python3 bench/trace_join_audit.py "$RES" --group "$group" \
+                > "$audit_log" 2>&1; then
+            log "  req_id 连接验收 PASS: $(head -1 "$audit_log")"
+        else
+            log "  !! req_id 连接验收 FAIL, 本组数据作废:"
+            tail -10 "$audit_log" | while IFS= read -r l; do log "     $l"; done
+            GROUP_STATUS[$group]="FAIL(trace_join)"
+        fi
+    fi
     return 0
 }
 
@@ -699,6 +733,7 @@ python3 -c "import openai" 2>/dev/null || { log "缺 python openai 包"; fail=1;
 python3 -c "from kv_uring_tier import _kvtier; import kv_uring_tier.manager" \
     || { log "uring 依赖检查失败: 先 make 编 .so;还不行就看上面 import 报错(vLLM 接口合同可能变了)"; fail=1; }
 [ -f bench/long_context_ttft.py ]    || { log "找不到 bench/long_context_ttft.py (要在项目根跑)"; fail=1; }
+[ -f bench/trace_join_audit.py ]     || { log "找不到 bench/trace_join_audit.py"; fail=1; }
 [ -f bench/ram_ballast.py ]          || { log "找不到 bench/ram_ballast.py"; fail=1; }
 # E6 额外要 mooncake_replay.py 和 trace 文件 —— trace 没下会跑到一半才炸
 if [ "$EXPERIMENT" = e6 ]; then

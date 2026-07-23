@@ -23,6 +23,16 @@ def register() -> None:
     except ValueError:
         pass  # 已注册(plugin 被加载了多次), 幂等处理
 
+    # OpenAI 层提供的 request ID 进入 EngineCore 前会被 vLLM 追加随机后缀。
+    # 记录这次外部→内部映射, 后续 scheduler/tier 账本才能和客户端样本按
+    # 我们控制的稳定 req_id 连接。它和具体 secondary tier 无关, fs/uring
+    # 两组都安装。
+    try:
+        from . import request_trace
+        request_trace.maybe_install()
+    except Exception as e:
+        logger.warning("request_trace 未装载(不影响 serve): %r", e)
+
     # 调度层 tier IO 计时埋点。只在设了 KVTIER_SCHED_LEDGER 时真装, 否则 no-op。
     # 借同一个 plugin 钩子 = fs 组也会装(plugin 与配哪个 tier 无关), 这样 fs
     # 才有 IO 账本可算占比。见 sched_ledger.py。
