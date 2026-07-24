@@ -33,6 +33,25 @@
 - [代码、配置、运行结果管理方案](docs/CODE_MANAGEMENT.md)
 - [锁定的上游版本](SOURCE_LOCK.json)
 
+## 静态环境采集
+
+`scripts/collect_static_env.sh` 只读取并输出操作系统、CPU/NUMA、内存、
+cgroup、GPU/CUDA、文件系统、块设备队列、io_uring 和工具链信息。脚本自身
+不创建文件、不安装软件、不运行 I/O 负载，也不修改任何系统参数。
+
+直接查看：
+
+```bash
+./scripts/collect_static_env.sh
+```
+
+需要保存为实验材料时，由调用者显式指定输出文件：
+
+```bash
+./scripts/collect_static_env.sh |
+    tee static-env-$(date -u +%Y%m%dT%H%M%SZ).txt
+```
+
 ## 建议的研究 claim
 
 推荐先注册一个范围清楚的条件式 claim：
@@ -68,4 +87,3 @@ flowchart LR
 
 P0/P1 是低成本 gate；P2 是核心机制实验；P3 用无 GPU 或最少 GPU 的方式
 验证上层影响；只有前三者都通过，才进入昂贵的 P4。
-
