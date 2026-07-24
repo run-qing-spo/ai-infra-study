@@ -47,6 +47,123 @@ flowchart LR
 因此 uring-slab 能替换的是 `CPU↔secondary` 段，不能消除 CPU staging，
 也不能绕过 GPU↔CPU 复制。
 
+### 2.1 一个 scheduler step 的内部流程
+
+术语约定：GPU↔CPU 段的两个方向叫 store（GPU→CPU）/load（CPU→GPU），
+由 worker 执行；CPU↔FS 段的两个方向叫 cascade（CPU→FS）/promotion
+（FS→CPU），由 FS 线程执行。primary 上 `prepare_write/read` 是
+`prepare_store/load` 的别名（GPU 视角与 secondary 视角同一套函数）；
+FS 接口的 `submit_store/submit_load` 里 store/load 则指 CPU↔FS 方向。
+
+```mermaid
+flowchart TD
+    subgraph PH1["阶段① schedule() — 挑请求、分 GPU block、查命中"]
+        A["waiting 请求"] --> B["get_num_new_matched_tokens()"]
+        B --> C{"primary.lookup()"}
+        C -- "True 命中" --> D["记入命中<br>稍后开 CPU→GPU load 工单"]
+        C -- "None 在途" --> E["本圈跳过<br>下圈再问"]
+        C -- "False 未命中" --> F{"fs.lookup()"}
+        F -- "None<br>存在性检查还在后台跑" --> E
+        F -- "False 文件不存在" --> G["彻底 miss<br>GPU 重算 prefill"]
+        F -- "True 文件在" --> H{"primary.prepare_write()<br>占 staging 槽"}
+        H -- "拿到槽 ref_cnt=-1" --> I["攒进<br>_pending_load_submissions"]
+        I --> E
+        H -- "primary 满 → None" --> G
+    end
+
+    subgraph PH2["阶段② build_connector_meta() — 收账 + 打包工单"]
+        J["_update_req_states()<br>登记本圈新分配的 block 号"] --> K["manager.on_schedule_end()"]
+        K --> K1["fs.get_finished_jobs() 收异步完成"]
+        K1 -- "promotion 完成" --> K2["primary.complete_write()<br>槽标为可读 → 下圈 lookup=True"]
+        K1 -- "cascade 完成" --> K3["primary.complete_read()<br>解 pin"]
+        K --> K4["flush promotions:<br>fs.submit_load() 批量提交"]
+        K --> L["对账:<br>_block_id_to_pending_jobs ∩ 本圈新分配<br>→ jobs_to_flush"]
+        L --> M["_build_store_jobs()"]
+        M --> N{"primary.prepare_store()"}
+        N -- "None 满" --> O["next_stored_block_idx 不动<br>下圈重试"]
+        N -- "分到槽" --> P["开 GPU→CPU store 工单<br>登记 _jobs / 块号反查表"]
+        P --> Q["metadata =<br>load_jobs + store_jobs + jobs_to_flush"]
+    end
+
+    subgraph PH3["阶段③ worker 执行"]
+        R["先提交上一圈延迟的<br>GPU→CPU store 拷贝"] --> S["forward<br>(prefill+decode 混合 batch)"]
+        S --> T["sampling 出 token"]
+        T --> U["执行 CPU→GPU load 拷贝<br>丢弃 jobs_to_flush 里的工单"]
+    end
+
+    subgraph PH4["阶段④ update_connector_output() — 收 worker 汇报"]
+        V{"哪类拷贝完成?"}
+        V -- "GPU→CPU store 完成" --> W["manager.complete_store()"]
+        W --> X["对每个 secondary:<br>primary.prepare_read() 加 pin<br>fs.submit_store() 发起 cascade"]
+        V -- "CPU→GPU load 完成" --> Y["complete_load() 解 pin"]
+        Z{"token 撞停止条件?<br>EOS / max_tokens / stop 词"}
+        Z -- "是" --> ZA["request_finished()<br>归还 GPU block"]
+    end
+
+    PH1 --> PH2 --> PH3 --> PH4
+    PH4 -- "下一圈" --> PH1
+```
+
+FS 线程始终在图外异步跑：`submit_load` 之后做文件→mmap（promotion），
+`submit_store` 之后做 mmap→文件（cascade），结果都等下一圈的
+`get_finished_jobs()` 才被收走。
+
+### 2.2 FS 命中一个前缀的函数时序（跨三圈）
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant CS as Connector<br>(scheduler 半边)
+    participant TM as TieringManager
+    participant PR as CPU Primary
+    participant FS as FS tier<br>(线程)
+    participant W as Worker<br>(connector worker 半边)
+
+    Note over S,W: ── 第 N 圈:发现 FS 命中 ──
+    S->>CS: get_num_new_matched_tokens(req)
+    CS->>TM: lookup(key)
+    TM->>PR: lookup(key)
+    PR-->>TM: False (miss)
+    TM->>FS: lookup(key)
+    FS-->>TM: True (文件在)
+    TM->>PR: prepare_write() 占槽, ref_cnt=-1
+    TM->>TM: 攒进 _pending_load_submissions
+    TM-->>CS: None (促升中,请求先等着)
+    S->>CS: build_connector_meta()
+    CS->>TM: on_schedule_end()
+    TM->>FS: submit_load(job) 批量提交 promotion
+    activate FS
+    Note right of FS: 异步:文件 → mmap 槽位
+
+    Note over S,W: ── 第 N+1 圈:收 promotion 完成 ──
+    FS-->>FS: 搬完
+    deactivate FS
+    S->>CS: get_num_new_matched_tokens(req)
+    CS->>TM: lookup(key)
+    TM->>FS: get_finished_jobs()
+    FS-->>TM: job 完成
+    TM->>PR: complete_write() 槽标可读
+    TM->>PR: lookup(key)
+    PR-->>TM: True
+    TM-->>CS: True (命中!)
+    S->>CS: build_connector_meta()
+    CS->>TM: prepare_load() → PR 加 pin
+    CS-->>W: metadata{load_jobs}
+    W->>W: 执行 CPU→GPU 拷贝
+
+    Note over S,W: ── 第 N+2 圈:load 收尾 ──
+    W-->>CS: update_connector_output(load 完成)
+    CS->>TM: complete_load()
+    TM->>PR: 解 pin
+    Note over S: 请求带着现成 KV 进入 prefill/decode
+```
+
+两张图的共同点：**所有异步都发生在圈与圈之间，圈内全是同步记账**。
+FS 线程和 GPU 拷贝在背景跑，但结果只在每圈固定的收账点
+（`get_finished_jobs()`、`update_connector_output()`）被承认。
+这是第 9 节里 completion→observed lag 的来源，也是 4.1 节 TTFT
+分解式里排队延迟项的结构性原因。
+
 ## 3. 什么时候会 store
 
 `_build_store_jobs()` 在每个 scheduler step 的 connector metadata 构建阶段被
