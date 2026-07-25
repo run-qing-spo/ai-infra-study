@@ -69,6 +69,10 @@ def _harness_identity(config_path: Path) -> dict[str, Any]:
         if path.is_file()
         and path.suffix in included_suffixes
         and "__pycache__" not in path.parts
+        and not (
+            "evidence" in path.parts
+            and "raw" in path.parts
+        )
     }
     resolved_config = config_path.resolve()
     if project_root not in resolved_config.parents:

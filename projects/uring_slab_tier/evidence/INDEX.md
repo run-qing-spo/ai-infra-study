@@ -49,3 +49,9 @@ The archived snapshot matches all 16 file hashes in `campaign.json`.
 
 Interpretation and the frozen A/B success floor:
 [Decision 0001](../docs/DECISION_0001_3090_NOISE_GATE.md).
+
+## Long-window paired FS/FS A/A
+
+The fixed 30-pair qualification is defined by
+[Decision 0002](../docs/DECISION_0002_UNSTABLE_CLOUD_READ_PATH.md).
+No formal campaign has been admitted to the index yet.

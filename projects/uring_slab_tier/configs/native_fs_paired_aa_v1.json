@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "campaign_name": "native-fs-paired-aa-long-v1",
+  "expected": {
+    "python_major_minor": "3.12",
+    "vllm_distribution": "0.24.0+cu129",
+    "vllm_module": "0.24.0",
+    "torch": "2.11.0+cu129",
+    "torch_cuda": "12.9",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_dir": "/root/uring-slab-experiments/source/vllm",
+    "pythonhashseed": "0"
+  },
+  "workload": {
+    "block_bytes": 196608,
+    "dataset_blocks": 1024,
+    "blocks_per_job": 16,
+    "n_read_threads": 16,
+    "n_write_threads": 16,
+    "warmup_passes": 4,
+    "measurement_passes": 64,
+    "minimum_measured_phase_seconds": 8.0,
+    "poll_interval_seconds": 0.0005,
+    "phase_timeout_seconds": 180,
+    "lookup_timeout_seconds": 30,
+    "seed": 240
+  },
+  "pairing": {
+    "windows": 3,
+    "pairs_per_window": 10,
+    "window_pause_seconds": 120,
+    "randomization_seed": 240,
+    "max_inter_arm_gap_seconds": 5.0
+  },
+  "safety": {
+    "max_live_backing_bytes_per_arm": 1073741824,
+    "minimum_free_bytes": 4294967296,
+    "retain_backing_files": false,
+    "drop_caches": false
+  },
+  "system_observation": {
+    "block_device": "vda"
+  },
+  "gate": {
+    "required_complete_pairs": 30,
+    "primary_metric": "load_sustained_throughput_mib_s",
+    "higher_is_better": true,
+    "bootstrap_samples": 20000,
+    "bootstrap_seed": 1240,
+    "sign_flip_samples": 100000,
+    "sign_flip_seed": 2240,
+    "power_samples": 50000,
+    "power_seed": 3240,
+    "minimum_detectable_effect": 0.25,
+    "pass_absolute_aa_bias": 0.05,
+    "max_absolute_aa_bias": 0.10,
+    "pass_noise_floor": 0.10,
+    "max_noise_floor": 0.15,
+    "minimum_power": 0.80,
+    "pass_absolute_window_effect": 0.10,
+    "max_absolute_window_effect": 0.20,
+    "pass_absolute_position_effect": 0.05,
+    "max_absolute_position_effect": 0.10
+  }
+}
