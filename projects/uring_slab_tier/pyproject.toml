@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uring-slab-tier"
+version = "0.1.0"
+description = "Contract-first vLLM 0.24 second-tier experiment harness"
+requires-python = ">=3.12"
+dependencies = ["numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"

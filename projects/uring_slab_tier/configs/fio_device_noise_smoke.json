@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "campaign_name": "fio-preallocated-device-noise-smoke",
+  "expected": {
+    "fio_version": "fio-3.36"
+  },
+  "workload": {
+    "num_bytes": 25165824,
+    "block_bytes": 196608,
+    "ioengine": "io_uring",
+    "iodepth": 32,
+    "windows": 1,
+    "repetitions_per_window": 2,
+    "window_pause_seconds": 0,
+    "seed": 240
+  },
+  "safety": {
+    "max_backing_bytes": 1073741824,
+    "retain_backing_file": false,
+    "drop_caches": false
+  },
+  "gate": {
+    "minimum_valid_runs": 2,
+    "bootstrap_samples": 200,
+    "bootstrap_seed": 240,
+    "throughput_robust_cv_pass": 10.0,
+    "throughput_robust_cv_fail": 20.0,
+    "throughput_relative_ci_halfwidth_pass": 10.0,
+    "throughput_relative_ci_halfwidth_fail": 20.0,
+    "throughput_window_ratio_pass": 10.0,
+    "throughput_window_ratio_fail": 20.0,
+    "sojourn_p95_robust_cv_pass": 10.0,
+    "sojourn_p95_robust_cv_fail": 20.0,
+    "sojourn_p95_relative_ci_halfwidth_pass": 10.0,
+    "sojourn_p95_relative_ci_halfwidth_fail": 20.0,
+    "sojourn_p95_window_ratio_pass": 10.0,
+    "sojourn_p95_window_ratio_fail": 20.0
+  }
+}

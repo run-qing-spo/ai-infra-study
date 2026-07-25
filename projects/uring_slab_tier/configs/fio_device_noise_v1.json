@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "campaign_name": "fio-preallocated-device-noise-v1",
+  "expected": {
+    "fio_version": "fio-3.36"
+  },
+  "workload": {
+    "num_bytes": 201326592,
+    "block_bytes": 196608,
+    "ioengine": "io_uring",
+    "iodepth": 32,
+    "windows": 3,
+    "repetitions_per_window": 10,
+    "window_pause_seconds": 300,
+    "seed": 240
+  },
+  "safety": {
+    "max_backing_bytes": 1073741824,
+    "retain_backing_file": false,
+    "drop_caches": false
+  },
+  "gate": {
+    "minimum_valid_runs": 30,
+    "bootstrap_samples": 5000,
+    "bootstrap_seed": 240,
+    "throughput_robust_cv_pass": 0.15,
+    "throughput_robust_cv_fail": 0.30,
+    "throughput_relative_ci_halfwidth_pass": 0.10,
+    "throughput_relative_ci_halfwidth_fail": 0.20,
+    "throughput_window_ratio_pass": 1.25,
+    "throughput_window_ratio_fail": 1.50,
+    "sojourn_p95_robust_cv_pass": 0.25,
+    "sojourn_p95_robust_cv_fail": 0.50,
+    "sojourn_p95_relative_ci_halfwidth_pass": 0.20,
+    "sojourn_p95_relative_ci_halfwidth_fail": 0.40,
+    "sojourn_p95_window_ratio_pass": 1.50,
+    "sojourn_p95_window_ratio_fail": 2.00
+  }
+}

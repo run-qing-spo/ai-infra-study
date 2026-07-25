@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "campaign_name": "native-fs-noise-harness-smoke",
+  "expected": {
+    "python_major_minor": "3.12",
+    "vllm_distribution": "0.24.0+cu129",
+    "vllm_module": "0.24.0",
+    "torch": "2.11.0+cu129",
+    "torch_cuda": "12.9",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_dir": "/root/uring-slab-experiments/source/vllm",
+    "pythonhashseed": "0"
+  },
+  "workload": {
+    "block_bytes": 196608,
+    "num_blocks": 128,
+    "blocks_per_job": 16,
+    "n_read_threads": 16,
+    "n_write_threads": 16,
+    "poll_interval_seconds": 0.0005,
+    "job_timeout_seconds": 120,
+    "lookup_timeout_seconds": 30,
+    "windows": 1,
+    "repetitions_per_window": 2,
+    "window_pause_seconds": 0,
+    "seed": 240
+  },
+  "safety": {
+    "max_backing_bytes": 1073741824,
+    "retain_backing_files": false,
+    "drop_caches": false
+  },
+  "system_observation": {
+    "block_device": "vda"
+  },
+  "gate": {
+    "minimum_valid_runs": 2,
+    "bootstrap_samples": 200,
+    "bootstrap_seed": 240,
+    "throughput_robust_cv_pass": 1.00,
+    "throughput_robust_cv_fail": 2.00,
+    "throughput_relative_ci_halfwidth_pass": 1.00,
+    "throughput_relative_ci_halfwidth_fail": 2.00,
+    "throughput_window_ratio_pass": 1.00,
+    "throughput_window_ratio_fail": 2.00,
+    "sojourn_p95_robust_cv_pass": 1.00,
+    "sojourn_p95_robust_cv_fail": 2.00,
+    "sojourn_p95_relative_ci_halfwidth_pass": 1.00,
+    "sojourn_p95_relative_ci_halfwidth_fail": 2.00,
+    "sojourn_p95_window_ratio_pass": 1.00,
+    "sojourn_p95_window_ratio_fail": 2.00
+  }
+}
