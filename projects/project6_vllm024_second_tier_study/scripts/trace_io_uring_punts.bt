@@ -1,0 +1,25 @@
+BEGIN
+{
+    @queue_async_work = 0;
+    @request_failed = 0;
+}
+
+tracepoint:io_uring:io_uring_queue_async_work
+/comm == "fio"/
+{
+    @queue_async_work = @queue_async_work + 1;
+}
+
+tracepoint:io_uring:io_uring_req_failed
+/comm == "fio"/
+{
+    @request_failed = @request_failed + 1;
+}
+
+END
+{
+    printf("fio_queue_async_work=%d\n", @queue_async_work);
+    printf("fio_request_failed=%d\n", @request_failed);
+    clear(@queue_async_work);
+    clear(@request_failed);
+}

@@ -23,15 +23,37 @@
 4. **端到端主指标建议定为 SLO goodput，revisit TTFT 作为第二主指标。**
    原因是 second tier 的价值是用存储资源换 GPU prefill 计算；单用户 TTFT
    能说明机制是否成立，而固定 TTFT/ITL SLO 下可服务的请求率更接近系统价值。
-5. **从干净起点估算 4 周，Stage 3 最多占 2 个 GPU 日。**
-   如果复用现有 engine、trace 和采集工具，预计可压缩到 2–3 周。
+5. **当前采用两周快线，从核心因果链向外扩展。**
+   先完成 adapter、contract、正式微基准与最小端到端 A/B，再整理作品；
+   若负结果成立则转为瓶颈定位与适用边界，不通过修改 trace 追求正结果。
 
 ## 文档入口
 
 - [vLLM 0.24.0 源码事实与接口](docs/VLLM_024_ARCHITECTURE.md)
 - [实验路线、矩阵、指标与时间线](docs/EXPERIMENT_ROADMAP.md)
+- [两周快线：先完成研究，再整理成作品](docs/TWO_WEEK_EXECUTION_PLAN.md)
 - [代码、配置、运行结果管理方案](docs/CODE_MANAGEMENT.md)
+- [当前云 GPU 环境资格审计](ENV_REPORT.md)
+- [vLLM/native-FS/uring prototype 运行证据索引](evidence/runtime/20260725T103442Z/INDEX.md)
 - [锁定的上游版本](SOURCE_LOCK.json)
+
+## 当前可执行状态
+
+截至 2026-07-25：
+
+- 干净 venv
+  `/root/uring-slab-experiments/venvs/vllm024-cu129-clean` 中，官方
+  `vllm==0.24.0+cu129`、Torch `2.11.0+cu129` 与锁定 source commit
+  已通过 CUDA、tiering imports 和真实小模型 generation；
+- 原生 FS 已完成
+  `store → 持久化 → 服务重启 → external hit → promotion/load` 闭环，
+  400 tokens 与 4,915,200 bytes 在文件、进程 I/O 和 vLLM metrics 三侧
+  对账一致；
+- 选择性移植的 uring-slab prototype 已通过 64 MiB O_DIRECT 全区 SHA-256；
+- 旧实验数据与本次 256 MiB 短诊断均不作为正式结果。
+
+下一项实现工作是独立 `UringSecondaryTierManager` adapter、共享 contract
+suite 与统一 instrumentation；在它们通过前不启动正式性能矩阵。
 
 ## 静态环境采集
 
