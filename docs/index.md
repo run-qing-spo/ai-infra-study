@@ -35,6 +35,7 @@ features:
 ### 硬件
 
 - [SSD 的能力边界与压榨路径](/hardware/ssd) — 沿一次 I/O 的完整链路逐站找瓶颈与旋钮，从 syscall 到 NAND die
+- [一次 AIO 请求的全链路](/hardware/aio-path) — `io_submit` 到 NAND cell 的机制细节：pin page、PRP/SGL、doorbell、CQE 与持久化语义
 
 ### AI 存储
 

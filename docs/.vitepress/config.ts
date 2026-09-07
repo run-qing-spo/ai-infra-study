@@ -79,6 +79,10 @@ export default withMermaid(
               text: 'SSD 的能力边界与压榨路径',
               link: '/hardware/ssd',
             },
+            {
+              text: '一次 AIO 请求的全链路',
+              link: '/hardware/aio-path',
+            },
           ],
         },
       ],
