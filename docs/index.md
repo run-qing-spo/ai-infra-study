@@ -32,6 +32,10 @@ features:
 - [KV Cache C++ Backend 优化方向细则](/infra/kv-cache-cpp-backend-direction) — 推理推动力 → C++ backend 服务 → 技术实现 → 对位与切入点
 - [SGLang 0.5.18 KV Cache 源码剖析](/infra/sglang源码剖析) — 三级存储、Radix Tree 前缀复用、Prefill/Decode 的 slot 生命周期，共 16 节
 
+### 硬件
+
+- [SSD 的能力边界与压榨路径](/hardware/ssd) — 沿一次 I/O 的完整链路逐站找瓶颈与旋钮，从 syscall 到 NAND die
+
 ### AI 存储
 
 - [项目总览](/projects/overview) — 围绕 KV Cache 存储的 10 个渐进式 C++ 小项目（单层缓存 → 4 层完整路径）路线图

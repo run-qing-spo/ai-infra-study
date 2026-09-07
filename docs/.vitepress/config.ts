@@ -43,6 +43,7 @@ export default withMermaid(
     nav: [
       { text: '首页', link: '/' },
       { text: '基础设施', link: '/infra/inference-fundamentals' },
+      { text: '硬件', link: '/hardware/ssd' },
       { text: 'AI 存储', link: '/projects/overview' },
       { text: 'C++', link: '/cpp/exception-safety' },
     ],
@@ -66,6 +67,17 @@ export default withMermaid(
             {
               text: 'SGLang 0.5.18 KV Cache 源码剖析',
               link: '/infra/sglang源码剖析',
+            },
+          ],
+        },
+      ],
+      '/hardware/': [
+        {
+          text: '硬件',
+          items: [
+            {
+              text: 'SSD 的能力边界与压榨路径',
+              link: '/hardware/ssd',
             },
           ],
         },
