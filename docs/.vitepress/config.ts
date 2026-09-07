@@ -63,6 +63,10 @@ export default withMermaid(
               text: 'KV Cache C++ Backend 优化方向细则',
               link: '/infra/kv-cache-cpp-backend-direction',
             },
+            {
+              text: 'SGLang 0.5.18 KV Cache 源码剖析',
+              link: '/infra/sglang源码剖析',
+            },
           ],
         },
       ],
