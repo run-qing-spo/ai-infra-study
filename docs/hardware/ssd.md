@@ -37,7 +37,7 @@
 
 每一站都问同一组问题：这里的有限资源是什么，饱和时是什么现象，我能拧的旋钮有哪些。至于每一站内部的机制怎么运转 —— `iocb` 长什么样、PRP 怎么描述内存、phase bit 怎么判断新完成项 —— 那是另一篇的事，见[一次 AIO 请求的全链路](/hardware/aio-path)，下面各站会给出对应小节的跳转。
 
-## 1. 应用与 syscall：CPU 时间
+## 1. 应用与 syscall：CPU 时间 {#cpu-cost}
 
 即使 SSD 还没满载，主机也可能先到上限。每个 I/O 都要执行构造请求、系统调用、走文件系统路径、DMA mapping、提交队列操作、完成回调、回收对象。
 
@@ -53,7 +53,7 @@ SSD 可能支持 1M IOPS，但单提交线程只能驱动到 500K。
 
 **能拧的旋钮**：多线程提交把 CPU 从一个核摊到多个核；`io_uring` 批量提交（一次 `io_uring_enter` 带多条 SQE）摊薄 syscall 固定成本；注册文件和缓冲区（`IORING_REGISTER_FILES` / `_BUFFERS`）省掉每次 I/O 的引用计数和 DMA mapping；再进一步是 SQPOLL 或 SPDK 用户态驱动，把 syscall 彻底从热路径拿掉。
 
-## 2. 文件系统：偏移 → LBA
+## 2. 文件系统：偏移 → LBA {#fs-cost}
 
 这一步把文件内的偏移翻译成设备上的 LBA。代价来自元数据：extent 树查找、inode 锁、日志提交。
 
@@ -61,7 +61,7 @@ buffered I/O 还要额外经过 page cache —— 多一次内存拷贝，多一
 
 **能拧的旋钮**：`O_DIRECT` 绕开 page cache 和拷贝；预分配（`fallocate`）避免写路径上临时分配 extent；大文件顺序布局让一次请求对应连续 LBA，给下游的合并创造条件；极端情况直接裸设备，跳过整个文件系统。
 
-## 3. block layer：合并与队列
+## 3. block layer：合并与队列 {#blk-mq}
 
 这一层把请求构造成 bio/request，相邻的会被合并，然后交给下游。历史上单队列加自旋锁是明确的瓶颈，现在的 blk-mq 是 per-CPU 软件队列映射到硬件队列。
 
@@ -69,7 +69,7 @@ buffered I/O 还要额外经过 page cache —— 多一次内存拷贝，多一
 
 **能拧的旋钮**：`none` 调度器（NVMe 上调度器带来的排序收益通常抵不过它的开销）；确认软件队列到硬件队列是一对一而不是多对一；让提交线程绑核，避免请求在 CPU 间漂移。
 
-## 4. NVMe 队列与 doorbell
+## 4. NVMe 队列与 doorbell {#nvme-doorbell}
 
 驱动挑一条提交队列，写入 SQE，然后敲 doorbell 通知设备。队列对数量有限（由设备的 `Number of Queues` 特性决定），每条队列的深度也有限。
 
@@ -77,7 +77,7 @@ doorbell 是一次 MMIO 写，会变成一个跨 PCIe 发到控制器的 Memory 
 
 **能拧的旋钮**：保证队列数 ≥ 提交 CPU 数，做到 per-CPU 无锁提交；批量提交合并 doorbell；深队列让设备内部有更多请求可调度（这条的收益曲线见第 9 节）。
 
-## 5. PCIe：DMA 搬命令和数据
+## 5. PCIe：DMA 搬命令和数据 {#pcie-bw}
 
 控制器通过 PCIe DMA 取命令和数据。这里是字节带宽的第一道硬墙，也是唯一一处"大 I/O 比小 I/O 更容易撞到"的地方。
 
@@ -85,7 +85,7 @@ doorbell 是一次 MMIO 写，会变成一个跨 PCIe 发到控制器的 Memory 
 
 **能拧的旋钮**：确认链路真的跑在标称的代数和宽度上（x4 Gen4 被协商成 x2 或 Gen3 是常见事故）；NUMA 亲和，别让数据跨 socket 搬；IOMMU 开着的开销来自每次 DMA mapping 都要建立和拆除 IOVA 映射（[细节](/hardware/aio-path#pin-page-iova)），高 IOPS 下评估是否需要 passthrough。
 
-## 6. 控制器与 FTL：命令处理率
+## 6. 控制器与 FTL：命令处理率 {#controller}
 
 SSD 控制器需要处理 NVMe 命令解析、FTL 地址映射、请求调度、ECC/LDPC、垃圾回收、wear leveling、加密、RAID-like NAND 保护、DMA 和 PCIe 管理。
 
@@ -95,7 +95,7 @@ SSD 控制器需要处理 NVMe 命令解析、FTL 地址映射、请求调度、
 
 **能拧的旋钮**：这一站主机侧几乎拧不动，只能选型时看清楚 —— 有没有独立 DRAM（DRAM-less 盘靠 HMB 借主机内存，随机性能塌得很快）、映射粒度多大、标称 IOPS 是在什么盘况下测的。主机侧唯一能做的是缩小工作集，让热点的映射页留在控制器缓存里。
 
-## 7. NAND：并行度的来源
+## 7. NAND：并行度的来源 {#nand-parallel}
 
 NAND 本身并不快，尤其是写入和擦除：
 
@@ -138,13 +138,13 @@ Die C：内部编程
 
 **能拧的旋钮**：让请求地址分散，别让访问集中砸在少数 die 上（顺序大文件反而容易做到，因为 FTL 通常把连续 LBA 条带化铺到所有 channel）；I/O 大小和对齐匹配内部页大小，避免一次主机读触发多个 NAND page read；保持足够 QD 让所有 die 有活干。
 
-## 8. 完成路径：CQE 与 MSI-X
+## 8. 完成路径：CQE 与 MSI-X {#completion-cpu}
 
 SSD 写入 CQE，触发 MSI-X 中断。如果所有 completion 都落在同一个 CPU，该 CPU 处理中断和 softirq 的能力会到达上限，其他 CPU 仍然空闲，整体 IOPS 封顶。
 
 **能拧的旋钮**：MSI-X 向量数要够，IRQ affinity 摊开；让提交 CPU 和完成 CPU 尽量是同一个（缓存亲和）；低延迟场景用轮询（`io_uring` 的 `IOPOLL`）代替中断，用 CPU 换延迟；高 IOPS 场景反过来靠中断合并省 CPU。
 
-## 9. 小结：整条链路取最小
+## 9. 小结：整条链路取最小 {#iops-min}
 
 把各层看作独立处理站，整体上限近似是各站上限的最小值：
 
@@ -182,7 +182,7 @@ IOPS_max = min(
 
 上面是按空间切的。还有三条规律横跨所有站点，它们决定了同一块盘在不同用法下能压榨出多少。
 
-## 10. 队列深度：为什么先涨后平
+## 10. 队列深度：为什么先涨后平 {#queue-depth}
 
 设平均完成延迟为 L，在途请求数为 QD，根据 Little's Law：
 
@@ -213,7 +213,7 @@ Latency ≈ QD / IOPS_max
 
 **压榨含义**：QD 是免费的性能，但只在饱和点之前。找到那个拐点，是调优的第一件事 —— 低于它是浪费硬件，高于它是白白抬高延迟。
 
-## 11. 小 I/O 与大 I/O：两种不同的天花板
+## 11. 小 I/O 与大 I/O：两种不同的天花板 {#io-size}
 
 4 KiB 随机读和 1 MiB 顺序读都要经历一次相近的固定流程：
 
@@ -233,7 +233,7 @@ Latency ≈ QD / IOPS_max
 
 **压榨含义**：合并小 I/O 是最直接的手段 —— 它同时省掉命令处理成本和内核软件栈成本。但合并到多大有上限：除了超过内部条带宽度后收益消失，还有一道硬限制是 PRP 能描述的内存段数有限，超了就必须把一个用户 I/O 拆成多条 NVMe command（[细节](/hardware/aio-path#prp-sgl)）。顺带一提，`O_DIRECT` 那些对齐要求也源于此 —— PRP list 里的每一项都必须页对齐，缓冲区不对齐就没法描述。
 
-## 12. 写路径：无效工作从哪来
+## 12. 写路径：无效工作从哪来 {#write-path}
 
 写比读多做很多事：
 
@@ -252,7 +252,7 @@ Latency ≈ QD / IOPS_max
 
 还有一件事必须先问清楚，否则测出来的写延迟不知道代表什么：**写命令完成不等于数据落到 NAND**。它可能只表示数据进了控制器的易失性写缓存（VWC）。真正的持久化取决于盘有没有断电保护（PLP）、命令是否带 FUA、主机是否发了 Flush、文件系统何时提交元数据和日志（[细节](/hardware/aio-path#write-durability)）。所以同一块盘，带不带 `fsync` 测出来可以差一个数量级，而这个差值不是性能问题，是语义问题 —— 对比前先确认两边处在同一个持久化域上。
 
-## 13. 尾延迟：平均值掩盖的东西
+## 13. 尾延迟：平均值掩盖的东西 {#tail-latency}
 
 平均延迟低不代表每个请求都快。少数请求可能碰到 FTL mapping cache miss、多轮 ECC/LDPC 解码、read retry、GC 搬迁、block 擦除、wear leveling、thermal throttling、固件后台任务、队列头阻塞、PCIe 错误恢复、文件系统元数据锁、CPU 调度延迟。
 
@@ -264,7 +264,7 @@ Latency ≈ QD / IOPS_max
 
 # 第三部分 · 定位与总结
 
-## 14. 从测试形状反推瓶颈
+## 14. 从测试形状反推瓶颈 {#diagnose}
 
 第 9 节说过，优化非瓶颈环节没有收益，所以定位优先于调优。下面这张表是从 fio 曲线形状反推瓶颈站的对照：
 

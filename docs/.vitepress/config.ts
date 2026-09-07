@@ -83,6 +83,10 @@ export default withMermaid(
               text: '一次 AIO 请求的全链路',
               link: '/hardware/aio-path',
             },
+            {
+              text: 'io_uring 相比 AIO 改了什么',
+              link: '/hardware/io_uring',
+            },
           ],
         },
       ],
