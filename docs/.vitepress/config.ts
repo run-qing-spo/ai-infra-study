@@ -3,29 +3,6 @@ import { defineConfig } from 'vitepress'
 import taskLists from 'markdown-it-task-lists'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
-const aiStorageSidebar = () => [
-  {
-    text: 'AI 存储',
-    items: [
-      { text: '项目总览', link: '/projects/overview' },
-    ],
-  },
-  {
-    text: '背景知识（服务 P1/P2）',
-    collapsed: false,
-    items: [
-      { text: '多线程缓存设计综述', link: '/algorithms/concurrent-cache' },
-      { text: 'LRU/ARC/LFU 算法对比', link: '/algorithms/lru-arc-lfu-comparison' },
-    ],
-  },
-  {
-    text: '项目 1 · Thread-safe LRU Cache',
-    collapsed: false,
-    items: [
-      { text: 'README', link: '/projects/project1_lru/README' },
-    ],
-  },
-]
 
 export default withMermaid(
   defineConfig({
@@ -44,7 +21,7 @@ export default withMermaid(
       { text: '首页', link: '/' },
       { text: '基础设施', link: '/infra/inference-fundamentals' },
       { text: '硬件', link: '/hardware/ssd' },
-      { text: 'AI 存储', link: '/projects/overview' },
+      { text: 'AI 存储', link: '/prefix-cache/' },
       { text: 'C++', link: '/cpp/exception-safety' },
     ],
     sidebar: {
@@ -94,8 +71,26 @@ export default withMermaid(
           ],
         },
       ],
-      '/projects/': aiStorageSidebar(),
-      '/algorithms/': aiStorageSidebar(),
+      '/prefix-cache/': [
+        {
+          text: 'SGLang Prefix Cache 转换审计',
+          items: [
+            { text: '专栏总览与进度', link: '/prefix-cache/' },
+            {
+              text: '轮次 01 · BasePrefixCache 接口契约',
+              link: '/prefix-cache/round-01-contract',
+            },
+            {
+              text: '轮次 02 · Scheduler 侧调用点',
+              link: '/prefix-cache/round-02-scheduler',
+            },
+            {
+              text: '轮次 03 · 建树与 match / split / insert',
+              link: '/prefix-cache/round-03-tree-core',
+            },
+          ],
+        },
+      ],
       '/cpp/': [
         {
           text: 'C++',

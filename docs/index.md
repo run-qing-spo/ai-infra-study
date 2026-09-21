@@ -41,11 +41,12 @@ features:
 
 ### AI 存储
 
-- [项目总览](/projects/overview) — 围绕 KV Cache 存储的 10 个渐进式 C++ 小项目（单层缓存 → 4 层完整路径）路线图
-- [项目 1 · Thread-safe LRU Cache](/projects/project1_lru/README) — 16 线程并发 LRU，`-fsanitize=thread` 0 race
-- 背景知识（服务 P1/P2）：
-  - [多线程缓存设计综述](/algorithms/concurrent-cache) — Sharding、全局锁、不同算法的并发方案
-  - [LRU/ARC/LFU 算法对比](/algorithms/lru-arc-lfu-comparison) — 原理、性能对比、适用场景
+SGLang Prefix Cache 转换审计 —— 逐轮审读 `mem_cache`，追踪 `BasePrefixCache` 契约的转换完成度，共 14 轮。
+
+- [专栏总览与进度](/prefix-cache/)
+- [轮次 01 · BasePrefixCache 接口契约](/prefix-cache/round-01-contract) — DTO 层、方法契约、能力探测、registry 选择链
+- [轮次 02 · Scheduler 侧调用点](/prefix-cache/round-02-scheduler) — wrapper 收敛、六类调用分布、锁生命周期、抢占时序陷阱
+- [轮次 03 · 建树与 match / split / insert](/prefix-cache/round-03-tree-core) — 节点布局、会改树的 match、insert 三阶段状态机
 
 ### C++
 

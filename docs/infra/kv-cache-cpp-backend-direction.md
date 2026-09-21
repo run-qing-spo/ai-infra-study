@@ -10,7 +10,7 @@ description: "推理场景的推动力量 → CPP backend 为推理提供的服�
 ::: info 这份文档的定位
 相关的三份文档：
 - **[推理 IO 优化：完整技术全景](/infra/inference-io-tech-complete)** —— 9 层全景图，覆盖从芯片内到跨数据中心的 IO 技术
-- **[AI 存储 · KV Cache 基础项目总览](/projects/overview)** —— 渐进式 C++ 项目路线图
+- **AI 存储 · KV Cache 基础项目总览** —— 渐进式 C++ 项目路线图
 
 工作落在 **推理框架的 C++ KV backend 这一层**（vLLM `KVConnector` / SGLang `HiCache` / FlexKV `StorageEngine|TransferEngine` / Mooncake `Transfer Engine` 的共同战场）。本文以"推动力量 → 推理需求 → C++ backend 服务 → 技术实现"为线索，回答：
 
@@ -478,7 +478,7 @@ graph LR
 | KV cache offload 到底指什么？ | [边界文档](https://github.com/run-qing-spo/kvcache_way) |
 | 推理 IO 整体有哪些技术？ | [推理 IO 优化技术全景](/infra/inference-io-tech-complete) |
 | Transformer 推理原理 / 硬件结构？ | [推理基础：原理与硬件](/infra/inference-fundamentals) |
-| 我具体一周做什么？ | [项目总览](/projects/overview) + 学习计划 v3 |
+| 我具体一周做什么？ | 项目总览 + 学习计划 v3 |
 | 怎么拿到 PR？ | 本文档 §7 |
 
 ---
@@ -507,7 +507,6 @@ graph LR
 - Mooncake round-robin slice 优化 PR：[kvcache-ai/Mooncake#1721](https://github.com/kvcache-ai/Mooncake/pull/1721)
 
 ### 我的相关文档
-- 项目总览：[/projects/overview](/projects/overview)
 
 ---
 
