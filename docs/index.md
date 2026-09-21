@@ -32,6 +32,7 @@ features:
 - [KV Cache C++ Backend 优化方向细则](/infra/kv-cache-cpp-backend-direction) — 推理推动力 → C++ backend 服务 → 技术实现 → 对位与切入点
 - [SGLang 0.5.18 KV Cache 源码剖析](/infra/sglang源码剖析) — 三级存储、Radix Tree 前缀复用、Prefill/Decode 的 slot 生命周期，共 16 节
 - [SGLang Prefix Cache 技术分析](/infra/sglang-kv-cache-summary) — 从请求生命周期出发，理清 token / KV slot / Radix Tree 节点的关系与缓存接口语义
+- [SGLang Unified Radix Tree：match / split / insert](/infra/unified-radix-tree-kv-cache) — 节点为什么存一段 token、match 为什么不是纯读、insert 为什么是可恢复的状态机
 
 ### 硬件
 

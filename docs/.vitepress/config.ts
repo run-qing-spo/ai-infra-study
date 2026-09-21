@@ -49,6 +49,10 @@ export default withMermaid(
               text: 'SGLang Prefix Cache 技术分析',
               link: '/infra/sglang-kv-cache-summary',
             },
+            {
+              text: 'SGLang Unified Radix Tree：match / split / insert',
+              link: '/infra/unified-radix-tree-kv-cache',
+            },
           ],
         },
       ],
