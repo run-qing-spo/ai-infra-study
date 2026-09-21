@@ -68,6 +68,10 @@ export default withMermaid(
               text: 'SGLang 0.5.18 KV Cache 源码剖析',
               link: '/infra/sglang源码剖析',
             },
+            {
+              text: 'SGLang Prefix Cache 技术分析',
+              link: '/infra/sglang-kv-cache-summary',
+            },
           ],
         },
       ],
