@@ -102,4 +102,4 @@ finally:
 
 ---
 
-上一轮：[轮次 02 · Scheduler 侧调用点](./round-02-scheduler) · 下一轮：轮次 04 · eviction（待读）
+上一轮：[轮次 02 · Scheduler 侧调用点](./round-02-scheduler) · 下一轮：[轮次 04 · eviction / LRU / lock_ref 生命周期](./round-04-eviction)
