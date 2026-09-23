@@ -53,6 +53,10 @@ export default withMermaid(
               text: 'SGLang Unified Radix Tree：match / split / insert',
               link: '/infra/unified-radix-tree-kv-cache',
             },
+            {
+              text: 'SGLang Unified Radix Tree：eviction 与 lock_ref',
+              link: '/infra/unified-radix-evict',
+            },
           ],
         },
       ],
