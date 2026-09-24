@@ -57,6 +57,10 @@ export default withMermaid(
               text: 'SGLang Unified Radix Tree：eviction 与 lock_ref',
               link: '/infra/unified-radix-evict',
             },
+            {
+              text: 'SGLang Unified Cache：异构 Component 状态语义',
+              link: '/infra/unified-cache-components',
+            },
           ],
         },
       ],

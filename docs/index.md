@@ -34,6 +34,7 @@ features:
 - [SGLang Prefix Cache 技术分析](/infra/sglang-kv-cache-summary) — 从请求生命周期出发，理清 token / KV slot / Radix Tree 节点的关系与缓存接口语义
 - [SGLang Unified Radix Tree：match / split / insert](/infra/unified-radix-tree-kv-cache) — 节点为什么存一段 token、match 为什么不是纯读、insert 为什么是可恢复的状态机
 - [SGLang Unified Radix Tree：eviction 与 lock_ref](/infra/unified-radix-evict) — lock_ref 怎样保护正在使用的 KV、LRU 怎样挑选驱逐 victim、KV 的完整生命周期
+- [SGLang Unified Cache：异构 Component 状态语义](/infra/unified-cache-components) — FULL / SWA / Mamba 三种状态怎样共用一棵前缀树，匹配边界、所有权、锁与回收规则各自不同
 
 ### 硬件
 
