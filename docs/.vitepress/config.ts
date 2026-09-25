@@ -58,6 +58,10 @@ export default withMermaid(
               link: '/infra/unified-radix-evict',
             },
             {
+              text: 'SGLang Unified Cache：请求级提交路径',
+              link: '/infra/unified-cache-order',
+            },
+            {
               text: 'SGLang Unified Cache：异构 Component 状态语义',
               link: '/infra/unified-cache-components',
             },
